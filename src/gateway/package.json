@@ -1,0 +1,31 @@
+{
+  "name": "@flopsy/gateway",
+  "version": "1.0.0",
+  "description": "Gateway layer: normalize, deduplicate, route messages to channels",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@flopsy/shared": "*",
+    "@hapi/boom": "^10.0.1",
+    "@line/bot-sdk": "^10.6.0",
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "discord.js": "^14.25.1",
+    "grammy": "^1.41.1",
+    "json5": "^2.2.3",
+    "ws": "^8.20.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.9.3"
+  }
+}

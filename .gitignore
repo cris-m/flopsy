@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+src/*/package-lock.json
+
+# Build output
+dist/
+*.js
+*.js.map
+*.d.ts
+*.d.ts.map
+!*.config.js
+!packages/config/**/*.js
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Sessions & credentials (sensitive)
+sessions/
+assets/sessions/
+credentials/
+*.pem
+*.key
+
+# Scheduler data (user-specific)
+assets/scheduler/jobs.json
+assets/scheduler/jobs.json.bak
+assets/scheduler/jobs.json.tmp
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temp
+tmp/
+
+# TypeScript
+*.tsbuildinfo
+
+# LangGraph API
+.langgraph_api

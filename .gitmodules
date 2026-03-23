@@ -1,0 +1,4 @@
+[submodule "flopsygraph"]
+	path = flopsygraph
+	url = https://github.com/cris-m/flopsygraph.git
+	branch = main

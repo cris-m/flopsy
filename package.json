@@ -1,0 +1,26 @@
+{
+  "name": "flopsybot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.ts",
+  "scripts": {
+    "chat": "tsx src/agent/src/chat_cli.ts",
+    "build": "tsc --build",
+    "build:clean": "tsc --build --clean",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\"",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "workspaces": [
+    "src/*",
+    "flopsygraph"
+  ],
+  "devDependencies": {
+    "prettier": "^3.8.1",
+    "typescript": "^5.9.3"
+  }
+}
