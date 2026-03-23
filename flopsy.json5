@@ -1,0 +1,166 @@
+{
+    // FlopsyBot Configuration
+    // Env vars: ${VAR_NAME} resolved at load time from .env or system env
+
+    gateway: {
+        host: '127.0.0.1',
+        port: 18789,
+        token: '${GATEWAY_TOKEN}',
+        rateLimit: {
+            windowMs: 60000,
+            maxRequests: 100,
+            maxConnectionsPerIp: 5,
+        },
+        deduplication: {
+            ttlMs: 30000,
+            maxEntries: 10000,
+        },
+    },
+
+    logging: {
+        level: 'info',
+        pretty: false,
+        // file: '.flopsy/logs/flopsy.log',
+        components: {
+            // gateway: 'debug',
+            // agent: 'warn',
+        },
+    },
+
+    timezone: 'UTC',
+
+    channels: {
+
+        // Auth: QR scan (WhatsApp Linked Devices)
+        // Session stored at sessionPath, auto-reconnects on restart
+        whatsapp: {
+            enabled: false,
+            sessionPath: '.flopsy/sessions/whatsapp',
+            dm: {
+                policy: 'disabled',
+                allowFrom: [],
+                blockedFrom: [],
+            },
+            group: {
+                policy: 'disabled',
+                activation: 'mention',
+                allowedGroups: [],
+            },
+            selfChatMode: false,
+            sendReadReceipts: true,
+            autoTyping: true,
+            contextMessages: 50,
+            maxChunkSize: 4000,
+            media: {
+                inboundMax: 10485760,
+                outboundMax: 10485760,
+            },
+            ackReaction: {
+                emoji: '👀',
+                direct: true,
+                group: 'mentions',
+            },
+        },
+
+        // Auth: bot token from @BotFather
+        telegram: {
+            enabled: false,
+            token: '${TELEGRAM_BOT_TOKEN}',
+            botUsername: '',
+            dm: {
+                policy: 'disabled',
+                allowFrom: [],
+                blockedFrom: [],
+            },
+            group: {
+                policy: 'disabled',
+                activation: 'mention',
+                allowedGroups: [],
+            },
+            ackReaction: {
+                emoji: '👀',
+                direct: true,
+                group: 'mentions',
+            },
+        },
+
+        // Auth: bot token from Discord Developer Portal
+        discord: {
+            enabled: false,
+            token: '${DISCORD_BOT_TOKEN}',
+            botUsername: '',
+            dm: {
+                policy: 'disabled',
+                allowFrom: [],
+                blockedFrom: [],
+            },
+            guild: {
+                policy: 'disabled',
+                activation: 'mention',
+                allowedGuilds: [],
+                allowedChannels: [],
+            },
+            ackReaction: {
+                emoji: '👀',
+                direct: true,
+                group: 'mentions',
+            },
+        },
+
+        // Auth: channel access token + secret from LINE Developers Console
+        line: {
+            enabled: false,
+            channelAccessToken: '${LINE_CHANNEL_ACCESS_TOKEN}',
+            channelSecret: '${LINE_CHANNEL_SECRET}',
+            botName: '',
+            webhookPath: '/webhook/line',
+            dm: {
+                policy: 'disabled',
+                allowFrom: [],
+                blockedFrom: [],
+            },
+            group: {
+                policy: 'disabled',
+                activation: 'mention',
+                allowedGroups: [],
+            },
+        },
+
+        // Auth: QR scan (Signal Linked Devices)
+        // Session stored at sessionPath, auto-reconnects on restart
+        signal: {
+            enabled: false,
+            account: '',
+            cliPath: 'signal-cli',
+            deviceName: 'FlopsyBot',
+            sessionPath: '.flopsy/sessions/signal',
+            dm: {
+                policy: 'disabled',
+                allowFrom: [],
+                blockedFrom: [],
+            },
+            group: {
+                policy: 'disabled',
+                activation: 'mention',
+                allowedGroups: [],
+            },
+            ackReaction: {
+                emoji: '👀',
+                direct: false,
+                group: 'never',
+            },
+        },
+
+        // Auth: none (uses macOS Messages.app directly)
+        imessage: {
+            enabled: false,
+            cliPath: 'imsg',
+            selfChatMode: false,
+            dm: {
+                policy: 'disabled',
+                allowFrom: [],
+                blockedFrom: [],
+            },
+        },
+    },
+}
