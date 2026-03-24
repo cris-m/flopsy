@@ -1,7 +1,7 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import type { Peer, OutboundMessage, ReactionOptions, Message } from '@gateway/types';
-import { BaseChannel } from '@gateway/core/base-channel';
+import { BaseChannel, toError } from '@gateway/core/base-channel';
 import type { IMessageChannelConfig } from './types';
 
 const execFileAsync = promisify(execFile);
@@ -32,7 +32,7 @@ export class IMessageChannel extends BaseChannel {
 
             this.pollTimer = setInterval(() => {
                 this.poll().catch((err) =>
-                    this.emitError(err instanceof Error ? err : new Error(String(err))),
+                    this.emitError(toError(err)),
                 );
             }, POLL_INTERVAL_MS);
             this.pollTimer.unref();
@@ -41,7 +41,7 @@ export class IMessageChannel extends BaseChannel {
             this.emit('onAuthUpdate', 'authenticated');
         } catch (err) {
             this.setStatus('error');
-            this.emitError(err instanceof Error ? err : new Error(String(err)));
+            this.emitError(toError(err));
         }
     }
 

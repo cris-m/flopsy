@@ -10,27 +10,24 @@ export interface WebhookConfig {
     maxBodyBytes?: number;
 }
 
-export interface WebhookEvent {
-    source: string;
-    event: string;
-    payload: unknown;
-    headers: Record<string, string | string[] | undefined>;
-    timestamp: number;
-}
-
-export type WebhookHandler = (event: WebhookEvent) => Promise<void>;
+export type RouteHandler = (req: IncomingMessage, body: string, res: ServerResponse) => Promise<void>;
 
 const DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024;
 const DEDUP_TTL_MS = 3_600_000;
 const MAX_DEDUP_ENTRIES = 50_000;
 
-export abstract class BaseWebhook {
-    protected readonly log = createLogger('webhook');
+export class WebhookServer {
+    readonly log = createLogger('webhook');
 
     private server: Server | null = null;
     private config: WebhookConfig | null = null;
     private readonly processed = new Map<string, number>();
     private cleanupInterval: ReturnType<typeof setInterval> | null = null;
+    private readonly routes = new Map<string, RouteHandler>();
+
+    registerRoute(pathPrefix: string, handler: RouteHandler): void {
+        this.routes.set(pathPrefix, handler);
+    }
 
     async start(config: WebhookConfig): Promise<void> {
         this.config = config;
@@ -49,7 +46,7 @@ export abstract class BaseWebhook {
         return new Promise((resolve, reject) => {
             this.server!.on('error', reject);
             this.server!.listen(config.port, host, () => {
-                this.log.info({ port: config.port, host }, 'webhook server started');
+                this.log.info({ port: config.port, host, routes: [...this.routes.keys()] }, 'webhook server started');
                 resolve();
             });
         });
@@ -69,6 +66,20 @@ export abstract class BaseWebhook {
                     resolve();
                 });
             });
+        }
+    }
+
+    respond(res: ServerResponse, status: number, data: Record<string, unknown>): void {
+        res.setHeader('Content-Type', 'application/json');
+        res.statusCode = status;
+        res.end(JSON.stringify(data));
+    }
+
+    parseJson(body: string): unknown | null {
+        try {
+            return JSON.parse(body);
+        } catch {
+            return null;
         }
     }
 
@@ -126,23 +137,15 @@ export abstract class BaseWebhook {
             this.markProcessed(requestId);
         }
 
-        await this.route(req, body, res);
-    }
-
-    protected abstract route(req: IncomingMessage, body: string, res: ServerResponse): Promise<void>;
-
-    protected respond(res: ServerResponse, status: number, data: Record<string, unknown>): void {
-        res.setHeader('Content-Type', 'application/json');
-        res.statusCode = status;
-        res.end(JSON.stringify(data));
-    }
-
-    protected parseJson(body: string): unknown | null {
-        try {
-            return JSON.parse(body);
-        } catch {
-            return null;
+        const url = req.url ?? '/';
+        for (const [prefix, handler] of this.routes) {
+            if (url.startsWith(prefix)) {
+                await handler(req, body, res);
+                return;
+            }
         }
+
+        this.respond(res, 404, { error: 'Unknown webhook endpoint' });
     }
 
     private findSignatureHeader(req: IncomingMessage): string | null {
@@ -152,6 +155,7 @@ export abstract class BaseWebhook {
             'x-slack-signature',
             'x-linear-signature',
             'stripe-signature',
+            'x-line-signature',
             'x-signature',
         ];
         for (const name of candidates) {

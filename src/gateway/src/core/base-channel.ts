@@ -12,6 +12,13 @@ import type {
     PairingRequestHandler,
 } from '@gateway/types';
 
+const RECONNECT_BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 30_000, 60_000];
+const MAX_RECONNECT_ATTEMPTS = 6;
+
+export function toError(err: unknown): Error {
+    return err instanceof Error ? err : new Error(String(err));
+}
+
 export interface BaseChannelConfig {
     enabled: boolean;
     dmPolicy: DmPolicy;
@@ -27,12 +34,12 @@ export abstract class BaseChannel implements Channel {
 
     pairingRequestHandler: PairingRequestHandler | null = null;
 
+    protected reconnectAttempts = 0;
+    protected reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
     private _status: ChannelStatus = 'disconnected';
     private _config: BaseChannelConfig;
-
-    private handlers: {
-        [K in keyof ChannelEvents]?: ChannelEvents[K];
-    } = {};
+    private handlers: { [K in keyof ChannelEvents]?: ChannelEvents[K] } = {};
 
     constructor(config: BaseChannelConfig) {
         this._config = { ...config };
@@ -81,6 +88,28 @@ export abstract class BaseChannel implements Channel {
         this.emit('onError', error);
     }
 
+    protected scheduleReconnect(): void {
+        if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+            this.setStatus('error');
+            this.emitError(new Error('Max reconnect attempts reached'));
+            return;
+        }
+        const delay = RECONNECT_BACKOFF_MS[this.reconnectAttempts] ?? 60_000;
+        this.reconnectAttempts++;
+        this.setStatus('connecting');
+        this.reconnectTimer = setTimeout(() => {
+            this.reconnectTimer = null;
+            this.connect().catch((err) => this.emitError(toError(err)));
+        }, delay);
+    }
+
+    protected clearReconnect(): void {
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+        this.reconnectAttempts = 0;
+    }
 
     isAllowed(senderId: string, peerType: 'user' | 'group' | 'channel'): boolean {
         const blocked = this._config.blockedFrom ?? [];

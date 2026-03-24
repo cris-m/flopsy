@@ -1,6 +1,7 @@
 import { loadConfig, type FlopsyConfig } from '@flopsy/shared';
 import type { Message } from '@gateway/types';
 import { BaseGateway } from '@gateway/core/base-gateway';
+import { WebhookServer } from '@gateway/core/base-webhook';
 import { WhatsAppChannel } from '@gateway/channels/whatsapp';
 import { TelegramChannel } from '@gateway/channels/telegram';
 import { DiscordChannel } from '@gateway/channels/discord';
@@ -9,6 +10,9 @@ import { SignalChannel } from '@gateway/channels/signal';
 import { IMessageChannel } from '@gateway/channels/imessage';
 
 export class FlopsyGateway extends BaseGateway {
+    private webhookServer: WebhookServer | null = null;
+    private readonly cfg: FlopsyConfig;
+
     constructor(config?: FlopsyConfig) {
         const cfg = config ?? loadConfig();
 
@@ -18,8 +22,10 @@ export class FlopsyGateway extends BaseGateway {
             token: cfg.gateway.token,
             deduplicationTtlMs: cfg.gateway.deduplication.ttlMs,
             maxDeduplicationEntries: cfg.gateway.deduplication.maxEntries,
+            rateLimit: cfg.gateway.rateLimit,
         });
 
+        this.cfg = cfg;
         this.registerChannels(cfg);
     }
 
@@ -57,16 +63,20 @@ export class FlopsyGateway extends BaseGateway {
         }
 
         if (channels.discord.enabled) {
+            const dc = channels.discord;
             this.register(new DiscordChannel({
                 enabled: true,
-                dmPolicy: channels.discord.dm.policy,
-                allowFrom: channels.discord.dm.allowFrom,
-                blockedFrom: channels.discord.dm.blockedFrom,
-                groupPolicy: channels.discord.guild.policy,
-                allowedGroups: channels.discord.guild.allowedGuilds,
-                token: channels.discord.token,
-                allowedGuilds: channels.discord.guild.allowedGuilds,
-                allowedChannels: channels.discord.guild.allowedChannels,
+                dmPolicy: dc.dm.policy,
+                allowFrom: dc.dm.allowFrom,
+                blockedFrom: dc.dm.blockedFrom,
+                groupPolicy: dc.guild.policy,
+                allowedGroups: dc.guild.allowedGuilds,
+                token: dc.token,
+                allowedGuilds: dc.guild.allowedGuilds,
+                allowedChannels: dc.guild.allowedChannels,
+                presence: dc.presence,
+                slashCommands: dc.slashCommands,
+                devGuildId: dc.devGuildId,
             }));
         }
 
@@ -111,7 +121,87 @@ export class FlopsyGateway extends BaseGateway {
         }
     }
 
+    protected async onStart(): Promise<void> {
+        const wh = this.cfg.webhook;
+        if (!wh.enabled) return;
+
+        this.webhookServer = new WebhookServer();
+        this.registerWebhookRoutes();
+
+        await this.webhookServer.start({
+            port: wh.port,
+            host: wh.host,
+            secret: wh.secret || undefined,
+            allowedIps: wh.allowedIps.length ? wh.allowedIps : undefined,
+        });
+    }
+
+    protected async onStop(): Promise<void> {
+        if (this.webhookServer) {
+            await this.webhookServer.stop();
+            this.webhookServer = null;
+        }
+    }
+
+    private registerWebhookRoutes(): void {
+        if (!this.webhookServer) return;
+
+        const lineChannel = this.getChannel('line') as LineChannel | undefined;
+        if (lineChannel) {
+            const webhookPath = this.cfg.channels.line.webhookPath;
+            this.webhookServer.registerRoute(webhookPath, async (_req, body, res) => {
+                const parsed = this.webhookServer!.parseJson(body);
+                if (!parsed || typeof parsed !== 'object') {
+                    this.webhookServer!.respond(res, 400, { error: 'Invalid JSON' });
+                    return;
+                }
+
+                const events = (parsed as { events?: unknown[] }).events;
+                if (!Array.isArray(events)) {
+                    this.webhookServer!.respond(res, 400, { error: 'Missing events array' });
+                    return;
+                }
+
+                this.webhookServer!.respond(res, 200, { status: 'ok' });
+
+                for (const event of events) {
+                    await lineChannel.handleWebhookEvent(
+                        event as Parameters<LineChannel['handleWebhookEvent']>[0],
+                    ).catch((err) => this.log.error({ err }, 'LINE webhook event error'));
+                }
+            });
+        }
+    }
+
     protected async route(message: Message): Promise<void> {
-        this.log.info({ channel: message.channelName, sender: message.peer.id }, 'message routed');
+        this.log.debug({
+            channel: message.channelName,
+            from: message.sender?.name ?? message.sender?.id ?? message.peer.id,
+            peer: message.peer.type,
+            body: message.body.slice(0, 100),
+        }, 'inbound message');
+
+        await this.ackReact(message);
+    }
+
+    private async ackReact(message: Message): Promise<void> {
+        const channelCfg = this.cfg.channels[message.channelName as keyof typeof this.cfg.channels];
+        if (!channelCfg) return;
+
+        const ack = (channelCfg as { ackReaction?: { emoji: string; direct: boolean; group: string } }).ackReaction;
+        if (!ack?.emoji) return;
+
+        const isGroup = message.peer.type === 'group' || message.peer.type === 'channel';
+        if (isGroup && ack.group === 'never') return;
+        if (!isGroup && !ack.direct) return;
+
+        const channel = this.getChannel(message.channelName);
+        if (!channel) return;
+
+        try {
+            await channel.react({ messageId: message.id, peer: message.peer, emoji: ack.emoji });
+        } catch {
+            this.log.debug({ channel: message.channelName }, 'ack reaction failed');
+        }
     }
 }

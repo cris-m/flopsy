@@ -1,11 +1,8 @@
 import { spawn, type ChildProcess } from 'child_process';
 import { createInterface, type Interface } from 'readline';
 import type { Peer, OutboundMessage, ReactionOptions, Message } from '@gateway/types';
-import { BaseChannel } from '@gateway/core/base-channel';
+import { BaseChannel, toError } from '@gateway/core/base-channel';
 import type { SignalChannelConfig } from './types';
-
-const RECONNECT_BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 30_000, 60_000];
-const MAX_RECONNECT_ATTEMPTS = 6;
 
 export class SignalChannel extends BaseChannel {
     readonly name = 'signal';
@@ -14,8 +11,6 @@ export class SignalChannel extends BaseChannel {
     private process: ChildProcess | null = null;
     private reader: Interface | null = null;
     private readonly channelConfig: SignalChannelConfig;
-    private reconnectAttempts = 0;
-    private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
     constructor(config: SignalChannelConfig) {
         super(config);
@@ -28,22 +23,16 @@ export class SignalChannel extends BaseChannel {
 
         try {
             const cliPath = this.channelConfig.cliPath ?? 'signal-cli';
-            const account = this.channelConfig.account;
 
-            this.process = spawn(cliPath, [
-                '-a', account,
-                'jsonRpc',
-            ], {
+            this.process = spawn(cliPath, ['-a', this.channelConfig.account, 'jsonRpc'], {
                 stdio: ['pipe', 'pipe', 'pipe'],
-                env: { ...process.env },
+                env: { PATH: process.env.PATH, HOME: process.env.HOME },
             });
 
             this.reader = createInterface({ input: this.process.stdout! });
 
             this.reader.on('line', (line) => {
-                this.handleJsonRpcLine(line).catch((err) =>
-                    this.emitError(err instanceof Error ? err : new Error(String(err))),
-                );
+                this.handleJsonRpcLine(line).catch((err) => this.emitError(toError(err)));
             });
 
             this.process.stderr?.on('data', (data: Buffer) => {
@@ -71,17 +60,12 @@ export class SignalChannel extends BaseChannel {
             this.emit('onAuthUpdate', 'authenticated');
         } catch (err) {
             this.setStatus('error');
-            this.emitError(err instanceof Error ? err : new Error(String(err)));
+            this.emitError(toError(err));
         }
     }
 
     async disconnect(): Promise<void> {
-        if (this.reconnectTimer) {
-            clearTimeout(this.reconnectTimer);
-            this.reconnectTimer = null;
-        }
-        this.reconnectAttempts = 0;
-
+        this.clearReconnect();
         if (this.process) {
             this.process.kill('SIGTERM');
             this.process = null;
@@ -96,75 +80,40 @@ export class SignalChannel extends BaseChannel {
     async send(message: OutboundMessage): Promise<string> {
         if (!this.process?.stdin) throw new Error('Signal not connected');
 
-        const args: string[] = [];
         const isGroup = message.peer.type === 'group';
-
-        if (isGroup) {
-            args.push('-g', message.peer.id);
-        } else {
-            args.push(message.peer.id);
-        }
-
-        if (message.media?.length) {
-            for (const media of message.media) {
-                if (media.url) args.push('-a', media.url);
-            }
-        }
-
         const id = `rpc-${Date.now()}`;
-        const rpc = {
-            jsonrpc: '2.0',
-            id,
-            method: 'send',
-            params: {
-                ...(isGroup ? { groupId: message.peer.id } : { recipient: [message.peer.id] }),
-                message: message.body ?? '',
-                ...(message.media?.length && {
-                    attachments: message.media
-                        .filter((m) => m.url)
-                        .map((m) => m.url!),
-                }),
-            },
-        };
 
-        this.process.stdin.write(JSON.stringify(rpc) + '\n');
+        this.writeRpc(id, 'send', {
+            ...(isGroup ? { groupId: message.peer.id } : { recipient: [message.peer.id] }),
+            message: message.body ?? '',
+            ...(message.media?.length && {
+                attachments: message.media.filter((m) => m.url).map((m) => m.url!),
+            }),
+        });
+
         return id;
     }
 
     async sendTyping(peer: Peer): Promise<void> {
         if (!this.process?.stdin) return;
-
-        const rpc = {
-            jsonrpc: '2.0',
-            id: `typing-${Date.now()}`,
-            method: 'sendTyping',
-            params: peer.type === 'group'
-                ? { groupId: peer.id }
-                : { recipient: [peer.id] },
-        };
-
-        this.process.stdin.write(JSON.stringify(rpc) + '\n');
+        this.writeRpc(`typing-${Date.now()}`, 'sendTyping',
+            peer.type === 'group' ? { groupId: peer.id } : { recipient: [peer.id] },
+        );
     }
 
     async react(options: ReactionOptions): Promise<void> {
         if (!this.process?.stdin) throw new Error('Signal not connected');
+        this.writeRpc(`react-${Date.now()}`, 'sendReaction', {
+            ...(options.peer.type === 'group' ? { groupId: options.peer.id } : { recipient: [options.peer.id] }),
+            emoji: options.remove ? '' : options.emoji,
+            targetAuthor: options.peer.id,
+            targetTimestamp: parseInt(options.messageId, 10),
+            remove: options.remove ?? false,
+        });
+    }
 
-        const rpc = {
-            jsonrpc: '2.0',
-            id: `react-${Date.now()}`,
-            method: 'sendReaction',
-            params: {
-                ...(options.peer.type === 'group'
-                    ? { groupId: options.peer.id }
-                    : { recipient: [options.peer.id] }),
-                emoji: options.remove ? '' : options.emoji,
-                targetAuthor: options.peer.id,
-                targetTimestamp: parseInt(options.messageId, 10),
-                remove: options.remove ?? false,
-            },
-        };
-
-        this.process.stdin.write(JSON.stringify(rpc) + '\n');
+    private writeRpc(id: string, method: string, params: Record<string, unknown>): void {
+        this.process!.stdin!.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
     }
 
     private async handleJsonRpcLine(line: string): Promise<void> {
@@ -201,22 +150,5 @@ export class SignalChannel extends BaseChannel {
         };
 
         await this.emit('onMessage', normalized);
-    }
-
-    private scheduleReconnect(): void {
-        if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-            this.setStatus('error');
-            this.emitError(new Error('Max reconnect attempts reached'));
-            return;
-        }
-
-        const delay = RECONNECT_BACKOFF_MS[this.reconnectAttempts] ?? 60_000;
-        this.reconnectAttempts++;
-        this.setStatus('connecting');
-
-        this.reconnectTimer = setTimeout(() => {
-            this.reconnectTimer = null;
-            this.connect().catch((err) => this.emitError(err instanceof Error ? err : new Error(String(err))));
-        }, delay);
     }
 }
