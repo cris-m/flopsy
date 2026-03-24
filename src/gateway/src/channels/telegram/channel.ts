@@ -1,5 +1,5 @@
 import type { Peer, OutboundMessage, ReactionOptions, Message } from '@gateway/types';
-import { BaseChannel } from '@gateway/core/base-channel';
+import { BaseChannel, toError } from '@gateway/core/base-channel';
 import type { TelegramChannelConfig } from './types';
 
 export class TelegramChannel extends BaseChannel {
@@ -56,10 +56,14 @@ export class TelegramChannel extends BaseChannel {
                 await this.emit('onMessage', normalized);
             });
 
-            this.bot.start({ onStart: () => this.setStatus('connected') });
+            this.bot.start({ onStart: () => this.setStatus('connected') })
+                .catch((err) => {
+                    this.setStatus('error');
+                    this.emitError(toError(err));
+                });
         } catch (err) {
             this.setStatus('error');
-            this.emitError(err instanceof Error ? err : new Error(String(err)));
+            this.emitError(toError(err));
         }
     }
 

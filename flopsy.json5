@@ -18,8 +18,8 @@
     },
 
     logging: {
-        level: 'info',
-        pretty: false,
+        level: 'debug',
+        pretty: true,
         // file: '.flopsy/logs/flopsy.log',
         components: {
             // gateway: 'debug',
@@ -28,6 +28,14 @@
     },
 
     timezone: 'UTC',
+
+    webhook: {
+        enabled: false,
+        port: 18790,
+        host: '127.0.0.1',
+        secret: '${WEBHOOK_SECRET}',
+        allowedIps: [],
+    },
 
     channels: {
 
@@ -64,11 +72,11 @@
 
         // Auth: bot token from @BotFather
         telegram: {
-            enabled: false,
+            enabled: true,
             token: '${TELEGRAM_BOT_TOKEN}',
             botUsername: '',
             dm: {
-                policy: 'disabled',
+                policy: 'open',
                 allowFrom: [],
                 blockedFrom: [],
             },
@@ -86,11 +94,11 @@
 
         // Auth: bot token from Discord Developer Portal
         discord: {
-            enabled: false,
+            enabled: true,
             token: '${DISCORD_BOT_TOKEN}',
             botUsername: '',
             dm: {
-                policy: 'disabled',
+                policy: 'open',
                 allowFrom: [],
                 blockedFrom: [],
             },
@@ -105,17 +113,25 @@
                 direct: true,
                 group: 'mentions',
             },
+            presence: {
+                status: 'online',
+                activity: 'Listening to messages',
+                activityType: 'listening',
+            },
+            slashCommands: [
+                { name: 'ask', description: 'Ask FlopsyBot a question' },
+            ],
         },
 
         // Auth: channel access token + secret from LINE Developers Console
         line: {
-            enabled: false,
+            enabled: true,
             channelAccessToken: '${LINE_CHANNEL_ACCESS_TOKEN}',
             channelSecret: '${LINE_CHANNEL_SECRET}',
             botName: '',
             webhookPath: '/webhook/line',
             dm: {
-                policy: 'disabled',
+                policy: 'open',
                 allowFrom: [],
                 blockedFrom: [],
             },

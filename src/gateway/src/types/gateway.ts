@@ -8,6 +8,11 @@ export interface GatewayConfig {
     token?: string;
     deduplicationTtlMs?: number;
     maxDeduplicationEntries?: number;
+    rateLimit?: {
+        windowMs?: number;
+        maxRequests?: number;
+        maxConnectionsPerIp?: number;
+    };
 }
 
 export interface Gateway {

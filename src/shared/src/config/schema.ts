@@ -48,6 +48,18 @@ const telegramSchema = z.object({
     ackReaction: ackReactionSchema,
 });
 
+const discordPresenceSchema = z.object({
+    status: z.enum(['online', 'idle', 'dnd', 'invisible']).default('online'),
+    activity: z.string().optional(),
+    activityType: z.enum(['playing', 'streaming', 'listening', 'watching', 'competing']).default('playing'),
+    activityUrl: z.string().optional(),
+}).optional();
+
+const discordSlashCommandSchema = z.object({
+    name: z.string().min(1).max(32).regex(/^[\p{Ll}\p{N}-]+$/u, 'Must be lowercase alphanumeric with hyphens'),
+    description: z.string().min(1).max(100),
+});
+
 const discordSchema = z.object({
     enabled: z.boolean().default(false),
     token: z.string().default(''),
@@ -60,6 +72,9 @@ const discordSchema = z.object({
         allowedChannels: z.array(z.string()).default([]),
     }).default({}),
     ackReaction: ackReactionSchema,
+    presence: discordPresenceSchema,
+    slashCommands: z.array(discordSlashCommandSchema).default([]),
+    devGuildId: z.string().regex(/^\d{17,20}$/).optional(),
 });
 
 const lineSchema = z.object({
@@ -121,9 +136,18 @@ const loggingSchema = z.object({
     components: z.record(z.string(), z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent'])).default({}),
 });
 
+const webhookSchema = z.object({
+    enabled: z.boolean().default(false),
+    port: z.number().int().min(1).max(65535).default(18790),
+    host: z.string().default('127.0.0.1'),
+    secret: z.string().default(''),
+    allowedIps: z.array(z.string()).default([]),
+}).default({});
+
 export const flopsyConfigSchema = z.object({
     gateway: gatewaySchema.default({}),
     channels: channelsSchema.default({}),
+    webhook: webhookSchema,
     logging: loggingSchema.default({}),
     timezone: z.string().default('UTC'),
 }).strict();
@@ -138,3 +162,4 @@ export type LineConfig = z.infer<typeof lineSchema>;
 export type SignalConfig = z.infer<typeof signalSchema>;
 export type IMessageConfig = z.infer<typeof imessageSchema>;
 export type LoggingConfig = z.infer<typeof loggingSchema>;
+export type WebhookSection = z.infer<typeof webhookSchema>;

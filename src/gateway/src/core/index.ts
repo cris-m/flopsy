@@ -1,6 +1,6 @@
-export { BaseChannel, type BaseChannelConfig } from './base-channel';
+export { BaseChannel, toError, type BaseChannelConfig } from './base-channel';
 export { BaseGateway, type EventType, type WsRequest, type WsClient } from './base-gateway';
-export { BaseWebhook, type WebhookConfig, type WebhookEvent, type WebhookHandler } from './base-webhook';
+export { WebhookServer, type WebhookConfig, type RouteHandler } from './base-webhook';
 export {
     validateToken,
     extractToken,

@@ -11,7 +11,7 @@ import {
     extractToken,
     isLoopbackIp,
 } from './security';
-import type { BaseChannel } from './base-channel';
+
 
 const DEFAULT_DEDUP_TTL_MS = 30_000;
 const DEFAULT_MAX_DEDUP_ENTRIES = 10_000;
@@ -59,8 +59,9 @@ export abstract class BaseGateway implements Gateway {
             token: config.token ?? '',
             deduplicationTtlMs: config.deduplicationTtlMs ?? DEFAULT_DEDUP_TTL_MS,
             maxDeduplicationEntries: config.maxDeduplicationEntries ?? DEFAULT_MAX_DEDUP_ENTRIES,
+            rateLimit: config.rateLimit ?? {},
         };
-        this.rateLimiter = new RateLimiter();
+        this.rateLimiter = new RateLimiter(config.rateLimit);
         this.registerBuiltinHandlers();
     }
 
@@ -80,7 +81,7 @@ export abstract class BaseGateway implements Gateway {
             this.broadcast('channel.error', { channel: channel.name, error: err.message });
         });
         channel.on('onQR', (qr) => this.broadcast('channel.qr', { channel: channel.name, qr }));
-        this.log.info({ channel: channel.name }, 'channel registered');
+        this.log.info(`channel registered - ${channel.name} (auth=${channel.authType}, dm=${channel.dmPolicy})`);
     }
 
     unregister(name: string): void {
@@ -117,7 +118,7 @@ export abstract class BaseGateway implements Gateway {
             if (!channel.enabled) continue;
             try {
                 await channel.connect();
-                this.log.info({ channel: channel.name }, 'channel connected');
+                this.log.debug({ channel: channel.name }, 'channel connected');
             } catch (err) {
                 this.log.error({ channel: channel.name, err }, 'channel failed to connect');
             }
@@ -306,6 +307,17 @@ export abstract class BaseGateway implements Gateway {
         client.ws.send(JSON.stringify({ type: 'res', id, ok: false, error: { code, message } }));
     }
 
+    private static readonly VALID_EVENTS = new Set<EventType>([
+        'message.inbound', 'message.outbound', 'channel.status', 'channel.error', 'channel.qr',
+    ]);
+
+    private requireChannel(name: string | undefined): Channel {
+        if (!name) throw new Error('channel required');
+        const ch = this._channels.get(name);
+        if (!ch) throw new Error(`channel "${name}" not found`);
+        return ch;
+    }
+
     private registerBuiltinHandlers(): void {
         this.handlers.set('ping', async () => ({ pong: Date.now() }));
 
@@ -330,16 +342,18 @@ export abstract class BaseGateway implements Gateway {
         );
 
         this.handlers.set('subscribe', async (client, params) => {
-            const events = params?.events as EventType[] | undefined;
+            const events = params?.events as string[] | undefined;
             if (!Array.isArray(events)) return { error: 'events array required' };
-            for (const e of events) client.subscriptions.add(e);
+            for (const e of events) {
+                if (BaseGateway.VALID_EVENTS.has(e as EventType)) client.subscriptions.add(e as EventType);
+            }
             return { subscribed: [...client.subscriptions] };
         });
 
         this.handlers.set('unsubscribe', async (client, params) => {
-            const events = params?.events as EventType[] | undefined;
+            const events = params?.events as string[] | undefined;
             if (!Array.isArray(events)) return { error: 'events array required' };
-            for (const e of events) client.subscriptions.delete(e);
+            for (const e of events) client.subscriptions.delete(e as EventType);
             return { subscribed: [...client.subscriptions] };
         });
 
@@ -363,18 +377,14 @@ export abstract class BaseGateway implements Gateway {
 
         this.handlers.set('channel.auth.status', async (_client, params) => {
             const name = params?.channel as string;
-            if (!name) throw new Error('channel required');
-            const ch = this._channels.get(name);
-            if (!ch) throw new Error(`channel "${name}" not found`);
+            const ch = this.requireChannel(name);
             return { channel: name, status: ch.status, authType: ch.authType, needsAuth: ch.status !== 'connected' };
         });
 
         const authStartCooldowns = new Map<string, number>();
         this.handlers.set('channel.auth.start', async (_client, params) => {
             const name = params?.channel as string;
-            if (!name) throw new Error('channel required');
-            const ch = this._channels.get(name);
-            if (!ch) throw new Error(`channel "${name}" not found`);
+            const ch = this.requireChannel(name);
 
             const lastStart = authStartCooldowns.get(name) ?? 0;
             if (Date.now() - lastStart < 60_000) {
@@ -390,10 +400,7 @@ export abstract class BaseGateway implements Gateway {
 
         this.handlers.set('channel.auth.disconnect', async (_client, params) => {
             const name = params?.channel as string;
-            if (!name) throw new Error('channel required');
-            const ch = this._channels.get(name);
-            if (!ch) throw new Error(`channel "${name}" not found`);
-
+            const ch = this.requireChannel(name);
             await ch.disconnect();
             return { disconnected: true, channel: name };
         });
@@ -409,16 +416,7 @@ export abstract class BaseGateway implements Gateway {
 
         if (this.isDuplicate(clean.id)) return;
 
-        const sanitized: Message = { ...message, id: clean.id, channelName: clean.channelName, body: clean.body };
-
-        const channel = this._channels.get(sanitized.channelName);
-        if (channel && 'isAllowed' in channel) {
-            const senderId = sanitized.sender?.id ?? sanitized.peer.id;
-            if (!(channel as BaseChannel).isAllowed(senderId, sanitized.peer.type)) {
-                this.log.warn({ channel: sanitized.channelName, senderId }, 'blocked by access control');
-                return;
-            }
-        }
+        const sanitized: Message = { ...message, ...clean };
 
         this.broadcast('message.inbound', {
             channel: sanitized.channelName,

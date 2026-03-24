@@ -1,11 +1,8 @@
 import type { WASocket, ConnectionState, AnyMessageContent } from '@whiskeysockets/baileys';
 import type { Boom } from '@hapi/boom';
 import type { Peer, OutboundMessage, ReactionOptions, Message } from '@gateway/types';
-import { BaseChannel } from '@gateway/core/base-channel';
+import { BaseChannel, toError } from '@gateway/core/base-channel';
 import type { WhatsAppChannelConfig } from './types';
-
-const RECONNECT_BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 30_000, 60_000];
-const MAX_RECONNECT_ATTEMPTS = 6;
 
 export class WhatsAppChannel extends BaseChannel {
     readonly name = 'whatsapp';
@@ -13,8 +10,6 @@ export class WhatsAppChannel extends BaseChannel {
 
     private socket: WASocket | null = null;
     private readonly channelConfig: WhatsAppChannelConfig;
-    private reconnectAttempts = 0;
-    private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     private connecting = false;
 
     constructor(config: WhatsAppChannelConfig) {
@@ -35,7 +30,6 @@ export class WhatsAppChannel extends BaseChannel {
 
             const sessionPath = this.channelConfig.sessionPath ?? '.flopsy/sessions/whatsapp';
             const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
-
             const logger = pino({ level: 'silent' });
 
             this.socket = makeWASocket({
@@ -47,21 +41,17 @@ export class WhatsAppChannel extends BaseChannel {
             this.socket.ev.on('creds.update', saveCreds);
 
             this.socket.ev.on('connection.update', (update: Partial<ConnectionState>) => {
-                const { connection, lastDisconnect, qr } = update;
+                if (update.qr) this.emit('onQR', update.qr);
 
-                if (qr) {
-                    this.emit('onQR', qr);
-                }
-
-                if (connection === 'open') {
+                if (update.connection === 'open') {
                     this.reconnectAttempts = 0;
                     this.setStatus('connected');
                     this.emit('onAuthUpdate', 'authenticated');
                 }
 
-                if (connection === 'close') {
+                if (update.connection === 'close') {
                     this.socket = null;
-                    const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+                    const statusCode = (update.lastDisconnect?.error as Boom)?.output?.statusCode;
 
                     if (statusCode === DisconnectReason.loggedOut) {
                         this.setStatus('disconnected');
@@ -89,23 +79,19 @@ export class WhatsAppChannel extends BaseChannel {
                         msg.message.imageMessage?.caption ??
                         '';
 
-                    const normalized: Message = {
+                    await this.emit('onMessage', {
                         id: msg.key.id ?? '',
                         channelName: this.name,
                         peer: { id: senderId, type: peerType },
-                        sender: msg.key.participant
-                            ? { id: msg.key.participant }
-                            : undefined,
+                        sender: msg.key.participant ? { id: msg.key.participant } : undefined,
                         body,
                         timestamp: new Date((msg.messageTimestamp as number) * 1000).toISOString(),
-                    };
-
-                    await this.emit('onMessage', normalized);
+                    });
                 }
             });
         } catch (err) {
             this.setStatus('error');
-            this.emitError(err instanceof Error ? err : new Error(String(err)));
+            this.emitError(toError(err));
         } finally {
             this.connecting = false;
         }
@@ -118,11 +104,7 @@ export class WhatsAppChannel extends BaseChannel {
     }
 
     async disconnect(): Promise<void> {
-        if (this.reconnectTimer) {
-            clearTimeout(this.reconnectTimer);
-            this.reconnectTimer = null;
-        }
-        this.reconnectAttempts = 0;
+        this.clearReconnect();
         if (this.socket) {
             this.socket.end(undefined);
             this.socket = null;
@@ -177,27 +159,8 @@ export class WhatsAppChannel extends BaseChannel {
 
     async react(options: ReactionOptions): Promise<void> {
         if (!this.socket) throw new Error('WhatsApp not connected');
-
-        const text = !options.emoji || options.remove ? '' : options.emoji;
         await this.socket.sendMessage(options.peer.id, {
-            react: { text, key: { id: options.messageId, remoteJid: options.peer.id } },
+            react: { text: !options.emoji || options.remove ? '' : options.emoji, key: { id: options.messageId, remoteJid: options.peer.id } },
         });
-    }
-
-    private scheduleReconnect(): void {
-        if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-            this.setStatus('error');
-            this.emitError(new Error('Max reconnect attempts reached'));
-            return;
-        }
-
-        const delay = RECONNECT_BACKOFF_MS[this.reconnectAttempts] ?? 60_000;
-        this.reconnectAttempts++;
-        this.setStatus('connecting');
-
-        this.reconnectTimer = setTimeout(() => {
-            this.reconnectTimer = null;
-            this.connect().catch((err) => this.emitError(err instanceof Error ? err : new Error(String(err))));
-        }, delay);
     }
 }
