@@ -12,7 +12,6 @@ import {
     isLoopbackIp,
 } from './security';
 
-
 const DEFAULT_DEDUP_TTL_MS = 30_000;
 const DEFAULT_MAX_DEDUP_ENTRIES = 10_000;
 const DEDUP_SWEEP_INTERVAL_MS = 60_000;
@@ -87,6 +86,10 @@ export abstract class BaseGateway implements Gateway {
     unregister(name: string): void {
         const channel = this._channels.get(name);
         if (!channel) return;
+        channel.off('onMessage', undefined as never);
+        channel.off('onStatusChange', undefined as never);
+        channel.off('onError', undefined as never);
+        channel.off('onQR', undefined as never);
         this._channels.delete(name);
         this.log.info({ channel: name }, 'channel unregistered');
     }
@@ -321,6 +324,12 @@ export abstract class BaseGateway implements Gateway {
     private registerBuiltinHandlers(): void {
         this.handlers.set('ping', async () => ({ pong: Date.now() }));
 
+        this.handlers.set('health', async () => {
+            const channelStates = [...this._channels.entries()].map(([name, ch]) => ({ name, status: ch.status }));
+            const allConnected = channelStates.every((c) => c.status === 'connected');
+            return { healthy: allConnected, uptime: process.uptime(), channels: channelStates };
+        });
+
         this.handlers.set('status', async () => ({
             uptime: process.uptime(),
             channels: [...this._channels.entries()].map(([name, ch]) => ({
@@ -410,7 +419,7 @@ export abstract class BaseGateway implements Gateway {
         const clean = sanitizeInbound(message);
 
         if (!isSafeIdentifier(clean.id, 256)) {
-            this.log.warn({ messageId: clean.id }, 'invalid message id rejected');
+            this.log.debug({ messageId: clean.id }, 'invalid message id rejected');
             return;
         }
 

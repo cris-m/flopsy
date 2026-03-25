@@ -1,6 +1,46 @@
 import { timingSafeEqual, createHmac } from 'crypto';
 import { resolve, sep } from 'path';
 
+
+const SAFE_ID_REGEX = /^[a-zA-Z0-9._:+@-]+$/;
+
+const MAX_MESSAGE_ID_LENGTH = 256;
+const MAX_CHANNEL_NAME_LENGTH = 64;
+const MAX_BODY_LENGTH = 50_000;
+
+export interface RateLimitConfig {
+    windowMs: number;
+    maxRequests: number;
+    maxConnectionsPerIp: number;
+    blockDurationMs: number;
+    maxTrackedClients: number;
+}
+
+export interface SanitizedMessage {
+    id: string;
+    channelName: string;
+    body: string;
+}
+
+export interface WebhookSignatureConfig {
+    algorithm: 'sha1' | 'sha256' | 'sha512';
+    format: 'hex' | 'base64';
+    prefix?: string;
+}
+
+const BLOCKED_HOSTS = new Set([
+    'localhost', '127.0.0.1', '0.0.0.0', '[::1]', '::1',
+    'metadata.google.internal', 'metadata.azure.internal',
+]);
+
+const PRIVATE_PATTERNS = [
+    /^10\./, /^172\.(1[6-9]|2\d|3[01])\./, /^192\.168\./, /^169\.254\./,
+    /^0x/i, /^\d{8,}$/,
+    /^fd[0-9a-f]{2}:/i, /^fe80:/i, /^fc[0-9a-f]{2}:/i,
+    /^::ffff:/i, /^\[::ffff:/i,
+    /^\[fd/i, /^\[fe80:/i, /^\[fc/i,
+];
+
 export function validateToken(
     expected: string,
     provided: string | null | undefined,
@@ -39,7 +79,6 @@ export function extractToken(
     return null;
 }
 
-
 function normalizeIp(ip: string): string {
     if (ip.startsWith('::ffff:')) return ip.slice(7);
     if (ip === '::1' || ip === '0:0:0:0:0:0:0:1') return '127.0.0.1';
@@ -49,15 +88,6 @@ function normalizeIp(ip: string): string {
 export function isLoopbackIp(ip: string): boolean {
     if (ip === 'localhost') return true;
     return normalizeIp(ip) === '127.0.0.1';
-}
-
-
-export interface RateLimitConfig {
-    windowMs: number;
-    maxRequests: number;
-    maxConnectionsPerIp: number;
-    blockDurationMs: number;
-    maxTrackedClients: number;
 }
 
 const DEFAULT_RATE_LIMIT: RateLimitConfig = {
@@ -173,17 +203,13 @@ export class RateLimiter {
     }
 }
 
-
 export function sanitize(input: string, maxLength: number): string {
     return input.replace(/\0/g, '').trim().slice(0, maxLength);
 }
 
-const SAFE_ID_REGEX = /^[a-zA-Z0-9._:+@-]+$/;
-
 export function isSafeIdentifier(id: string, maxLength = 128): boolean {
     return id.length > 0 && id.length <= maxLength && SAFE_ID_REGEX.test(id);
 }
-
 
 export function resolveSafePath(basePath: string, userPath: string): string {
     const cleaned = userPath.replace(/\0/g, '');
@@ -194,13 +220,6 @@ export function resolveSafePath(basePath: string, userPath: string): string {
         throw new Error(`Path traversal detected: "${userPath}" escapes base directory`);
     }
     return resolved;
-}
-
-
-export interface WebhookSignatureConfig {
-    algorithm: 'sha1' | 'sha256' | 'sha512';
-    format: 'hex' | 'base64';
-    prefix?: string;
 }
 
 export function verifyWebhookSignature(
@@ -231,14 +250,20 @@ export function verifyWebhookSignature(
 }
 
 
-const MAX_MESSAGE_ID_LENGTH = 256;
-const MAX_CHANNEL_NAME_LENGTH = 64;
-const MAX_BODY_LENGTH = 50_000;
-
-export interface SanitizedMessage {
-    id: string;
-    channelName: string;
-    body: string;
+export function isSafeMediaUrl(url?: string): boolean {
+    if (!url) return false;
+    try {
+        const parsed = new URL(url);
+        if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
+        const host = parsed.hostname.replace(/^\[|\]$/g, '');
+        if (BLOCKED_HOSTS.has(host)) return false;
+        for (const pattern of PRIVATE_PATTERNS) {
+            if (pattern.test(host)) return false;
+        }
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 export function sanitizeInbound(msg: { id: string; channelName: string; body: string }): SanitizedMessage {

@@ -10,23 +10,24 @@ const EXEC_TIMEOUT_MS = 15_000;
 
 export class IMessageChannel extends BaseChannel {
     readonly name = 'imessage';
-    readonly authType = 'none' as const;
+    readonly authType = 'none';
 
     private readonly channelConfig: IMessageChannelConfig;
+    private readonly cliPath: string;
     private pollTimer: ReturnType<typeof setInterval> | null = null;
     private lastTimestamp: string = new Date().toISOString();
 
     constructor(config: IMessageChannelConfig) {
         super(config);
         this.channelConfig = config;
+        this.cliPath = config.cliPath ?? 'imsg';
     }
 
     async connect(): Promise<void> {
         this.setStatus('connecting');
 
         try {
-            const cliPath = this.channelConfig.cliPath ?? 'imsg';
-            await execFileAsync(cliPath, ['--version'], { timeout: EXEC_TIMEOUT_MS });
+            await execFileAsync(this.cliPath, ['--version'], { timeout: EXEC_TIMEOUT_MS });
 
             this.lastTimestamp = new Date().toISOString();
 
@@ -54,18 +55,17 @@ export class IMessageChannel extends BaseChannel {
     }
 
     async send(message: OutboundMessage): Promise<string> {
-        const cliPath = this.channelConfig.cliPath ?? 'imsg';
         const recipient = message.peer.id;
 
         if (message.media?.length) {
             for (const media of message.media) {
                 if (!media.url) continue;
-                await execFileAsync(cliPath, ['send', '--to', recipient, '--file', media.url], { timeout: EXEC_TIMEOUT_MS });
+                await execFileAsync(this.cliPath, ['send', '--to', recipient, '--file', media.url], { timeout: EXEC_TIMEOUT_MS });
             }
         }
 
         if (message.body?.trim()) {
-            await execFileAsync(cliPath, ['send', '--to', recipient, '--text', message.body], { timeout: EXEC_TIMEOUT_MS });
+            await execFileAsync(this.cliPath, ['send', '--to', recipient, '--text', message.body], { timeout: EXEC_TIMEOUT_MS });
         }
 
         return `imsg-${Date.now()}`;
@@ -76,12 +76,10 @@ export class IMessageChannel extends BaseChannel {
     async react(_options: ReactionOptions): Promise<void> {}
 
     private async poll(): Promise<void> {
-        const cliPath = this.channelConfig.cliPath ?? 'imsg';
-
         let stdout: string;
         try {
             const result = await execFileAsync(
-                cliPath,
+                this.cliPath,
                 ['watch', '--after', this.lastTimestamp, '--json'],
                 { timeout: EXEC_TIMEOUT_MS },
             );

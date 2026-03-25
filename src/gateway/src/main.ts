@@ -21,8 +21,8 @@ async function main(): Promise<void> {
         process.exit(0);
     };
 
-    process.on('SIGINT', () => shutdown('SIGINT'));
-    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT').catch((err) => { log.error({ err }, 'shutdown error'); process.exit(1); }));
+    process.on('SIGTERM', () => shutdown('SIGTERM').catch((err) => { log.error({ err }, 'shutdown error'); process.exit(1); }));
 
     await gateway.start();
 }

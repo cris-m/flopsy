@@ -1,5 +1,6 @@
 import type { Peer, OutboundMessage, ReactionOptions, Message } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
+import { isSafeMediaUrl } from '@gateway/core/security';
 import type { DiscordChannelConfig } from './types';
 
 const INTERACTION_TTL_MS = 14 * 60_000;
@@ -7,19 +8,9 @@ const INTERACTION_SWEEP_MS = 60_000;
 const MAX_PENDING_INTERACTIONS = 500;
 const MAX_DISCORD_LENGTH = 2000;
 
-function isSafeMediaUrl(url?: string): boolean {
-    if (!url) return false;
-    try {
-        const parsed = new URL(url);
-        return parsed.protocol === 'https:' || parsed.protocol === 'http:';
-    } catch {
-        return false;
-    }
-}
-
 export class DiscordChannel extends BaseChannel {
     readonly name = 'discord';
-    readonly authType = 'token' as const;
+    readonly authType = 'token';
 
     private client: import('discord.js').Client | null = null;
     private readonly channelConfig: DiscordChannelConfig;
@@ -68,7 +59,7 @@ export class DiscordChannel extends BaseChannel {
                 const senderId = msg.author.id;
 
                 if (!isDM && !this.isGuildAllowed(msg.guildId, msg.channelId)) return;
-                if (!this.isAllowed(senderId, isDM ? 'user' : 'group')) return;
+                if (!this.isAllowed(peerId, peerType)) return;
 
                 const normalized: Message = {
                     id: msg.id,
@@ -91,6 +82,8 @@ export class DiscordChannel extends BaseChannel {
                 const senderId = interaction.user.id;
                 const channelId = interaction.channelId;
                 const isDM = !interaction.guildId;
+                const peerId = isDM ? senderId : channelId;
+                const peerType = isDM ? 'user' as const : 'group' as const;
 
                 if (!channelId) {
                     await interaction.reply({ content: 'Unable to process.', ephemeral: true });
@@ -102,7 +95,7 @@ export class DiscordChannel extends BaseChannel {
                     return;
                 }
 
-                if (!this.isAllowed(senderId, isDM ? 'user' : 'group')) {
+                if (!this.isAllowed(peerId, peerType)) {
                     await interaction.reply({ content: 'Not authorized.', ephemeral: true });
                     return;
                 }
@@ -111,7 +104,7 @@ export class DiscordChannel extends BaseChannel {
                 const normalized: Message = {
                     id: interaction.id,
                     channelName: this.name,
-                    peer: { id: isDM ? senderId : channelId, type: isDM ? 'user' : 'group' },
+                    peer: { id: peerId, type: peerType },
                     sender: { id: senderId, name: interaction.user.username },
                     body: `/${interaction.commandName} ${input}`.trim(),
                     timestamp: new Date().toISOString(),
@@ -151,6 +144,8 @@ export class DiscordChannel extends BaseChannel {
     async send(message: OutboundMessage): Promise<string> {
         if (!this.client) throw new Error('Discord not connected');
 
+        const files = this.buildFileAttachments(message);
+
         if (message.replyTo) {
             const pending = this.pendingInteractions.get(message.replyTo);
             if (pending) {
@@ -158,39 +153,23 @@ export class DiscordChannel extends BaseChannel {
                 const interaction = pending.interaction as import('discord.js').ChatInputCommandInteraction;
                 const reply = await interaction.editReply({
                     content: (message.body ?? '').slice(0, MAX_DISCORD_LENGTH),
-                    ...(message.media?.length && {
-                        files: message.media.filter((m) => isSafeMediaUrl(m.url)).map((m) => ({
-                            attachment: m.url ?? m.data ?? '',
-                            name: m.fileName ?? 'file',
-                        })),
-                    }),
+                    ...(files.length && { files }),
                 });
                 return reply.id;
             }
         }
 
-        const channel = await this.resolveChannel(message.peer);
-        if (!channel || !('send' in channel)) {
-            throw new Error(`Cannot send to channel ${message.peer.id}`);
+        const channel = await this.resolveTextChannel(message.peer);
+
+        if (files.length) {
+            const sent = await channel.send({
+                content: message.body ? message.body.slice(0, MAX_DISCORD_LENGTH) : undefined,
+                files,
+            });
+            return sent.id;
         }
 
-        const sendable = channel as Extract<typeof channel, { send: Function }>;
-
-        if (message.media?.length) {
-            const files = message.media.filter((m) => isSafeMediaUrl(m.url)).map((m) => ({
-                attachment: m.url ?? m.data ?? '',
-                name: m.fileName ?? 'file',
-            }));
-            if (files.length) {
-                const sent = await sendable.send({
-                    content: message.body ?? undefined,
-                    files,
-                });
-                return sent.id;
-            }
-        }
-
-        const sent = await sendable.send({
+        const sent = await channel.send({
             content: (message.body ?? '').slice(0, MAX_DISCORD_LENGTH),
             ...(message.replyTo && { reply: { messageReference: message.replyTo } }),
         });
@@ -201,23 +180,16 @@ export class DiscordChannel extends BaseChannel {
         if (!this.client) return;
 
         try {
-            const channel = await this.resolveChannel(peer);
-            if (channel && 'sendTyping' in channel) {
-                await (channel as Extract<typeof channel, { sendTyping: Function }>).sendTyping();
-            }
+            const channel = await this.resolveTextChannel(peer);
+            await channel.sendTyping();
         } catch {}
     }
 
     async react(options: ReactionOptions): Promise<void> {
         if (!this.client) throw new Error('Discord not connected');
 
-        const channel = await this.resolveChannel(options.peer);
-        if (!channel || !('messages' in channel)) {
-            throw new Error(`Cannot react in channel ${options.peer.id}`);
-        }
-
-        const textChannel = channel as import('discord.js').TextBasedChannel & { messages: import('discord.js').MessageManager };
-        const msg = await textChannel.messages.fetch(options.messageId);
+        const channel = await this.resolveTextChannel(options.peer);
+        const msg = await channel.messages.fetch(options.messageId);
 
         if (options.remove) {
             const reaction = msg.reactions.cache.find((r) => r.emoji.name === options.emoji);
@@ -278,6 +250,13 @@ export class DiscordChannel extends BaseChannel {
         });
     }
 
+    private buildFileAttachments(message: OutboundMessage): { attachment: string; name: string }[] {
+        if (!message.media?.length) return [];
+        return message.media
+            .filter((m) => isSafeMediaUrl(m.url))
+            .map((m) => ({ attachment: m.url ?? m.data ?? '', name: m.fileName ?? 'file' }));
+    }
+
     private isGuildAllowed(guildId: string | null, channelId: string): boolean {
         if (this.channelConfig.allowedGuilds?.length) {
             if (!guildId || !this.channelConfig.allowedGuilds.includes(guildId)) return false;
@@ -288,13 +267,17 @@ export class DiscordChannel extends BaseChannel {
         return true;
     }
 
-    private async resolveChannel(peer: Peer): Promise<import('discord.js').Channel | null> {
-        if (!this.client) return null;
-        if (peer.type === 'user') {
-            const user = await this.client.users.fetch(peer.id);
-            return user.createDM();
+    private async resolveTextChannel(peer: Peer) {
+        if (!this.client) throw new Error('Discord not connected');
+
+        const channel = peer.type === 'user'
+            ? await this.client.users.fetch(peer.id).then((u) => u.createDM())
+            : await this.client.channels.fetch(peer.id);
+
+        if (!channel || !('send' in channel)) {
+            throw new Error(`Cannot resolve text channel for ${peer.id}`);
         }
-        return this.client.channels.fetch(peer.id);
+        return channel as import('discord.js').DMChannel;
     }
 
     private ensureSweep(): void {

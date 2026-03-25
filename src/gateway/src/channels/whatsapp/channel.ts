@@ -2,11 +2,12 @@ import type { WASocket, ConnectionState, AnyMessageContent } from '@whiskeysocke
 import type { Boom } from '@hapi/boom';
 import type { Peer, OutboundMessage, ReactionOptions, Message } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
+import { isSafeMediaUrl } from '@gateway/core/security';
 import type { WhatsAppChannelConfig } from './types';
 
 export class WhatsAppChannel extends BaseChannel {
     readonly name = 'whatsapp';
-    readonly authType = 'qr' as const;
+    readonly authType = 'qr';
 
     private socket: WASocket | null = null;
     private readonly channelConfig: WhatsAppChannelConfig;
@@ -65,28 +66,32 @@ export class WhatsAppChannel extends BaseChannel {
 
             this.socket.ev.on('messages.upsert', async ({ messages }) => {
                 for (const msg of messages) {
-                    if (!msg.message || msg.key.fromMe) continue;
+                    try {
+                        if (!msg.message || msg.key.fromMe) continue;
 
-                    const senderId = msg.key.remoteJid ?? '';
-                    const isGroup = senderId.endsWith('@g.us');
-                    const peerType = isGroup ? 'group' as const : 'user' as const;
+                        const senderId = msg.key.remoteJid ?? '';
+                        const isGroup = senderId.endsWith('@g.us');
+                        const peerType = isGroup ? 'group' as const : 'user' as const;
 
-                    if (!this.isAllowed(senderId, peerType)) continue;
+                        if (!this.isAllowed(senderId, peerType)) continue;
 
-                    const body =
-                        msg.message.conversation ??
-                        msg.message.extendedTextMessage?.text ??
-                        msg.message.imageMessage?.caption ??
-                        '';
+                        const body =
+                            msg.message.conversation ??
+                            msg.message.extendedTextMessage?.text ??
+                            msg.message.imageMessage?.caption ??
+                            '';
 
-                    await this.emit('onMessage', {
-                        id: msg.key.id ?? '',
-                        channelName: this.name,
-                        peer: { id: senderId, type: peerType },
-                        sender: msg.key.participant ? { id: msg.key.participant } : undefined,
-                        body,
-                        timestamp: new Date((msg.messageTimestamp as number) * 1000).toISOString(),
-                    });
+                        await this.emit('onMessage', {
+                            id: msg.key.id ?? '',
+                            channelName: this.name,
+                            peer: { id: senderId, type: peerType },
+                            sender: msg.key.participant ? { id: msg.key.participant } : undefined,
+                            body,
+                            timestamp: new Date((msg.messageTimestamp as number) * 1000).toISOString(),
+                        });
+                    } catch (err) {
+                        this.emitError(toError(err));
+                    }
                 }
             });
         } catch (err) {
@@ -121,6 +126,7 @@ export class WhatsAppChannel extends BaseChannel {
             let lastId = '';
             for (let i = 0; i < message.media.length; i++) {
                 const media = message.media[i]!;
+                if (!isSafeMediaUrl(media.url)) continue;
                 const caption = i === 0 ? message.body : undefined;
                 let content: AnyMessageContent;
 

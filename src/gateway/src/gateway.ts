@@ -2,6 +2,9 @@ import { loadConfig, type FlopsyConfig } from '@flopsy/shared';
 import type { Message } from '@gateway/types';
 import { BaseGateway } from '@gateway/core/base-gateway';
 import { WebhookServer } from '@gateway/core/base-webhook';
+import { verifyWebhookSignature } from '@gateway/core/security';
+import { MessageRouter } from '@gateway/core/message-router';
+import type { AgentHandler } from '@gateway/core/agent-handler';
 import { WhatsAppChannel } from '@gateway/channels/whatsapp';
 import { TelegramChannel } from '@gateway/channels/telegram';
 import { DiscordChannel } from '@gateway/channels/discord';
@@ -11,6 +14,7 @@ import { IMessageChannel } from '@gateway/channels/imessage';
 
 export class FlopsyGateway extends BaseGateway {
     private webhookServer: WebhookServer | null = null;
+    private router: MessageRouter | null = null;
     private readonly cfg: FlopsyConfig;
 
     constructor(config?: FlopsyConfig) {
@@ -27,6 +31,17 @@ export class FlopsyGateway extends BaseGateway {
 
         this.cfg = cfg;
         this.registerChannels(cfg);
+    }
+
+    setAgentHandler(handler: AgentHandler): void {
+        this.router = new MessageRouter({
+            agentHandler: handler,
+            coalesceDelayMs: this.cfg.gateway.coalesceDelayMs,
+        });
+
+        for (const channel of this.channels.values()) {
+            this.router.registerChannel(channel);
+        }
     }
 
     private registerChannels(cfg: FlopsyConfig): void {
@@ -131,12 +146,17 @@ export class FlopsyGateway extends BaseGateway {
         await this.webhookServer.start({
             port: wh.port,
             host: wh.host,
-            secret: wh.secret || undefined,
+            secret: wh.secret ?? undefined,
             allowedIps: wh.allowedIps.length ? wh.allowedIps : undefined,
         });
     }
 
     protected async onStop(): Promise<void> {
+        if (this.router) {
+            await this.router.stopAll();
+            this.router = null;
+        }
+
         if (this.webhookServer) {
             await this.webhookServer.stop();
             this.webhookServer = null;
@@ -149,7 +169,15 @@ export class FlopsyGateway extends BaseGateway {
         const lineChannel = this.getChannel('line') as LineChannel | undefined;
         if (lineChannel) {
             const webhookPath = this.cfg.channels.line.webhookPath;
-            this.webhookServer.registerRoute(webhookPath, async (_req, body, res) => {
+            const lineSecret = this.cfg.channels.line.channelSecret;
+            this.webhookServer.registerRoute(webhookPath, async (req, body, res) => {
+                if (lineSecret) {
+                    const sig = req.headers['x-line-signature'] as string | undefined;
+                    if (!sig || !verifyWebhookSignature(lineSecret, body, sig, { algorithm: 'sha256', format: 'base64' })) {
+                        this.webhookServer!.respond(res, 401, { error: 'Invalid LINE signature' });
+                        return;
+                    }
+                }
                 const parsed = this.webhookServer!.parseJson(body);
                 if (!parsed || typeof parsed !== 'object') {
                     this.webhookServer!.respond(res, 400, { error: 'Invalid JSON' });
@@ -182,6 +210,16 @@ export class FlopsyGateway extends BaseGateway {
         }, 'inbound message');
 
         await this.ackReact(message);
+
+        if (!this.router) {
+            this.log.warn('no agent handler configured - message not routed');
+            return;
+        }
+
+        const channel = this.getChannel(message.channelName);
+        if (!channel) return;
+
+        await this.router.route(message, channel);
     }
 
     private async ackReact(message: Message): Promise<void> {

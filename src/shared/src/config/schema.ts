@@ -118,6 +118,7 @@ const gatewaySchema = z.object({
     host: z.string().default('127.0.0.1'),
     port: z.number().int().min(1).max(65535).default(18789),
     token: z.string().default(''),
+    coalesceDelayMs: z.number().int().min(0).max(5_000).default(300),
     rateLimit: z.object({
         windowMs: z.number().default(60_000),
         maxRequests: z.number().default(100),

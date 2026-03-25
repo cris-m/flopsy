@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'http';
 import { createLogger } from '@flopsy/shared';
-import { verifyWebhookSignature, isLoopbackIp, type WebhookSignatureConfig } from './security';
+import { verifyWebhookSignature, isLoopbackIp } from './security';
 
 export interface WebhookConfig {
     port: number;
@@ -75,7 +75,7 @@ export class WebhookServer {
         res.end(JSON.stringify(data));
     }
 
-    parseJson(body: string): unknown | null {
+    parseJson(body: string): unknown {
         try {
             return JSON.parse(body);
         } catch {
@@ -170,17 +170,19 @@ export class WebhookServer {
         return new Promise((resolve, reject) => {
             const chunks: Buffer[] = [];
             let received = 0;
+            let settled = false;
             req.on('data', (chunk: Buffer) => {
                 received += chunk.length;
-                if (received > maxBytes) {
-                    req.destroy(new Error('body too large'));
+                if (received > maxBytes && !settled) {
+                    settled = true;
                     reject(new Error('body too large'));
+                    req.destroy();
                     return;
                 }
-                chunks.push(chunk);
+                if (!settled) chunks.push(chunk);
             });
-            req.on('end', () => resolve(Buffer.concat(chunks).toString()));
-            req.on('error', reject);
+            req.on('end', () => { if (!settled) { settled = true; resolve(Buffer.concat(chunks).toString()); } });
+            req.on('error', (err) => { if (!settled) { settled = true; reject(err); } });
         });
     }
 

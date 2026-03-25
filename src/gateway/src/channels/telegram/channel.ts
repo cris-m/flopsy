@@ -1,10 +1,11 @@
 import type { Peer, OutboundMessage, ReactionOptions, Message } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
+import { isSafeMediaUrl } from '@gateway/core/security';
 import type { TelegramChannelConfig } from './types';
 
 export class TelegramChannel extends BaseChannel {
     readonly name = 'telegram';
-    readonly authType = 'token' as const;
+    readonly authType = 'token';
 
     private bot: import('grammy').Bot | null = null;
     private botInfo: { id: number; username: string } | null = null;
@@ -87,9 +88,8 @@ export class TelegramChannel extends BaseChannel {
                 const media = message.media[i]!;
                 const caption = i === 0 ? message.body : undefined;
                 const { InputFile } = await import('grammy');
-                const inputFile = media.url?.startsWith('http')
-                    ? new InputFile(new URL(media.url))
-                    : new InputFile(media.url ?? '');
+                if (!isSafeMediaUrl(media.url)) continue;
+                const inputFile = new InputFile(new URL(media.url!));
 
                 let sent;
                 switch (media.type) {
