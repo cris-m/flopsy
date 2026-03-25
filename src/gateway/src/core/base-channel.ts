@@ -131,7 +131,11 @@ export abstract class BaseChannel implements Channel {
         }
 
         if (this.dmPolicy === 'pairing') {
-            return this.pairingRequestHandler != null;
+            if (!this.pairingRequestHandler) return false;
+            const allowed = this._config.allowFrom ?? [];
+            if (allowed.includes(senderId)) return true;
+            this.pairingRequestHandler({ channelName: this.name, senderId, timestamp: Date.now() });
+            return false;
         }
 
         return false;

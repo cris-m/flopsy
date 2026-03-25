@@ -6,7 +6,7 @@ import type { SignalChannelConfig } from './types';
 
 export class SignalChannel extends BaseChannel {
     readonly name = 'signal';
-    readonly authType = 'qr' as const;
+    readonly authType = 'qr';
 
     private process: ChildProcess | null = null;
     private reader: Interface | null = null;

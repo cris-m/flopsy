@@ -2,17 +2,20 @@ import type { Channel } from './channel';
 
 export type Platform = 'whatsapp' | 'telegram' | 'discord' | 'line' | 'signal' | (string & {});
 
+export interface RateLimitConfig {
+    windowMs?: number;
+    maxRequests?: number;
+    maxConnectionsPerIp?: number;
+}
+
+
 export interface GatewayConfig {
     port?: number;
     host?: string;
     token?: string;
     deduplicationTtlMs?: number;
     maxDeduplicationEntries?: number;
-    rateLimit?: {
-        windowMs?: number;
-        maxRequests?: number;
-        maxConnectionsPerIp?: number;
-    };
+    rateLimit?: RateLimitConfig;
 }
 
 export interface Gateway {

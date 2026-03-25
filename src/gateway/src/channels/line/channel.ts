@@ -1,10 +1,11 @@
 import type { Peer, OutboundMessage, ReactionOptions, Message } from '@gateway/types';
-import { BaseChannel } from '@gateway/core/base-channel';
+import { BaseChannel, toError } from '@gateway/core/base-channel';
+import { isSafeMediaUrl } from '@gateway/core/security';
 import type { LineChannelConfig } from './types';
 
 export class LineChannel extends BaseChannel {
     readonly name = 'line';
-    readonly authType = 'token' as const;
+    readonly authType = 'token';
 
     private client: import('@line/bot-sdk').messagingApi.MessagingApiClient | null = null;
     private readonly channelConfig: LineChannelConfig;
@@ -29,7 +30,7 @@ export class LineChannel extends BaseChannel {
             this.emit('onAuthUpdate', 'authenticated');
         } catch (err) {
             this.setStatus('error');
-            this.emitError(err instanceof Error ? err : new Error(String(err)));
+            this.emitError(toError(err));
         }
     }
 
@@ -46,6 +47,7 @@ export class LineChannel extends BaseChannel {
 
         if (message.media?.length) {
             for (const media of message.media) {
+                if (!isSafeMediaUrl(media.url)) continue;
                 switch (media.type) {
                     case 'image':
                         messages.push({
