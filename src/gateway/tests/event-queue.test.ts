@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { EventQueue, type ChannelEvent } from '../src/core/event-queue';
+import { EventQueue } from '../src/core/event-queue';
+import type { ChannelEvent } from '../src/types/agent';
 
 function makeEvent(overrides: Partial<ChannelEvent> = {}): ChannelEvent {
     return {

@@ -10,6 +10,7 @@ import type {
     ReactionOptions,
     AccessControlUpdate,
     PairingRequestHandler,
+    BaseChannelConfig,
 } from '@gateway/types';
 
 const RECONNECT_BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 30_000, 60_000];
@@ -17,15 +18,6 @@ const MAX_RECONNECT_ATTEMPTS = 6;
 
 export function toError(err: unknown): Error {
     return err instanceof Error ? err : new Error(String(err));
-}
-
-export interface BaseChannelConfig {
-    enabled: boolean;
-    dmPolicy: DmPolicy;
-    groupPolicy?: GroupPolicy;
-    allowFrom?: string[];
-    blockedFrom?: string[];
-    allowedGroups?: string[];
 }
 
 export abstract class BaseChannel implements Channel {
@@ -65,8 +57,10 @@ export abstract class BaseChannel implements Channel {
         this.handlers[event] = handler;
     }
 
-    off<K extends keyof ChannelEvents>(event: K, _handler: ChannelEvents[K]): void {
-        delete this.handlers[event];
+    off<K extends keyof ChannelEvents>(event: K, handler: ChannelEvents[K]): void {
+        if (this.handlers[event] === handler) {
+            delete this.handlers[event];
+        }
     }
 
     protected emit<K extends keyof ChannelEvents>(

@@ -1,7 +1,6 @@
 import { timingSafeEqual, createHmac } from 'crypto';
 import { resolve, sep } from 'path';
 
-
 const SAFE_ID_REGEX = /^[a-zA-Z0-9._:+@-]+$/;
 
 const MAX_MESSAGE_ID_LENGTH = 256;
@@ -29,16 +28,53 @@ export interface WebhookSignatureConfig {
 }
 
 const BLOCKED_HOSTS = new Set([
-    'localhost', '127.0.0.1', '0.0.0.0', '[::1]', '::1',
-    'metadata.google.internal', 'metadata.azure.internal',
+    'localhost', 
+    '127.0.0.1', 
+    '0.0.0.0', 
+    '[::1]', 
+    '::1',
+    '169.254.169.254', 
+    '169.254.170.2',
+    '100.100.100.200',
+    'metadata.google.internal', 
+    'metadata.azure.internal',
+    'kubernetes.default.svc',
 ]);
 
 const PRIVATE_PATTERNS = [
-    /^10\./, /^172\.(1[6-9]|2\d|3[01])\./, /^192\.168\./, /^169\.254\./,
-    /^0x/i, /^\d{8,}$/,
-    /^fd[0-9a-f]{2}:/i, /^fe80:/i, /^fc[0-9a-f]{2}:/i,
-    /^::ffff:/i, /^\[::ffff:/i,
-    /^\[fd/i, /^\[fe80:/i, /^\[fc/i,
+    /^10\./,
+    /^172\.(1[6-9]|2\d|3[01])\./,
+    /^192\.168\./,
+    /^169\.254\./,
+    /^127\./,
+    /^0\.0\.0\.0$/,
+    /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./,
+    /^192\.0\.0\./,
+    /^192\.0\.2\./,
+    /^198\.18\./,
+    /^198\.51\.100\./,
+    /^203\.0\.113\./,
+    /^224\./,
+    /^240\./,
+    /^0x/i,
+    /^\d{8,}$/,
+    /^0[0-7]+\./,
+    /^\d+\.\d+$/,
+    /^\d+\.\d+\.\d+$/,
+    /^::1$/,
+    /^\[::1\]$/,
+    /^::$/,
+    /^\[::\]$/,
+    /^fc[0-9a-f]{2}:/i,
+    /^fd[0-9a-f]{2}:/i,
+    /^fe80:/i,
+    /^::ffff:/i,
+    /^\[::ffff:/i,
+    /^\[(fc|fd|fe80)/i,
+    /^localhost$/i,
+    /\.localhost$/i,
+    /\.local$/i,
+    /\.internal$/i,
 ];
 
 export function validateToken(
@@ -249,7 +285,6 @@ export function verifyWebhookSignature(
     }
 }
 
-
 export function isSafeMediaUrl(url?: string): boolean {
     if (!url) return false;
     try {
@@ -266,10 +301,35 @@ export function isSafeMediaUrl(url?: string): boolean {
     }
 }
 
-export function sanitizeInbound(msg: { id: string; channelName: string; body: string }): SanitizedMessage {
-    return {
+export function sanitizeInbound(msg: {
+    id: string;
+    channelName: string;
+    body: string;
+    peer?: { id: string; name?: string };
+    sender?: { id: string; name?: string };
+}): SanitizedMessage & {
+    peer?: { id: string; name?: string };
+    sender?: { id: string; name?: string };
+} {
+    const result: SanitizedMessage & {
+        peer?: { id: string; name?: string };
+        sender?: { id: string; name?: string };
+    } = {
         id: msg.id.replace(/\0/g, '').slice(0, MAX_MESSAGE_ID_LENGTH),
         channelName: msg.channelName.replace(/\0/g, '').slice(0, MAX_CHANNEL_NAME_LENGTH),
         body: msg.body.replace(/\0/g, '').trim().slice(0, MAX_BODY_LENGTH),
     };
+    if (msg.peer) {
+        result.peer = {
+            id: msg.peer.id.replace(/\0/g, '').slice(0, MAX_MESSAGE_ID_LENGTH),
+            ...(msg.peer.name && { name: sanitize(msg.peer.name, 200) }),
+        };
+    }
+    if (msg.sender) {
+        result.sender = {
+            id: msg.sender.id.replace(/\0/g, '').slice(0, MAX_MESSAGE_ID_LENGTH),
+            ...(msg.sender.name && { name: sanitize(msg.sender.name, 200) }),
+        };
+    }
+    return result;
 }

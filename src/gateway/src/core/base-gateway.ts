@@ -5,6 +5,7 @@ import type { IncomingMessage } from 'http';
 import type { Gateway, GatewayConfig, Channel, Message } from '@gateway/types';
 import {
     sanitizeInbound,
+    sanitize,
     isSafeIdentifier,
     RateLimiter,
     validateToken,
@@ -68,28 +69,48 @@ export abstract class BaseGateway implements Gateway {
         return this._channels;
     }
 
+    private readonly channelHandlers = new Map<string, {
+        onMessage: (msg: Message) => Promise<void>;
+        onStatusChange: (status: string) => void;
+        onError: (err: Error) => void;
+        onQR: (qr: string) => void;
+    }>();
+
     register(channel: Channel): void {
         if (this._channels.has(channel.name)) {
             throw new Error(`Channel "${channel.name}" is already registered`);
         }
         this._channels.set(channel.name, channel);
-        channel.on('onMessage', (msg) => this.handleInbound(msg));
-        channel.on('onStatusChange', (status) => this.broadcast('channel.status', { channel: channel.name, status }));
-        channel.on('onError', (err) => {
-            this.log.error({ channel: channel.name, err }, 'channel error');
-            this.broadcast('channel.error', { channel: channel.name, error: err.message });
-        });
-        channel.on('onQR', (qr) => this.broadcast('channel.qr', { channel: channel.name, qr }));
+
+        const handlers = {
+            onMessage: (msg: Message) => this.handleInbound(msg),
+            onStatusChange: (status: string) => this.broadcast('channel.status', { channel: channel.name, status }),
+            onError: (err: Error) => {
+                this.log.error({ channel: channel.name, err }, 'channel error');
+                this.broadcast('channel.error', { channel: channel.name, error: err.message });
+            },
+            onQR: (qr: string) => this.broadcast('channel.qr', { channel: channel.name, qr }),
+        };
+        this.channelHandlers.set(channel.name, handlers);
+
+        channel.on('onMessage', handlers.onMessage);
+        channel.on('onStatusChange', handlers.onStatusChange);
+        channel.on('onError', handlers.onError);
+        channel.on('onQR', handlers.onQR);
         this.log.info(`channel registered - ${channel.name} (auth=${channel.authType}, dm=${channel.dmPolicy})`);
     }
 
     unregister(name: string): void {
         const channel = this._channels.get(name);
         if (!channel) return;
-        channel.off('onMessage', undefined as never);
-        channel.off('onStatusChange', undefined as never);
-        channel.off('onError', undefined as never);
-        channel.off('onQR', undefined as never);
+        const handlers = this.channelHandlers.get(name);
+        if (handlers) {
+            channel.off('onMessage', handlers.onMessage);
+            channel.off('onStatusChange', handlers.onStatusChange);
+            channel.off('onError', handlers.onError);
+            channel.off('onQR', handlers.onQR);
+            this.channelHandlers.delete(name);
+        }
         this._channels.delete(name);
         this.log.info({ channel: name }, 'channel unregistered');
     }
@@ -366,21 +387,31 @@ export abstract class BaseGateway implements Gateway {
             return { subscribed: [...client.subscriptions] };
         });
 
+        const VALID_PEER_TYPES = new Set(['user', 'group', 'channel']);
+
         this.handlers.set('send', async (_client, params) => {
             const channelName = params?.channel as string;
             const peerId = params?.peerId as string;
             const body = params?.body as string | undefined;
             if (!channelName || !peerId) return { error: 'channel and peerId required' };
 
+            if (!isSafeIdentifier(peerId)) return { error: 'invalid peerId' };
+
+            const rawPeerType = (params?.peerType as string) ?? 'user';
+            if (!VALID_PEER_TYPES.has(rawPeerType)) return { error: 'invalid peerType' };
+            const peerType = rawPeerType as 'user' | 'group' | 'channel';
+
+            const sanitizedBody = body ? sanitize(body, 50_000) : undefined;
+
             const channel = this._channels.get(channelName);
             if (!channel) return { error: `channel "${channelName}" not found` };
 
             const messageId = await channel.send({
-                peer: { id: peerId, type: (params?.peerType as 'user' | 'group' | 'channel') ?? 'user' },
-                body,
+                peer: { id: peerId, type: peerType },
+                body: sanitizedBody,
             });
 
-            this.broadcast('message.outbound', { channel: channelName, peerId, body, messageId });
+            this.broadcast('message.outbound', { channel: channelName, peerId, body: sanitizedBody, messageId });
             return { messageId };
         });
 

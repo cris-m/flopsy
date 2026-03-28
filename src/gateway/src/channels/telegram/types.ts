@@ -1,4 +1,4 @@
-import type { BaseChannelConfig } from '@gateway/core/base-channel';
+import type { BaseChannelConfig } from '@gateway/types';
 
 export interface TelegramChannelConfig extends BaseChannelConfig {
     token: string;

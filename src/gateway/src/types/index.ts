@@ -5,6 +5,15 @@ export type {
 } from './gateway';
 
 export type {
+    AgentCallbacks,
+    AgentHandler,
+    AgentResult,
+    ChannelEvent,
+    IEventQueue,
+    InvokeRole,
+} from './agent';
+
+export type {
     ChannelStatus,
     AuthState,
     DmPolicy,
@@ -22,4 +31,6 @@ export type {
     AccessControlUpdate,
     AuthType,
     Channel,
+    ChannelWorkerConfig,
+    BaseChannelConfig,
 } from './channel';

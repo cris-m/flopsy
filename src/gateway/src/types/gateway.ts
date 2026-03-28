@@ -1,13 +1,7 @@
 import type { Channel } from './channel';
+import type { RateLimitConfig } from '../core/security';
 
 export type Platform = 'whatsapp' | 'telegram' | 'discord' | 'line' | 'signal' | (string & {});
-
-export interface RateLimitConfig {
-    windowMs?: number;
-    maxRequests?: number;
-    maxConnectionsPerIp?: number;
-}
-
 
 export interface GatewayConfig {
     port?: number;
@@ -15,7 +9,7 @@ export interface GatewayConfig {
     token?: string;
     deduplicationTtlMs?: number;
     maxDeduplicationEntries?: number;
-    rateLimit?: RateLimitConfig;
+    rateLimit?: Partial<RateLimitConfig>;
 }
 
 export interface Gateway {

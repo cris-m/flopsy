@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { MessageRouter } from '../src/core/message-router';
-import type { AgentHandler, AgentResult } from '../src/core/agent-handler';
+import type { AgentHandler, AgentResult } from '../src/types/agent';
 import type { Channel, Message } from '../src/types';
 
 function createMockChannel(name = 'discord'): Channel {

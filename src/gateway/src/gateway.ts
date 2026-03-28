@@ -4,7 +4,7 @@ import { BaseGateway } from '@gateway/core/base-gateway';
 import { WebhookServer } from '@gateway/core/base-webhook';
 import { verifyWebhookSignature } from '@gateway/core/security';
 import { MessageRouter } from '@gateway/core/message-router';
-import type { AgentHandler } from '@gateway/core/agent-handler';
+import type { AgentHandler } from '@gateway/types/agent';
 import { WhatsAppChannel } from '@gateway/channels/whatsapp';
 import { TelegramChannel } from '@gateway/channels/telegram';
 import { DiscordChannel } from '@gateway/channels/discord';

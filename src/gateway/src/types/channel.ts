@@ -77,6 +77,8 @@ export interface AccessControlUpdate {
     allowedGroups?: string[];
 }
 
+import type { AgentHandler } from './agent';
+
 export type AuthType = 'qr' | 'token' | 'oauth' | 'none';
 
 export interface Channel {
@@ -101,4 +103,25 @@ export interface Channel {
 
     on<K extends keyof ChannelEvents>(event: K, handler: ChannelEvents[K]): void;
     off<K extends keyof ChannelEvents>(event: K, handler: ChannelEvents[K]): void;
+}
+
+export interface BaseChannelConfig {
+    enabled: boolean;
+    dmPolicy: DmPolicy;
+    groupPolicy?: GroupPolicy;
+    allowFrom?: string[];
+    blockedFrom?: string[];
+    allowedGroups?: string[];
+}
+
+export interface ChannelWorkerConfig {
+    readonly channel: Channel;
+    readonly threadId: string;
+    readonly agentHandler: AgentHandler;
+    readonly onReply: (text: string, peer: Peer, replyTo?: string) => Promise<void>;
+    readonly coalesceDelayMs?: number;
+    /** Timeout for regular user turns. Default: 120 000 ms (2 min). */
+    readonly agentTimeoutMs?: number;
+    /** Timeout for background-task result turns. Default: 600 000 ms (10 min). */
+    readonly backgroundTurnTimeoutMs?: number;
 }
