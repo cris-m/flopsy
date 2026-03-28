@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'http';
 import { createLogger } from '@flopsy/shared';
-import { verifyWebhookSignature, isLoopbackIp } from './security';
+import { verifyWebhookSignature, isLoopbackIp, RateLimiter } from './security';
 
 export interface WebhookConfig {
     port: number;
@@ -24,6 +24,7 @@ export class WebhookServer {
     private readonly processed = new Map<string, number>();
     private cleanupInterval: ReturnType<typeof setInterval> | null = null;
     private readonly routes = new Map<string, RouteHandler>();
+    private readonly rateLimiter = new RateLimiter();
 
     registerRoute(pathPrefix: string, handler: RouteHandler): void {
         this.routes.set(pathPrefix, handler);
@@ -42,6 +43,10 @@ export class WebhookServer {
 
         this.cleanupInterval = setInterval(() => this.sweepDedup(), 5 * 60_000);
         this.cleanupInterval.unref();
+
+        if (!config.secret) {
+            this.log.warn('webhook server starting WITHOUT signature verification — all requests will be accepted unsigned');
+        }
 
         return new Promise((resolve, reject) => {
             this.server!.on('error', reject);
@@ -101,6 +106,12 @@ export class WebhookServer {
         } else if (!isLoopbackIp(clientIp)) {
             this.log.warn({ ip: clientIp }, 'rejected non-loopback (no allowlist configured)');
             return this.respond(res, 403, { error: 'Forbidden' });
+        }
+
+        const rateResult = this.rateLimiter.checkRequest(clientIp);
+        if (rateResult.blocked) {
+            this.log.warn({ ip: clientIp }, 'webhook rate limited');
+            return this.respond(res, 429, { error: 'Too many requests' });
         }
 
         let body: string;

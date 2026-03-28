@@ -1,4 +1,4 @@
-import type { BaseChannelConfig } from '@gateway/core/base-channel';
+import type { BaseChannelConfig } from '@gateway/types';
 
 export type DiscordStatus = 'online' | 'idle' | 'dnd' | 'invisible';
 export type DiscordActivityType = 'playing' | 'streaming' | 'listening' | 'watching' | 'competing';

@@ -1,9 +1,9 @@
 import { createLogger } from '@flopsy/shared';
 
-import type { Channel, Message, Peer } from '@gateway/types';
+import type { Channel, Message, Peer, ChannelWorkerConfig } from '@gateway/types';
 
-import type { AgentHandler } from './agent-handler';
-import { ChannelWorker, type ChannelWorkerConfig } from './channel-worker';
+import type { AgentHandler } from '../types/agent';
+import { ChannelWorker } from './channel-worker';
 
 export interface MessageRouterConfig {
     readonly agentHandler: AgentHandler;
@@ -28,12 +28,6 @@ export class MessageRouter {
 
     getWorker(channelName: string): ChannelWorker | undefined {
         return this.workers.get(channelName);
-    }
-
-    startAll(): void {
-        for (const worker of this.workers.values()) {
-            worker.start();
-        }
     }
 
     async stopAll(): Promise<void> {

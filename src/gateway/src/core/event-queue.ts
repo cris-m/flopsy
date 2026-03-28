@@ -1,14 +1,8 @@
-export interface ChannelEvent {
-    readonly type: 'task_complete' | 'task_error';
-    readonly taskId: string;
-    readonly result?: string;
-    readonly error?: string;
-    readonly completedAt: number;
-}
+import type { ChannelEvent, IEventQueue } from '../types/agent';
 
 const MAX_QUEUED_EVENTS = 1_000;
 
-export class EventQueue {
+export class EventQueue implements IEventQueue {
     private readonly queue: ChannelEvent[] = [];
     private waiter: (() => void) | null = null;
 

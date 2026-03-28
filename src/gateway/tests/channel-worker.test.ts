@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { ChannelWorker } from '../src/core/channel-worker';
-import type { AgentHandler, AgentResult, AgentCallbacks } from '../src/core/agent-handler';
+import type { AgentHandler, AgentResult, AgentCallbacks } from '../src/types/agent';
 import type { Channel, Message, Peer } from '../src/types';
 
 function createMockChannel(name = 'test'): Channel {
