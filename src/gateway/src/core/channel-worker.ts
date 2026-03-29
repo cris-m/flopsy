@@ -53,6 +53,10 @@ export class ChannelWorker {
         return this.eventQueue;
     }
 
+    injectEvent(event: ChannelEvent): void {
+        this.eventQueue.push(event);
+    }
+
     get isRunning(): boolean {
         return this.running;
     }

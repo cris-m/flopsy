@@ -1,11 +1,13 @@
-import type { Peer, OutboundMessage, ReactionOptions, Message } from '@gateway/types';
+import type { IncomingMessage } from 'node:http';
+import type { Peer, OutboundMessage, ReactionOptions, Message, WebhookChannel } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
-import { isSafeMediaUrl } from '@gateway/core/security';
+import { isSafeMediaUrl, verifyWebhookSignature } from '@gateway/core/security';
 import type { LineChannelConfig } from './types';
 
-export class LineChannel extends BaseChannel {
+export class LineChannel extends BaseChannel implements WebhookChannel {
     readonly name = 'line';
     readonly authType = 'token';
+    readonly webhookPath: string;
 
     private client: import('@line/bot-sdk').messagingApi.MessagingApiClient | null = null;
     private readonly channelConfig: LineChannelConfig;
@@ -13,6 +15,21 @@ export class LineChannel extends BaseChannel {
     constructor(config: LineChannelConfig) {
         super(config);
         this.channelConfig = config;
+        this.webhookPath = config.webhookPath ?? '/webhook/line';
+    }
+
+    verifyWebhook(req: IncomingMessage, body: string): boolean {
+        const secret = this.channelConfig.channelSecret;
+        if (!secret) return true;
+        const sig = req.headers['x-line-signature'] as string | undefined;
+        if (!sig) return false;
+        return verifyWebhookSignature(secret, body, sig, { algorithm: 'sha256', format: 'base64' });
+    }
+
+    extractEvents(parsed: unknown): unknown[] {
+        if (!parsed || typeof parsed !== 'object') return [];
+        const events = (parsed as { events?: unknown[] }).events;
+        return Array.isArray(events) ? events : [];
     }
 
     async connect(): Promise<void> {

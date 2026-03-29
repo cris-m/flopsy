@@ -1,3 +1,6 @@
+import type { IncomingMessage } from 'node:http';
+import type { AgentHandler } from './agent';
+
 export type ChannelStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 
 export type AuthState = 'needs_scan' | 'waiting_scan' | 'authenticated' | 'expired' | 'not_configured';
@@ -77,8 +80,6 @@ export interface AccessControlUpdate {
     allowedGroups?: string[];
 }
 
-import type { AgentHandler } from './agent';
-
 export type AuthType = 'qr' | 'token' | 'oauth' | 'none';
 
 export interface Channel {
@@ -103,6 +104,31 @@ export interface Channel {
 
     on<K extends keyof ChannelEvents>(event: K, handler: ChannelEvents[K]): void;
     off<K extends keyof ChannelEvents>(event: K, handler: ChannelEvents[K]): void;
+}
+
+/**
+ * Channels that receive messages via HTTP webhook implement this interface.
+ * The gateway uses it to register a single unified webhook route per channel.
+ */
+export interface WebhookChannel {
+    /** Route path the webhook server listens on (e.g. '/webhook/line'). */
+    readonly webhookPath: string;
+    /**
+     * Verify an inbound request. Return true to accept, false to reject with 401.
+     * Channels that don't need verification should always return true.
+     */
+    verifyWebhook(req: IncomingMessage, body: string): boolean;
+    /**
+     * Extract events from the parsed JSON body.
+     * Returns an array of opaque event objects the channel understands.
+     */
+    extractEvents(parsed: unknown): unknown[];
+    /** Process a single webhook event (normalize → emit onMessage). */
+    handleWebhookEvent(event: unknown): Promise<void>;
+}
+
+export function isWebhookChannel(ch: Channel): ch is Channel & WebhookChannel {
+    return 'webhookPath' in ch && 'handleWebhookEvent' in ch && 'verifyWebhook' in ch;
 }
 
 export interface BaseChannelConfig {

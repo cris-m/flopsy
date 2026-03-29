@@ -1,0 +1,136 @@
+{
+    // FlopsyBot Configuration
+    // Copy to flopsy.json5 and fill in your values.
+    // Environment variables: ${VAR_NAME} is replaced at load time.
+
+    gateway: {
+        host: "127.0.0.1",
+        port: 18789,
+        token: "${FLOPSY_GATEWAY_TOKEN}",
+        coalesceDelayMs: 300,
+    },
+
+    channels: {
+        whatsapp: {
+            enabled: false,
+            sessionPath: ".flopsy/sessions/whatsapp",
+            dm: { policy: "pairing", allowFrom: [], blockedFrom: [] },
+            group: { policy: "disabled", activation: "mention", allowedGroups: [] },
+        },
+
+        telegram: {
+            enabled: false,
+            token: "${TELEGRAM_BOT_TOKEN}",
+            dm: { policy: "allowlist", allowFrom: ["${TELEGRAM_USER_ID}"] },
+            group: { policy: "disabled", activation: "mention" },
+        },
+
+        discord: {
+            enabled: false,
+            token: "${DISCORD_BOT_TOKEN}",
+            dm: { policy: "allowlist", allowFrom: ["${DISCORD_USER_ID}"] },
+            guild: { policy: "disabled", activation: "mention", allowedGuilds: [], allowedChannels: [] },
+        },
+
+        line: {
+            enabled: false,
+            channelAccessToken: "${LINE_CHANNEL_ACCESS_TOKEN}",
+            channelSecret: "${LINE_CHANNEL_SECRET}",
+            webhookPath: "/webhook/line",
+            dm: { policy: "open" },
+            group: { policy: "disabled" },
+        },
+
+        signal: {
+            enabled: false,
+            account: "${SIGNAL_PHONE_NUMBER}",
+            cliPath: "signal-cli",
+            deviceName: "FlopsyBot",
+            dm: { policy: "allowlist", allowFrom: ["${SIGNAL_ALLOWED_NUMBER}"] },
+            group: { policy: "disabled" },
+        },
+
+        imessage: {
+            enabled: false,
+            cliPath: "imsg",
+            selfChatMode: false,
+            dm: { policy: "allowlist", allowFrom: [] },
+        },
+
+        slack: {
+            enabled: false,
+            botToken: "${SLACK_BOT_TOKEN}",       // xoxb-...
+            appToken: "${SLACK_APP_TOKEN}",        // xapp-... (Socket Mode)
+            signingSecret: "${SLACK_SIGNING_SECRET}",
+            dm: { policy: "open" },
+            group: { policy: "open", activation: "mention" },
+        },
+
+        googlechat: {
+            enabled: false,
+            serviceAccountKeyPath: ".flopsy/google-chat-sa.json",
+            verificationToken: "${GOOGLE_CHAT_VERIFICATION_TOKEN}",
+            webhookPath: "/webhook/googlechat",
+            dm: { policy: "open" },
+            group: { policy: "open", activation: "mention" },
+        },
+    },
+
+    // Webhook server for LINE, Google Chat, and external services
+    webhook: {
+        enabled: false,
+        port: 18790,
+        host: "127.0.0.1",
+        secret: "",
+        allowedIps: [],
+    },
+
+    // External webhook endpoints — events from GitHub, Stripe, etc.
+    // pushed into the agent via the target channel's worker.
+    externalWebhooks: [
+        // {
+        //     name: "github",
+        //     path: "/webhook/github",
+        //     targetChannel: "discord",
+        //     secret: "${GITHUB_WEBHOOK_SECRET}",
+        //     eventTypeHeader: "x-github-event",
+        //     signature: {
+        //         header: "x-hub-signature-256",
+        //         algorithm: "sha256",
+        //         format: "hex",
+        //         prefix: "sha256=",
+        //     },
+        // },
+        // {
+        //     name: "stripe",
+        //     path: "/webhook/stripe",
+        //     targetChannel: "telegram",
+        //     secret: "${STRIPE_WEBHOOK_SECRET}",
+        //     eventTypeHeader: "stripe-event",
+        //     signature: {
+        //         header: "stripe-signature",
+        //         algorithm: "sha256",
+        //         format: "hex",
+        //     },
+        // },
+        // {
+        //     name: "sentry",
+        //     path: "/webhook/sentry",
+        //     targetChannel: "slack",
+        //     secret: "${SENTRY_CLIENT_SECRET}",
+        //     eventTypeHeader: "sentry-hook-resource",
+        //     signature: {
+        //         header: "sentry-hook-signature",
+        //         algorithm: "sha256",
+        //         format: "hex",
+        //     },
+        // },
+    ],
+
+    logging: {
+        level: "info",
+        pretty: true,
+    },
+
+    timezone: "UTC",
+}
