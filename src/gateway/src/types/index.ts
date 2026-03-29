@@ -33,4 +33,7 @@ export type {
     Channel,
     ChannelWorkerConfig,
     BaseChannelConfig,
+    WebhookChannel,
 } from './channel';
+
+export { isWebhookChannel } from './channel';

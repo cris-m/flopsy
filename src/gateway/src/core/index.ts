@@ -19,3 +19,4 @@ export {
     type RateLimitConfig,
     type WebhookSignatureConfig,
 } from './security';
+export { WebhookRouter, type ExternalWebhookConfig } from './webhook-router';

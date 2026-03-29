@@ -1,9 +1,10 @@
 import { loadConfig, type FlopsyConfig } from '@flopsy/shared';
-import type { Message } from '@gateway/types';
+import type { Channel, Message, WebhookChannel } from '@gateway/types';
+import { isWebhookChannel } from '@gateway/types';
 import { BaseGateway } from '@gateway/core/base-gateway';
 import { WebhookServer } from '@gateway/core/base-webhook';
-import { verifyWebhookSignature } from '@gateway/core/security';
 import { MessageRouter } from '@gateway/core/message-router';
+import { WebhookRouter, type ExternalWebhookConfig } from '@gateway/core/webhook-router';
 import type { AgentHandler } from '@gateway/types/agent';
 import { WhatsAppChannel } from '@gateway/channels/whatsapp';
 import { TelegramChannel } from '@gateway/channels/telegram';
@@ -11,9 +12,12 @@ import { DiscordChannel } from '@gateway/channels/discord';
 import { LineChannel } from '@gateway/channels/line';
 import { SignalChannel } from '@gateway/channels/signal';
 import { IMessageChannel } from '@gateway/channels/imessage';
+import { SlackChannel } from '@gateway/channels/slack';
+import { GoogleChatChannel } from '@gateway/channels/googlechat';
 
 export class FlopsyGateway extends BaseGateway {
     private webhookServer: WebhookServer | null = null;
+    private webhookRouter: WebhookRouter | null = null;
     private router: MessageRouter | null = null;
     private readonly cfg: FlopsyConfig;
 
@@ -31,6 +35,10 @@ export class FlopsyGateway extends BaseGateway {
 
         this.cfg = cfg;
         this.registerChannels(cfg);
+
+        if (cfg.externalWebhooks.length > 0) {
+            this.registerExternalWebhooks(cfg.externalWebhooks);
+        }
     }
 
     setAgentHandler(handler: AgentHandler): void {
@@ -41,6 +49,22 @@ export class FlopsyGateway extends BaseGateway {
 
         for (const channel of this.channels.values()) {
             this.router.registerChannel(channel);
+        }
+
+        if (this.webhookRouter && this.webhookServer) {
+            this.webhookRouter.register(this.webhookServer, this.router);
+        }
+    }
+
+    /**
+     * Register external webhook endpoints (GitHub, Stripe, etc.) that push
+     * events into the agent via channel worker event queues.
+     * Call before start() so routes are ready when the webhook server starts.
+     */
+    registerExternalWebhooks(configs: ExternalWebhookConfig[]): void {
+        this.webhookRouter = new WebhookRouter(configs);
+        if (this.webhookServer && this.router) {
+            this.webhookRouter.register(this.webhookServer, this.router);
         }
     }
 
@@ -105,6 +129,7 @@ export class FlopsyGateway extends BaseGateway {
                 allowedGroups: channels.line.group.allowedGroups,
                 channelAccessToken: channels.line.channelAccessToken,
                 channelSecret: channels.line.channelSecret,
+                webhookPath: channels.line.webhookPath,
             }));
         }
 
@@ -134,6 +159,37 @@ export class FlopsyGateway extends BaseGateway {
                 selfChatMode: channels.imessage.selfChatMode,
             }));
         }
+
+        if (channels.slack?.enabled) {
+            this.register(new SlackChannel({
+                enabled: true,
+                dmPolicy: channels.slack.dm.policy,
+                allowFrom: channels.slack.dm.allowFrom,
+                blockedFrom: channels.slack.dm.blockedFrom,
+                groupPolicy: channels.slack.group?.policy,
+                allowedGroups: channels.slack.group?.allowedGroups,
+                botToken: channels.slack.botToken,
+                appToken: channels.slack.appToken,
+                signingSecret: channels.slack.signingSecret,
+                groupActivation: channels.slack.group?.activation,
+            }));
+        }
+
+        if (channels.googlechat?.enabled) {
+            this.register(new GoogleChatChannel({
+                enabled: true,
+                dmPolicy: channels.googlechat.dm.policy,
+                allowFrom: channels.googlechat.dm.allowFrom,
+                blockedFrom: channels.googlechat.dm.blockedFrom,
+                groupPolicy: channels.googlechat.group?.policy,
+                allowedGroups: channels.googlechat.group?.allowedGroups,
+                serviceAccountKeyPath: channels.googlechat.serviceAccountKeyPath,
+                serviceAccountKey: channels.googlechat.serviceAccountKey,
+                verificationToken: channels.googlechat.verificationToken,
+                webhookPath: channels.googlechat.webhookPath,
+                groupActivation: channels.googlechat.group?.activation,
+            }));
+        }
     }
 
     protected async onStart(): Promise<void> {
@@ -142,6 +198,10 @@ export class FlopsyGateway extends BaseGateway {
 
         this.webhookServer = new WebhookServer();
         this.registerWebhookRoutes();
+
+        if (this.webhookRouter && this.router) {
+            this.webhookRouter.register(this.webhookServer, this.router);
+        }
 
         await this.webhookServer.start({
             port: wh.port,
@@ -166,39 +226,39 @@ export class FlopsyGateway extends BaseGateway {
     private registerWebhookRoutes(): void {
         if (!this.webhookServer) return;
 
-        const lineChannel = this.getChannel('line') as LineChannel | undefined;
-        if (lineChannel) {
-            const webhookPath = this.cfg.channels.line.webhookPath;
-            const lineSecret = this.cfg.channels.line.channelSecret;
-            this.webhookServer.registerRoute(webhookPath, async (req, body, res) => {
-                if (lineSecret) {
-                    const sig = req.headers['x-line-signature'] as string | undefined;
-                    if (!sig || !verifyWebhookSignature(lineSecret, body, sig, { algorithm: 'sha256', format: 'base64' })) {
-                        this.webhookServer!.respond(res, 401, { error: 'Invalid LINE signature' });
-                        return;
-                    }
-                }
-                const parsed = this.webhookServer!.parseJson(body);
-                if (!parsed || typeof parsed !== 'object') {
-                    this.webhookServer!.respond(res, 400, { error: 'Invalid JSON' });
-                    return;
-                }
-
-                const events = (parsed as { events?: unknown[] }).events;
-                if (!Array.isArray(events)) {
-                    this.webhookServer!.respond(res, 400, { error: 'Missing events array' });
-                    return;
-                }
-
-                this.webhookServer!.respond(res, 200, { status: 'ok' });
-
-                for (const event of events) {
-                    await lineChannel.handleWebhookEvent(
-                        event as Parameters<LineChannel['handleWebhookEvent']>[0],
-                    ).catch((err) => this.log.error({ err }, 'LINE webhook event error'));
-                }
-            });
+        for (const channel of this.channels.values()) {
+            if (isWebhookChannel(channel)) {
+                this.registerWebhookChannel(channel);
+            }
         }
+    }
+
+    private registerWebhookChannel(channel: Channel & WebhookChannel): void {
+        this.webhookServer!.registerRoute(channel.webhookPath, async (req, body, res) => {
+            if (!channel.verifyWebhook(req, body)) {
+                this.webhookServer!.respond(res, 401, { error: `Invalid ${channel.name} webhook signature` });
+                return;
+            }
+
+            const parsed = this.webhookServer!.parseJson(body);
+            if (!parsed || typeof parsed !== 'object') {
+                this.webhookServer!.respond(res, 400, { error: 'Invalid JSON' });
+                return;
+            }
+
+            const events = channel.extractEvents(parsed);
+            if (events.length === 0) {
+                this.webhookServer!.respond(res, 200, { status: 'ok', events: 0 });
+                return;
+            }
+
+            this.webhookServer!.respond(res, 200, { status: 'ok' });
+
+            for (const event of events) {
+                await channel.handleWebhookEvent(event)
+                    .catch((err) => this.log.error({ err, channel: channel.name }, 'webhook event error'));
+            }
+        });
     }
 
     protected async route(message: Message): Promise<void> {
