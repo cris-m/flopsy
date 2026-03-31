@@ -10,5 +10,9 @@ export type {
     LineConfig,
     SignalConfig,
     IMessageConfig,
+    SlackConfig,
+    GoogleChatConfig,
+    ExternalWebhookConfigSchema,
     LoggingConfig,
+    WebhookSection,
 } from './schema';

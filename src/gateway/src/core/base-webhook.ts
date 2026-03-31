@@ -109,7 +109,7 @@ export class WebhookServer {
         }
 
         const rateResult = this.rateLimiter.checkRequest(clientIp);
-        if (rateResult.blocked) {
+        if (!rateResult.allowed) {
             this.log.warn({ ip: clientIp }, 'webhook rate limited');
             return this.respond(res, 429, { error: 'Too many requests' });
         }

@@ -6,11 +6,13 @@ export type {
 
 export type {
     AgentCallbacks,
+    AgentChunk,
     AgentHandler,
     AgentResult,
     ChannelEvent,
     IEventQueue,
     InvokeRole,
+    StreamingCallbacks,
 } from './agent';
 
 export type {
@@ -33,7 +35,18 @@ export type {
     Channel,
     ChannelWorkerConfig,
     BaseChannelConfig,
+    StreamingCapability,
     WebhookChannel,
+    InteractiveCapability,
+    ButtonStyle,
+    InteractiveButton,
+    InteractiveOption,
+    InteractiveTextBlock,
+    InteractiveButtonsBlock,
+    InteractiveSelectBlock,
+    InteractiveBlock,
+    InteractiveReply,
+    InteractionCallback,
 } from './channel';
 
 export { isWebhookChannel } from './channel';

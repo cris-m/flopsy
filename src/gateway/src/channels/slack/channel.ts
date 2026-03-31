@@ -1,10 +1,11 @@
-import type { Peer, OutboundMessage, ReactionOptions, Message } from '@gateway/types';
+import type { Peer, OutboundMessage, ReactionOptions, Message, StreamingCapability } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
 import type { SlackChannelConfig } from './types';
 
 export class SlackChannel extends BaseChannel {
     readonly name = 'slack';
     readonly authType = 'token';
+    readonly streaming: StreamingCapability = { editBased: true, minEditIntervalMs: 1000 };
 
     private app: import('@slack/bolt').App | null = null;
     private botUserId: string | null = null;
@@ -31,13 +32,17 @@ export class SlackChannel extends BaseChannel {
             this.botUserId = auth.user_id as string;
 
             this.app.message(async ({ message, client }) => {
-                const msg = message as import('@slack/bolt').GenericMessageEvent;
+                const msg = message as unknown as {
+                    subtype?: string; bot_id?: string; text?: string;
+                    channel_type?: string; user?: string; channel?: string;
+                    ts?: string; thread_ts?: string;
+                };
                 if (msg.subtype || msg.bot_id || !msg.text) return;
 
                 const isDm = msg.channel_type === 'im';
                 const peerType = isDm ? 'user' as const : 'group' as const;
                 const senderId = msg.user ?? '';
-                const peerId = msg.channel;
+                const peerId = msg.channel ?? '';
 
                 if (!this.isAllowed(isDm ? senderId : peerId, peerType)) return;
 
@@ -61,14 +66,15 @@ export class SlackChannel extends BaseChannel {
                     } catch {}
                 }
 
+                const ts = msg.ts ?? '';
                 const normalized: Message = {
-                    id: msg.ts,
+                    id: ts,
                     channelName: this.name,
                     peer: { id: peerId, type: peerType, name: peerName },
                     sender: { id: senderId, name: senderName },
                     body: msg.text,
-                    timestamp: new Date(parseFloat(msg.ts) * 1000).toISOString(),
-                    replyTo: msg.thread_ts && msg.thread_ts !== msg.ts
+                    timestamp: new Date(parseFloat(ts) * 1000).toISOString(),
+                    replyTo: msg.thread_ts && msg.thread_ts !== ts
                         ? { id: msg.thread_ts }
                         : undefined,
                 };
@@ -134,6 +140,16 @@ export class SlackChannel extends BaseChannel {
             channel: options.peer.id,
             timestamp: options.messageId,
             name,
+        });
+    }
+
+    async editMessage(messageId: string, peer: Peer, body: string): Promise<void> {
+        if (!this.app) throw new Error('Slack not connected');
+        await this.app.client.chat.update({
+            token: this.channelConfig.botToken,
+            channel: peer.id,
+            ts: messageId,
+            text: body,
         });
     }
 }

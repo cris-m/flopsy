@@ -305,14 +305,14 @@ export function sanitizeInbound(msg: {
     id: string;
     channelName: string;
     body: string;
-    peer?: { id: string; name?: string };
+    peer?: { id: string; type: 'user' | 'group' | 'channel'; name?: string };
     sender?: { id: string; name?: string };
 }): SanitizedMessage & {
-    peer?: { id: string; name?: string };
+    peer?: { id: string; type: 'user' | 'group' | 'channel'; name?: string };
     sender?: { id: string; name?: string };
 } {
     const result: SanitizedMessage & {
-        peer?: { id: string; name?: string };
+        peer?: { id: string; type: 'user' | 'group' | 'channel'; name?: string };
         sender?: { id: string; name?: string };
     } = {
         id: msg.id.replace(/\0/g, '').slice(0, MAX_MESSAGE_ID_LENGTH),
@@ -322,6 +322,7 @@ export function sanitizeInbound(msg: {
     if (msg.peer) {
         result.peer = {
             id: msg.peer.id.replace(/\0/g, '').slice(0, MAX_MESSAGE_ID_LENGTH),
+            type: msg.peer.type,
             ...(msg.peer.name && { name: sanitize(msg.peer.name, 200) }),
         };
     }

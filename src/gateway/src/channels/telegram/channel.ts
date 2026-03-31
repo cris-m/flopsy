@@ -1,4 +1,4 @@
-import type { Peer, OutboundMessage, ReactionOptions, Message } from '@gateway/types';
+import type { Peer, OutboundMessage, ReactionOptions, Message, StreamingCapability } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
 import { isSafeMediaUrl } from '@gateway/core/security';
 import type { TelegramChannelConfig } from './types';
@@ -6,6 +6,7 @@ import type { TelegramChannelConfig } from './types';
 export class TelegramChannel extends BaseChannel {
     readonly name = 'telegram';
     readonly authType = 'token';
+    readonly streaming: StreamingCapability = { editBased: true, minEditIntervalMs: 1000 };
 
     private bot: import('grammy').Bot | null = null;
     private botInfo: { id: number; username: string } | null = null;
@@ -140,5 +141,11 @@ export class TelegramChannel extends BaseChannel {
         await this.bot.api.setMessageReaction(chatId, messageId, [
             { type: 'emoji', emoji: options.emoji as never },
         ]);
+    }
+
+    async editMessage(messageId: string, peer: Peer, body: string): Promise<void> {
+        if (!this.bot) throw new Error('Telegram not connected');
+        await this.bot.api.editMessageText(peer.id, parseInt(messageId, 10), body, { parse_mode: 'Markdown' })
+            .catch(() => this.bot!.api.editMessageText(peer.id, parseInt(messageId, 10), body));
     }
 }

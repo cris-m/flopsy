@@ -13,6 +13,60 @@ export type GroupActivation = 'mention' | 'always';
 
 export type MediaType = 'image' | 'video' | 'audio' | 'document' | 'sticker';
 
+/**
+ * Interactive message capability flags.
+ * Each channel declares which of these it supports.
+ */
+export type InteractiveCapability = 'buttons' | 'select' | 'cards' | 'components' | 'polls';
+
+/** Button style for interactive messages. */
+export type ButtonStyle = 'primary' | 'secondary' | 'success' | 'danger';
+
+export interface InteractiveButton {
+    readonly label: string;
+    readonly value: string;
+    readonly style?: ButtonStyle;
+}
+
+export interface InteractiveOption {
+    readonly label: string;
+    readonly value: string;
+}
+
+export interface InteractiveTextBlock {
+    readonly type: 'text';
+    readonly text: string;
+}
+
+export interface InteractiveButtonsBlock {
+    readonly type: 'buttons';
+    readonly buttons: InteractiveButton[];
+}
+
+export interface InteractiveSelectBlock {
+    readonly type: 'select';
+    readonly placeholder?: string;
+    readonly options: InteractiveOption[];
+    readonly multiSelect?: boolean;
+}
+
+export type InteractiveBlock =
+    | InteractiveTextBlock
+    | InteractiveButtonsBlock
+    | InteractiveSelectBlock;
+
+export interface InteractiveReply {
+    readonly blocks: InteractiveBlock[];
+}
+
+export interface InteractionCallback {
+    readonly type: 'button_click' | 'select_choice';
+    readonly value: string;
+    readonly messageId: string;
+    readonly peer: Peer;
+    readonly sender?: { id: string; name?: string };
+}
+
 export interface Peer {
     id: string;
     type: 'user' | 'group' | 'channel';
@@ -45,6 +99,7 @@ export interface OutboundMessage {
     body?: string;
     replyTo?: string;
     media?: Media[];
+    interactive?: InteractiveReply;
 }
 
 export interface ReactionOptions {
@@ -66,6 +121,7 @@ export type PairingRequestHandler = (request: PairingRequest) => void;
 
 export interface ChannelEvents {
     onMessage: (message: Message) => Promise<void>;
+    onInteraction: (callback: InteractionCallback) => Promise<void>;
     onStatusChange: (status: ChannelStatus) => void;
     onError: (error: Error) => void;
     onQR: (qrData: string) => void;
@@ -82,6 +138,11 @@ export interface AccessControlUpdate {
 
 export type AuthType = 'qr' | 'token' | 'oauth' | 'none';
 
+export interface StreamingCapability {
+    readonly editBased: boolean;
+    readonly minEditIntervalMs: number;
+}
+
 export interface Channel {
     readonly name: string;
     readonly status: ChannelStatus;
@@ -89,6 +150,8 @@ export interface Channel {
     readonly dmPolicy: DmPolicy;
     readonly groupPolicy: GroupPolicy;
     readonly authType: AuthType;
+    readonly streaming?: StreamingCapability;
+    readonly capabilities?: readonly InteractiveCapability[];
 
     connect(): Promise<void>;
     disconnect(): Promise<void>;
@@ -106,24 +169,10 @@ export interface Channel {
     off<K extends keyof ChannelEvents>(event: K, handler: ChannelEvents[K]): void;
 }
 
-/**
- * Channels that receive messages via HTTP webhook implement this interface.
- * The gateway uses it to register a single unified webhook route per channel.
- */
 export interface WebhookChannel {
-    /** Route path the webhook server listens on (e.g. '/webhook/line'). */
     readonly webhookPath: string;
-    /**
-     * Verify an inbound request. Return true to accept, false to reject with 401.
-     * Channels that don't need verification should always return true.
-     */
     verifyWebhook(req: IncomingMessage, body: string): boolean;
-    /**
-     * Extract events from the parsed JSON body.
-     * Returns an array of opaque event objects the channel understands.
-     */
     extractEvents(parsed: unknown): unknown[];
-    /** Process a single webhook event (normalize → emit onMessage). */
     handleWebhookEvent(event: unknown): Promise<void>;
 }
 
@@ -146,8 +195,6 @@ export interface ChannelWorkerConfig {
     readonly agentHandler: AgentHandler;
     readonly onReply: (text: string, peer: Peer, replyTo?: string) => Promise<void>;
     readonly coalesceDelayMs?: number;
-    /** Timeout for regular user turns. Default: 120 000 ms (2 min). */
     readonly agentTimeoutMs?: number;
-    /** Timeout for background-task result turns. Default: 600 000 ms (10 min). */
     readonly backgroundTurnTimeoutMs?: number;
 }
