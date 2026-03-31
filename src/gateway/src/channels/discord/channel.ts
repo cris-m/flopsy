@@ -1,4 +1,4 @@
-import type { Peer, OutboundMessage, ReactionOptions, Message } from '@gateway/types';
+import type { Peer, OutboundMessage, ReactionOptions, Message, StreamingCapability } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
 import { isSafeMediaUrl } from '@gateway/core/security';
 import type { DiscordChannelConfig } from './types';
@@ -11,6 +11,7 @@ const MAX_DISCORD_LENGTH = 2000;
 export class DiscordChannel extends BaseChannel {
     readonly name = 'discord';
     readonly authType = 'token';
+    readonly streaming: StreamingCapability = { editBased: true, minEditIntervalMs: 500 };
 
     private client: import('discord.js').Client | null = null;
     private readonly channelConfig: DiscordChannelConfig;
@@ -197,6 +198,13 @@ export class DiscordChannel extends BaseChannel {
         } else {
             await msg.react(options.emoji);
         }
+    }
+
+    async editMessage(messageId: string, peer: Peer, body: string): Promise<void> {
+        if (!this.client) throw new Error('Discord not connected');
+        const channel = await this.resolveTextChannel(peer);
+        const msg = await channel.messages.fetch(messageId);
+        await msg.edit(body.slice(0, MAX_DISCORD_LENGTH));
     }
 
     private async registerSlashCommands(): Promise<void> {
