@@ -15,4 +15,9 @@ export type {
     ExternalWebhookConfigSchema,
     LoggingConfig,
     WebhookSection,
+    ProactiveConfig,
+    HeartbeatDefinitionConfig,
+    JobDefinitionConfig,
+    DeliveryTargetConfig,
+    HealthMonitorConfig,
 } from './schema';

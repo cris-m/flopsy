@@ -10,7 +10,11 @@ export interface WebhookConfig {
     maxBodyBytes?: number;
 }
 
-export type RouteHandler = (req: IncomingMessage, body: string, res: ServerResponse) => Promise<void>;
+export type RouteHandler = (
+    req: IncomingMessage,
+    body: string,
+    res: ServerResponse,
+) => Promise<void>;
 
 const DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024;
 const DEDUP_TTL_MS = 3_600_000;
@@ -45,13 +49,18 @@ export class WebhookServer {
         this.cleanupInterval.unref();
 
         if (!config.secret) {
-            this.log.warn('webhook server starting WITHOUT signature verification — all requests will be accepted unsigned');
+            this.log.warn(
+                'webhook server starting WITHOUT signature verification — all requests will be accepted unsigned',
+            );
         }
 
         return new Promise((resolve, reject) => {
             this.server!.on('error', reject);
             this.server!.listen(config.port, host, () => {
-                this.log.info({ port: config.port, host, routes: [...this.routes.keys()] }, 'webhook server started');
+                this.log.info(
+                    { port: config.port, host, routes: [...this.routes.keys()] },
+                    'webhook server started',
+                );
                 resolve();
             });
         });
@@ -140,7 +149,9 @@ export class WebhookServer {
             }
         }
 
-        const requestId = (req.headers['x-request-id'] ?? req.headers['x-webhook-id'] ?? req.headers['x-github-delivery']) as string | undefined;
+        const requestId = (req.headers['x-request-id'] ??
+            req.headers['x-webhook-id'] ??
+            req.headers['x-github-delivery']) as string | undefined;
         if (requestId) {
             if (this.isDuplicate(requestId)) {
                 return this.respond(res, 200, { status: 'duplicate' });
@@ -192,8 +203,18 @@ export class WebhookServer {
                 }
                 if (!settled) chunks.push(chunk);
             });
-            req.on('end', () => { if (!settled) { settled = true; resolve(Buffer.concat(chunks).toString()); } });
-            req.on('error', (err) => { if (!settled) { settled = true; reject(err); } });
+            req.on('end', () => {
+                if (!settled) {
+                    settled = true;
+                    resolve(Buffer.concat(chunks).toString());
+                }
+            });
+            req.on('error', (err) => {
+                if (!settled) {
+                    settled = true;
+                    reject(err);
+                }
+            });
         });
     }
 

@@ -2,7 +2,15 @@ import pino from 'pino';
 
 export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal' | 'silent';
 
-const VALID_LEVELS = new Set<string>(['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent']);
+const VALID_LEVELS = new Set<string>([
+    'trace',
+    'debug',
+    'info',
+    'warn',
+    'error',
+    'fatal',
+    'silent',
+]);
 
 let configLevel: LogLevel | undefined;
 let configPretty: boolean | undefined;
@@ -37,14 +45,46 @@ function resolveFile(): { enabled: boolean; path: string } {
 }
 
 const REDACT_PATHS = [
-    'password', 'token', 'secret', 'apiKey', 'api_key', 'accessToken', 'refreshToken',
-    'authorization', 'jwt', 'bearer', 'apiSecret', 'access_token', 'refresh_token',
-    'creditCard', 'cardNumber', 'cvv', 'ssn', 'bankAccount', 'routingNumber',
-    'email', 'phone', 'address', 'dateOfBirth', 'dob', 'passport', 'driverId',
-    '*.token', '*.secret', '*.password', '*.apiKey', '*.api_key',
-    '*.accessToken', '*.refreshToken', '*.access_token', '*.refresh_token',
-    'headers.authorization', '*.headers.authorization',
-    'auth.*', 'payment.*', 'secrets.*',
+    'password',
+    'token',
+    'secret',
+    'apiKey',
+    'api_key',
+    'accessToken',
+    'refreshToken',
+    'authorization',
+    'jwt',
+    'bearer',
+    'apiSecret',
+    'access_token',
+    'refresh_token',
+    'creditCard',
+    'cardNumber',
+    'cvv',
+    'ssn',
+    'bankAccount',
+    'routingNumber',
+    'email',
+    'phone',
+    'address',
+    'dateOfBirth',
+    'dob',
+    'passport',
+    'driverId',
+    '*.token',
+    '*.secret',
+    '*.password',
+    '*.apiKey',
+    '*.api_key',
+    '*.accessToken',
+    '*.refreshToken',
+    '*.access_token',
+    '*.refresh_token',
+    'headers.authorization',
+    '*.headers.authorization',
+    'auth.*',
+    'payment.*',
+    'secrets.*',
 ];
 
 const PII_PATTERNS: Array<{ regex: RegExp; label: string }> = [

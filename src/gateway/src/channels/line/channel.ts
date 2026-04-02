@@ -1,5 +1,11 @@
 import type { IncomingMessage } from 'node:http';
-import type { Peer, OutboundMessage, ReactionOptions, Message, WebhookChannel } from '@gateway/types';
+import type {
+    Peer,
+    OutboundMessage,
+    ReactionOptions,
+    Message,
+    WebhookChannel,
+} from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
 import { isSafeMediaUrl, verifyWebhookSignature } from '@gateway/core/security';
 import type { LineChannelConfig } from './types';
@@ -60,7 +66,12 @@ export class LineChannel extends BaseChannel implements WebhookChannel {
         if (!this.client) throw new Error('LINE not connected');
 
         const to = message.peer.id;
-        const messages: Array<{ type: string; text?: string; originalContentUrl?: string; previewImageUrl?: string }> = [];
+        const messages: Array<{
+            type: string;
+            text?: string;
+            originalContentUrl?: string;
+            previewImageUrl?: string;
+        }> = [];
 
         if (message.media?.length) {
             for (const media of message.media) {
@@ -105,7 +116,13 @@ export class LineChannel extends BaseChannel implements WebhookChannel {
 
     async react(_options: ReactionOptions): Promise<void> {}
 
-    async handleWebhookEvent(event: { type: string; source?: { userId?: string; groupId?: string; type?: string }; message?: { id?: string; text?: string; type?: string }; timestamp?: number; replyToken?: string }): Promise<void> {
+    async handleWebhookEvent(event: {
+        type: string;
+        source?: { userId?: string; groupId?: string; type?: string };
+        message?: { id?: string; text?: string; type?: string };
+        timestamp?: number;
+        replyToken?: string;
+    }): Promise<void> {
         if (event.type !== 'message' || event.message?.type !== 'text') return;
 
         const source = event.source;
@@ -114,7 +131,7 @@ export class LineChannel extends BaseChannel implements WebhookChannel {
         const isGroup = source.type === 'group';
         const peerId = isGroup ? (source.groupId ?? '') : (source.userId ?? '');
         const senderId = source.userId ?? '';
-        const peerType = isGroup ? 'group' as const : 'user' as const;
+        const peerType = isGroup ? ('group' as const) : ('user' as const);
 
         if (!this.isAllowed(isGroup ? peerId : senderId, peerType)) return;
 
@@ -124,7 +141,9 @@ export class LineChannel extends BaseChannel implements WebhookChannel {
             peer: { id: peerId, type: peerType },
             sender: { id: senderId },
             body: event.message?.text ?? '',
-            timestamp: event.timestamp ? new Date(event.timestamp).toISOString() : new Date().toISOString(),
+            timestamp: event.timestamp
+                ? new Date(event.timestamp).toISOString()
+                : new Date().toISOString(),
         };
 
         await this.emit('onMessage', normalized);

@@ -50,7 +50,10 @@ export abstract class BaseGateway implements Gateway {
     private readonly _channels = new Map<string, Channel>();
     private readonly dedup = new Map<string, number>();
     private dedupSweep: ReturnType<typeof setInterval> | null = null;
-    private readonly handlers = new Map<string, (client: WsClient, params?: Record<string, unknown>) => Promise<unknown>>();
+    private readonly handlers = new Map<
+        string,
+        (client: WsClient, params?: Record<string, unknown>) => Promise<unknown>
+    >();
 
     constructor(config: GatewayConfig = {}) {
         this.config = {
@@ -69,12 +72,15 @@ export abstract class BaseGateway implements Gateway {
         return this._channels;
     }
 
-    private readonly channelHandlers = new Map<string, {
-        onMessage: (msg: Message) => Promise<void>;
-        onStatusChange: (status: string) => void;
-        onError: (err: Error) => void;
-        onQR: (qr: string) => void;
-    }>();
+    private readonly channelHandlers = new Map<
+        string,
+        {
+            onMessage: (msg: Message) => Promise<void>;
+            onStatusChange: (status: string) => void;
+            onError: (err: Error) => void;
+            onQR: (qr: string) => void;
+        }
+    >();
 
     register(channel: Channel): void {
         if (this._channels.has(channel.name)) {
@@ -84,7 +90,8 @@ export abstract class BaseGateway implements Gateway {
 
         const handlers = {
             onMessage: (msg: Message) => this.handleInbound(msg),
-            onStatusChange: (status: string) => this.broadcast('channel.status', { channel: channel.name, status }),
+            onStatusChange: (status: string) =>
+                this.broadcast('channel.status', { channel: channel.name, status }),
             onError: (err: Error) => {
                 this.log.error({ channel: channel.name, err }, 'channel error');
                 this.broadcast('channel.error', { channel: channel.name, error: err.message });
@@ -97,7 +104,9 @@ export abstract class BaseGateway implements Gateway {
         channel.on('onStatusChange', handlers.onStatusChange);
         channel.on('onError', handlers.onError);
         channel.on('onQR', handlers.onQR);
-        this.log.info(`channel registered - ${channel.name} (auth=${channel.authType}, dm=${channel.dmPolicy})`);
+        this.log.info(
+            `channel registered - ${channel.name} (auth=${channel.authType}, dm=${channel.dmPolicy})`,
+        );
     }
 
     unregister(name: string): void {
@@ -119,11 +128,15 @@ export abstract class BaseGateway implements Gateway {
         return this._channels.get(name);
     }
 
-    registerHandler(method: string, handler: (client: WsClient, params?: Record<string, unknown>) => Promise<unknown>): void {
+    registerHandler(
+        method: string,
+        handler: (client: WsClient, params?: Record<string, unknown>) => Promise<unknown>,
+    ): void {
         this.handlers.set(method, handler);
     }
 
     async start(): Promise<void> {
+        if (this.wss) return;
         this.dedupSweep = setInterval(() => this.sweepDedup(), DEDUP_SWEEP_INTERVAL_MS);
         this.dedupSweep.unref();
 
@@ -235,10 +248,7 @@ export abstract class BaseGateway implements Gateway {
             }
         }
 
-        const token = extractToken(
-            req.headers as Record<string, string | string[] | undefined>,
-            req.url,
-        );
+        const token = extractToken(req.headers as Record<string, string | string[] | undefined>);
 
         if (!validateToken(this.config.token, token)) {
             this.log.warn({ ip: clientIp }, 'authentication failed');
@@ -281,14 +291,23 @@ export abstract class BaseGateway implements Gateway {
             this.log.error({ err, clientId }, 'client error');
             this.clients.delete(clientId);
             this.rateLimiter.unregisterConnection(clientId, clientIp);
-            try { ws.close(); } catch { /* */ }
+            try {
+                ws.close();
+            } catch {
+                /* */
+            }
         });
     }
 
     private async handleMessage(client: WsClient, raw: string): Promise<void> {
         const rateCheck = this.rateLimiter.checkRequest(client.id);
         if (!rateCheck.allowed) {
-            this.sendError(client, 'unknown', 'RATE_LIMITED', `Retry after ${Math.ceil((rateCheck.retryAfterMs ?? 0) / 1000)}s`);
+            this.sendError(
+                client,
+                'unknown',
+                'RATE_LIMITED',
+                `Retry after ${Math.ceil((rateCheck.retryAfterMs ?? 0) / 1000)}s`,
+            );
             return;
         }
 
@@ -301,13 +320,23 @@ export abstract class BaseGateway implements Gateway {
         }
 
         if (request.type !== 'req' || !request.id || !request.method) {
-            this.sendError(client, request.id ?? 'unknown', 'INVALID_REQUEST', 'Missing type, id, or method');
+            this.sendError(
+                client,
+                request.id ?? 'unknown',
+                'INVALID_REQUEST',
+                'Missing type, id, or method',
+            );
             return;
         }
 
         const handler = this.handlers.get(request.method);
         if (!handler) {
-            this.sendError(client, request.id, 'UNKNOWN_METHOD', `Unknown method: ${request.method}`);
+            this.sendError(
+                client,
+                request.id,
+                'UNKNOWN_METHOD',
+                `Unknown method: ${request.method}`,
+            );
             return;
         }
 
@@ -332,7 +361,11 @@ export abstract class BaseGateway implements Gateway {
     }
 
     private static readonly VALID_EVENTS = new Set<EventType>([
-        'message.inbound', 'message.outbound', 'channel.status', 'channel.error', 'channel.qr',
+        'message.inbound',
+        'message.outbound',
+        'channel.status',
+        'channel.error',
+        'channel.qr',
     ]);
 
     private requireChannel(name: string | undefined): Channel {
@@ -342,40 +375,77 @@ export abstract class BaseGateway implements Gateway {
         return ch;
     }
 
+    private healthCache: { data: unknown; ts: number } | null = null;
+    private readonly HEALTH_CACHE_TTL_MS = 5_000;
+
+    private buildChannelSnapshot(name: string, ch: Channel) {
+        return {
+            name,
+            status: ch.status,
+            enabled: ch.enabled,
+            authType: ch.authType,
+            dmPolicy: ch.dmPolicy,
+            groupPolicy: ch.groupPolicy,
+            streaming: ch.streaming ?? null,
+            capabilities: ch.capabilities ?? [],
+        };
+    }
+
+    private buildHealthSnapshot(probe = false) {
+        const now = Date.now();
+        if (!probe && this.healthCache && now - this.healthCache.ts < this.HEALTH_CACHE_TTL_MS) {
+            return this.healthCache.data;
+        }
+
+        const channels = [...this._channels.entries()].map(([name, ch]) =>
+            this.buildChannelSnapshot(name, ch),
+        );
+
+        let enabled = 0,
+            connected = 0,
+            disconnected = 0,
+            errored = 0;
+        for (const c of channels) {
+            if (c.enabled) enabled++;
+            if (c.status === 'connected') connected++;
+            else if (c.status === 'disconnected') disconnected++;
+            else if (c.status === 'error') errored++;
+        }
+
+        const snapshot = {
+            healthy: enabled > 0 && connected === enabled,
+            uptime: process.uptime(),
+            timestamp: new Date().toISOString(),
+            channels,
+            summary: { total: channels.length, enabled, connected, disconnected, error: errored },
+            clients: this.clients.size,
+            proactive: this.getProactiveHealth(),
+        };
+
+        this.healthCache = { data: snapshot, ts: now };
+        return snapshot;
+    }
+
     private registerBuiltinHandlers(): void {
         this.handlers.set('ping', async () => ({ pong: Date.now() }));
 
-        this.handlers.set('health', async () => {
-            const channelStates = [...this._channels.entries()].map(([name, ch]) => ({ name, status: ch.status }));
-            const allConnected = channelStates.every((c) => c.status === 'connected');
-            return { healthy: allConnected, uptime: process.uptime(), channels: channelStates };
+        this.handlers.set('health', async (_client, params) => {
+            const probe = params?.probe === true;
+            return this.buildHealthSnapshot(probe);
         });
 
-        this.handlers.set('status', async () => ({
-            uptime: process.uptime(),
-            channels: [...this._channels.entries()].map(([name, ch]) => ({
-                name,
-                status: ch.status,
-                enabled: ch.enabled,
-            })),
-            clients: this.clients.size,
-        }));
+        this.handlers.set('status', async () => this.buildHealthSnapshot());
 
         this.handlers.set('channels.list', async () =>
-            [...this._channels.entries()].map(([name, ch]) => ({
-                name,
-                status: ch.status,
-                enabled: ch.enabled,
-                dmPolicy: ch.dmPolicy,
-                groupPolicy: ch.groupPolicy,
-            })),
+            [...this._channels.entries()].map(([name, ch]) => this.buildChannelSnapshot(name, ch)),
         );
 
         this.handlers.set('subscribe', async (client, params) => {
             const events = params?.events as string[] | undefined;
             if (!Array.isArray(events)) return { error: 'events array required' };
             for (const e of events) {
-                if (BaseGateway.VALID_EVENTS.has(e as EventType)) client.subscriptions.add(e as EventType);
+                if (BaseGateway.VALID_EVENTS.has(e as EventType))
+                    client.subscriptions.add(e as EventType);
             }
             return { subscribed: [...client.subscriptions] };
         });
@@ -411,14 +481,24 @@ export abstract class BaseGateway implements Gateway {
                 body: sanitizedBody,
             });
 
-            this.broadcast('message.outbound', { channel: channelName, peerId, body: sanitizedBody, messageId });
+            this.broadcast('message.outbound', {
+                channel: channelName,
+                peerId,
+                body: sanitizedBody,
+                messageId,
+            });
             return { messageId };
         });
 
         this.handlers.set('channel.auth.status', async (_client, params) => {
             const name = params?.channel as string;
             const ch = this.requireChannel(name);
-            return { channel: name, status: ch.status, authType: ch.authType, needsAuth: ch.status !== 'connected' };
+            return {
+                channel: name,
+                status: ch.status,
+                authType: ch.authType,
+                needsAuth: ch.status !== 'connected',
+            };
         });
 
         const authStartCooldowns = new Map<string, number>();
@@ -496,4 +576,7 @@ export abstract class BaseGateway implements Gateway {
     protected abstract route(message: Message): Promise<void>;
     protected async onStart(): Promise<void> {}
     protected async onStop(): Promise<void> {}
+    protected getProactiveHealth(): Record<string, unknown> {
+        return {};
+    }
 }

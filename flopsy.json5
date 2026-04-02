@@ -1,6 +1,14 @@
 {
     // FlopsyBot Configuration
     // Env vars: ${VAR_NAME} resolved at load time from .env or system env
+    // All relative paths resolve against workspace root (~/.flopsy)
+
+    // Workspace root — where all data files live
+    // Override: FLOPSY_HOME env var, FLOPSY_PROFILE env var, or set here
+    // Default: ~/.flopsy
+    workspace: {
+        // root: '/custom/path/to/flopsy',
+    },
 
     gateway: {
         host: '127.0.0.1',
@@ -43,7 +51,7 @@
         // Session stored at sessionPath, auto-reconnects on restart
         whatsapp: {
             enabled: false,
-            sessionPath: '.flopsy/sessions/whatsapp',
+            sessionPath: 'sessions/whatsapp',    // relative to workspace (~/.flopsy)
             dm: {
                 policy: 'disabled',
                 allowFrom: [],
@@ -149,7 +157,7 @@
             account: '',
             cliPath: 'signal-cli',
             deviceName: 'FlopsyBot',
-            sessionPath: '.flopsy/sessions/signal',
+            sessionPath: 'sessions/signal',       // relative to workspace (~/.flopsy)
             dm: {
                 policy: 'disabled',
                 allowFrom: [],
@@ -177,6 +185,184 @@
                 allowFrom: [],
                 blockedFrom: [],
             },
+        },
+
+        // Auth: bot token + app token (Socket Mode) from Slack API
+        slack: {
+            enabled: false,
+            botToken: '${SLACK_BOT_TOKEN}',
+            appToken: '${SLACK_APP_TOKEN}',
+            signingSecret: '${SLACK_SIGNING_SECRET}',
+            dm: {
+                policy: 'open',
+                allowFrom: [],
+                blockedFrom: [],
+            },
+            group: {
+                policy: 'disabled',
+                activation: 'mention',
+                allowedGroups: [],
+            },
+        },
+
+        // Auth: service account key + verification token from Google Cloud Console
+        googlechat: {
+            enabled: false,
+            serviceAccountKeyPath: 'credentials/google-chat-sa.json',  // relative to workspace
+            verificationToken: '${GOOGLE_CHAT_VERIFICATION_TOKEN}',
+            webhookPath: '/webhook/googlechat',
+            dm: {
+                policy: 'open',
+                allowFrom: [],
+                blockedFrom: [],
+            },
+            group: {
+                policy: 'disabled',
+                activation: 'mention',
+                allowedGroups: [],
+            },
+        },
+    },
+
+    // ── Proactive Engine ────────────────────────────────────────
+    proactive: {
+        enabled: true,
+        // Paths are relative to workspace root (. or FLOPSY_HOME)
+        statePath: 'state/proactive.json',
+        retryQueuePath: 'state/retry-queue.json',
+
+        // Default delivery target — used by heartbeats and scheduler jobs
+        // delivery: {
+        //     channelName: 'telegram',
+        //     peer: { id: '${DEFAULT_PEER_ID}', type: 'user' },
+        // },
+
+        heartbeats: {
+            enabled: true,
+            heartbeats: [
+                {
+                    name: 'startup-ping',
+                    enabled: true,
+                    interval: '1h',
+                    prompt: 'Log a startup diagnostics ping.',
+                    deliveryMode: 'silent',  // runs in background, never delivered
+                    oneshot: true,           // fires once then disables itself
+                },
+                // deliveryMode: 'always' | 'conditional' | 'silent'
+                //   always      → response always sent to user
+                //   conditional → agent decides: promote (send) or suppress (skip)
+                //   silent      → runs in background, never delivered
+
+                // {
+                //     name: 'email-check',
+                //     enabled: true,
+                //     interval: '30m',
+                //     prompt: 'Check for new important emails. Only report urgent ones.',
+                //     deliveryMode: 'conditional',
+                //     activeHours: { start: 8, end: 22 },
+                // },
+                // {
+                //     name: 'daily-briefing',
+                //     enabled: true,
+                //     interval: '24h',
+                //     prompt: 'Generate today\'s briefing: weather, calendar, top news.',
+                //     deliveryMode: 'always',
+                //     activeHours: { start: 7, end: 9 },
+                // },
+                // {
+                //     name: 'memory-consolidation',
+                //     enabled: true,
+                //     interval: '24h',
+                //     prompt: 'Review today\'s conversations and consolidate memories.',
+                //     deliveryMode: 'silent',
+                // },
+                // {
+                //     name: 'startup-check',
+                //     enabled: true,
+                //     interval: '1h',
+                //     prompt: 'Run startup diagnostics and report issues.',
+                //     deliveryMode: 'conditional',
+                //     oneshot: true,
+                // },
+            ],
+        },
+
+        scheduler: {
+            enabled: false,
+            jobs: [
+                // schedule kinds:
+                //   { kind: 'at', atMs: 1743613200000 }            → one-shot
+                //   { kind: 'every', everyMs: 300000 }              → every 5 min
+                //   { kind: 'cron', expr: '0 18 * * 5', tz: '...'} → cron expression
+
+                // {
+                //     id: 'remind-call-mom',
+                //     name: 'Call mom reminder',
+                //     enabled: true,
+                //     schedule: { kind: 'at', atMs: 1743613200000 },
+                //     payload: {
+                //         message: 'Remind the user to call mom now.',
+                //         deliveryMode: 'always',
+                //     },
+                // },
+                // {
+                //     id: 'github-pr-check',
+                //     name: 'GitHub PR monitor',
+                //     enabled: true,
+                //     schedule: { kind: 'every', everyMs: 300000 },
+                //     payload: {
+                //         message: 'Check GitHub PRs for new comments or reviews.',
+                //         deliveryMode: 'conditional',
+                //     },
+                // },
+                // {
+                //     id: 'weekly-summary',
+                //     name: 'Weekly work summary',
+                //     enabled: true,
+                //     schedule: { kind: 'cron', expr: '0 18 * * 5', tz: 'Africa/Lubumbashi' },
+                //     payload: {
+                //         message: 'Generate a summary of what I worked on this week.',
+                //         deliveryMode: 'always',
+                //     },
+                // },
+            ],
+        },
+
+        webhooks: [
+            // {
+            //     name: 'github',
+            //     path: '/webhook/github',
+            //     targetChannel: 'discord',
+            //     secret: '${GITHUB_WEBHOOK_SECRET}',
+            //     eventTypeHeader: 'x-github-event',
+            //     signature: {
+            //         header: 'x-hub-signature-256',
+            //         algorithm: 'sha256',
+            //         format: 'hex',
+            //         prefix: 'sha256=',
+            //     },
+            // },
+            // {
+            //     name: 'stripe',
+            //     path: '/webhook/stripe',
+            //     targetChannel: 'telegram',
+            //     secret: '${STRIPE_WEBHOOK_SECRET}',
+            //     eventTypeHeader: 'stripe-event',
+            //     signature: {
+            //         header: 'stripe-signature',
+            //         algorithm: 'sha256',
+            //         format: 'hex',
+            //     },
+            // },
+        ],
+
+        healthMonitor: {
+            enabled: true,
+            checkIntervalMs: 300000,
+            staleEventThresholdMs: 600000,
+            connectGraceMs: 60000,
+            maxRestartsPerHour: 10,
+            cooldownCycles: 2,
         },
     },
 }

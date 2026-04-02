@@ -96,7 +96,9 @@ export class SignalChannel extends BaseChannel {
 
     async sendTyping(peer: Peer): Promise<void> {
         if (!this.process?.stdin) return;
-        this.writeRpc(`typing-${Date.now()}`, 'sendTyping',
+        this.writeRpc(
+            `typing-${Date.now()}`,
+            'sendTyping',
             peer.type === 'group' ? { groupId: peer.id } : { recipient: [peer.id] },
         );
     }
@@ -104,7 +106,9 @@ export class SignalChannel extends BaseChannel {
     async react(options: ReactionOptions): Promise<void> {
         if (!this.process?.stdin) throw new Error('Signal not connected');
         this.writeRpc(`react-${Date.now()}`, 'sendReaction', {
-            ...(options.peer.type === 'group' ? { groupId: options.peer.id } : { recipient: [options.peer.id] }),
+            ...(options.peer.type === 'group'
+                ? { groupId: options.peer.id }
+                : { recipient: [options.peer.id] }),
             emoji: options.remove ? '' : options.emoji,
             targetAuthor: options.peer.id,
             targetTimestamp: parseInt(options.messageId, 10),
@@ -136,7 +140,7 @@ export class SignalChannel extends BaseChannel {
         const groupInfo = dataMessage.groupInfo as { groupId?: string } | undefined;
         const isGroup = !!groupInfo?.groupId;
         const peerId = isGroup ? String(groupInfo!.groupId) : source;
-        const peerType = isGroup ? 'group' as const : 'user' as const;
+        const peerType = isGroup ? ('group' as const) : ('user' as const);
 
         if (!this.isAllowed(isGroup ? peerId : source, peerType)) return;
 

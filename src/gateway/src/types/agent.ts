@@ -1,11 +1,29 @@
 export type InvokeRole = 'user' | 'system';
 
+export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
+
 export interface ChannelEvent {
-    readonly type: 'task_complete' | 'task_error';
+    readonly type: 'task_complete' | 'task_error' | 'task_progress';
     readonly taskId: string;
     readonly result?: string;
     readonly error?: string;
+    readonly progress?: string;
     readonly completedAt: number;
+}
+
+export interface BackgroundTask {
+    readonly id: string;
+    readonly threadId: string;
+    readonly peerId: string;
+    readonly status: TaskStatus;
+    readonly description: string;
+    readonly result?: string;
+    readonly error?: string;
+    readonly startedAt: number;
+    readonly completedAt?: number;
+    readonly lastProgressAt?: number;
+    readonly retryCount: number;
+    readonly maxRetries: number;
 }
 
 export interface IEventQueue {
@@ -14,11 +32,32 @@ export interface IEventQueue {
     waitForEvent(timeoutMs: number): Promise<boolean>;
 }
 
+/** Persistent task store for crash-resilient background tasks. */
+export interface ITaskStore {
+    create(task: BackgroundTask): Promise<void>;
+    update(
+        id: string,
+        fields: Partial<
+            Pick<
+                BackgroundTask,
+                'status' | 'result' | 'error' | 'completedAt' | 'lastProgressAt' | 'retryCount'
+            >
+        >,
+    ): Promise<void>;
+    get(id: string): Promise<BackgroundTask | null>;
+    findByStatus(status: TaskStatus): Promise<BackgroundTask[]>;
+    findByThread(threadId: string): Promise<BackgroundTask[]>;
+    findUndelivered(): Promise<BackgroundTask[]>;
+    markDelivered(id: string): Promise<void>;
+}
+
 export interface AgentCallbacks {
     readonly onReply: (text: string) => Promise<void>;
+    readonly onProgress: (taskId: string, message: string) => void;
     readonly setDidSendViaTool: () => void;
     readonly eventQueue: IEventQueue;
-    readonly pending: string[];
+    readonly taskStore?: ITaskStore;
+    readonly pending: ReadonlyArray<string>;
     readonly signal: AbortSignal;
 }
 
@@ -40,6 +79,16 @@ export interface AgentResult {
 }
 
 export interface AgentHandler {
-    invoke(text: string, threadId: string, callbacks: AgentCallbacks, role?: InvokeRole): Promise<AgentResult>;
-    stream?(text: string, threadId: string, callbacks: StreamingCallbacks, role?: InvokeRole): AsyncIterable<AgentChunk>;
+    invoke(
+        text: string,
+        threadId: string,
+        callbacks: AgentCallbacks,
+        role?: InvokeRole,
+    ): Promise<AgentResult>;
+    stream?(
+        text: string,
+        threadId: string,
+        callbacks: StreamingCallbacks,
+        role?: InvokeRole,
+    ): AsyncIterable<AgentChunk>;
 }

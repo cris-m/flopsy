@@ -74,7 +74,10 @@ export class WebhookRouter {
 
             const worker = messageRouter.getWorker(cfg.targetChannel);
             if (!worker) {
-                this.log.warn({ webhook: cfg.name, target: cfg.targetChannel }, 'target channel worker not found');
+                this.log.warn(
+                    { webhook: cfg.name, target: cfg.targetChannel },
+                    'target channel worker not found',
+                );
                 return;
             }
 
@@ -97,10 +100,16 @@ export class WebhookRouter {
                 completedAt: Date.now(),
             });
 
-            this.log.info({ webhook: cfg.name, event: eventType, target: cfg.targetChannel }, 'webhook event routed');
+            this.log.info(
+                { webhook: cfg.name, event: eventType, target: cfg.targetChannel },
+                'webhook event routed',
+            );
         });
 
-        this.log.debug({ webhook: cfg.name, path: cfg.path, target: cfg.targetChannel }, 'external webhook registered');
+        this.log.debug(
+            { webhook: cfg.name, path: cfg.path, target: cfg.targetChannel },
+            'external webhook registered',
+        );
     }
 
     private verify(req: IncomingMessage, body: string, cfg: ExternalWebhookConfig): boolean {

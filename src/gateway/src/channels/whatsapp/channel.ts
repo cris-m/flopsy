@@ -25,8 +25,12 @@ export class WhatsAppChannel extends BaseChannel {
         try {
             this.setStatus('connecting');
 
-            const { makeWASocket, useMultiFileAuthState, makeCacheableSignalKeyStore, DisconnectReason } =
-                await import('@whiskeysockets/baileys');
+            const {
+                makeWASocket,
+                useMultiFileAuthState,
+                makeCacheableSignalKeyStore,
+                DisconnectReason,
+            } = await import('@whiskeysockets/baileys');
             const pino = (await import('pino')).default;
 
             const sessionPath = this.channelConfig.sessionPath ?? '.flopsy/sessions/whatsapp';
@@ -71,7 +75,7 @@ export class WhatsAppChannel extends BaseChannel {
 
                         const senderId = msg.key.remoteJid ?? '';
                         const isGroup = senderId.endsWith('@g.us');
-                        const peerType = isGroup ? 'group' as const : 'user' as const;
+                        const peerType = isGroup ? ('group' as const) : ('user' as const);
 
                         if (!this.isAllowed(senderId, peerType)) continue;
 
@@ -87,7 +91,9 @@ export class WhatsAppChannel extends BaseChannel {
                             peer: { id: senderId, type: peerType },
                             sender: msg.key.participant ? { id: msg.key.participant } : undefined,
                             body,
-                            timestamp: new Date((msg.messageTimestamp as number) * 1000).toISOString(),
+                            timestamp: new Date(
+                                (msg.messageTimestamp as number) * 1000,
+                            ).toISOString(),
                         });
                     } catch (err) {
                         this.emitError(toError(err));
@@ -135,13 +141,21 @@ export class WhatsAppChannel extends BaseChannel {
                         content = { image: { url: media.url ?? '' }, ...(caption && { caption }) };
                         break;
                     case 'audio':
-                        content = { audio: { url: media.url ?? '' }, mimetype: media.mimeType ?? 'audio/mpeg', ptt: true };
+                        content = {
+                            audio: { url: media.url ?? '' },
+                            mimetype: media.mimeType ?? 'audio/mpeg',
+                            ptt: true,
+                        };
                         break;
                     case 'video':
                         content = { video: { url: media.url ?? '' }, ...(caption && { caption }) };
                         break;
                     case 'document':
-                        content = { document: { url: media.url ?? '' }, mimetype: media.mimeType ?? 'application/octet-stream', fileName: media.fileName ?? 'document' };
+                        content = {
+                            document: { url: media.url ?? '' },
+                            mimetype: media.mimeType ?? 'application/octet-stream',
+                            fileName: media.fileName ?? 'document',
+                        };
                         break;
                     default:
                         content = { text: message.body ?? '' };
@@ -166,7 +180,10 @@ export class WhatsAppChannel extends BaseChannel {
     async react(options: ReactionOptions): Promise<void> {
         if (!this.socket) throw new Error('WhatsApp not connected');
         await this.socket.sendMessage(options.peer.id, {
-            react: { text: !options.emoji || options.remove ? '' : options.emoji, key: { id: options.messageId, remoteJid: options.peer.id } },
+            react: {
+                text: !options.emoji || options.remove ? '' : options.emoji,
+                key: { id: options.messageId, remoteJid: options.peer.id },
+            },
         });
     }
 }
