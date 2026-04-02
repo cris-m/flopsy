@@ -1,7 +1,13 @@
 import { createSign, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import type { IncomingMessage } from 'node:http';
-import type { Peer, OutboundMessage, ReactionOptions, Message, WebhookChannel } from '@gateway/types';
+import type {
+    Peer,
+    OutboundMessage,
+    ReactionOptions,
+    Message,
+    WebhookChannel,
+} from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
 import type { GoogleChatChannelConfig, ServiceAccountKey, GoogleChatEvent } from './types';
 
@@ -79,7 +85,7 @@ export class GoogleChatChannel extends BaseChannel implements WebhookChannel {
         const space = event.space;
         const sender = event.user;
         const isDm = space?.type === 'DM';
-        const peerType = isDm ? 'user' as const : 'group' as const;
+        const peerType = isDm ? ('user' as const) : ('group' as const);
         const senderId = sender?.name ?? '';
         const peerId = space?.name ?? '';
 
@@ -196,10 +202,7 @@ export class GoogleChatChannel extends BaseChannel implements WebhookChannel {
             exp: now + 3600,
         };
 
-        const segments = [
-            base64url(JSON.stringify(header)),
-            base64url(JSON.stringify(payload)),
-        ];
+        const segments = [base64url(JSON.stringify(header)), base64url(JSON.stringify(payload))];
 
         const signingInput = segments.join('.');
         const sign = createSign('RSA-SHA256');
@@ -213,4 +216,3 @@ export class GoogleChatChannel extends BaseChannel implements WebhookChannel {
 function base64url(str: string): string {
     return Buffer.from(str).toString('base64url');
 }
-

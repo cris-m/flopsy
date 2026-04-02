@@ -23,6 +23,10 @@ export class MessageRouter {
 
     route(message: Message, channel: Channel): void {
         const worker = this.getOrCreateWorker(channel);
+        this.log.trace(
+            { channel: channel.name, messageId: message.id },
+            'routing message to worker',
+        );
         worker.dispatch(message);
     }
 
@@ -31,9 +35,11 @@ export class MessageRouter {
     }
 
     async stopAll(): Promise<void> {
+        this.log.info({ workers: this.workers.size }, 'stopping all workers');
         const stops = [...this.workers.values()].map((w) => w.stop());
         await Promise.allSettled(stops);
         this.workers.clear();
+        this.log.debug('all workers stopped');
     }
 
     registerChannel(channel: Channel): void {
@@ -44,6 +50,7 @@ export class MessageRouter {
     unregisterChannel(channelName: string): void {
         const worker = this.workers.get(channelName);
         if (!worker) return;
+        this.log.info({ channel: channelName }, 'unregistering channel worker');
         worker.stop().catch(() => {});
         this.workers.delete(channelName);
     }

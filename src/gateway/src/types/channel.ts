@@ -3,7 +3,12 @@ import type { AgentHandler } from './agent';
 
 export type ChannelStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 
-export type AuthState = 'needs_scan' | 'waiting_scan' | 'authenticated' | 'expired' | 'not_configured';
+export type AuthState =
+    | 'needs_scan'
+    | 'waiting_scan'
+    | 'authenticated'
+    | 'expired'
+    | 'not_configured';
 
 export type DmPolicy = 'pairing' | 'allowlist' | 'open' | 'disabled';
 

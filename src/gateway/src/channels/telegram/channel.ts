@@ -1,4 +1,10 @@
-import type { Peer, OutboundMessage, ReactionOptions, Message, StreamingCapability } from '@gateway/types';
+import type {
+    Peer,
+    OutboundMessage,
+    ReactionOptions,
+    Message,
+    StreamingCapability,
+} from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
 import { isSafeMediaUrl } from '@gateway/core/security';
 import type { TelegramChannelConfig } from './types';
@@ -33,7 +39,7 @@ export class TelegramChannel extends BaseChannel {
 
                 const chatId = String(msg.chat.id);
                 const isGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
-                const peerType = isGroup ? 'group' as const : 'user' as const;
+                const peerType = isGroup ? ('group' as const) : ('user' as const);
                 const senderId = String(msg.from?.id ?? chatId);
 
                 if (!this.isAllowed(isGroup ? chatId : senderId, peerType)) return;
@@ -46,23 +52,31 @@ export class TelegramChannel extends BaseChannel {
                 const normalized: Message = {
                     id: String(msg.message_id),
                     channelName: this.name,
-                    peer: { id: chatId, type: peerType, name: msg.chat.type === 'private' ? msg.from?.first_name : msg.chat.title },
-                    sender: msg.from ? { id: String(msg.from.id), name: msg.from.first_name } : undefined,
+                    peer: {
+                        id: chatId,
+                        type: peerType,
+                        name: msg.chat.type === 'private' ? msg.from?.first_name : msg.chat.title,
+                    },
+                    sender: msg.from
+                        ? { id: String(msg.from.id), name: msg.from.first_name }
+                        : undefined,
                     body: msg.text ?? msg.caption ?? '',
                     timestamp: new Date(msg.date * 1000).toISOString(),
                     replyTo: msg.reply_to_message
-                        ? { id: String(msg.reply_to_message.message_id), body: (msg.reply_to_message as { text?: string }).text }
+                        ? {
+                              id: String(msg.reply_to_message.message_id),
+                              body: (msg.reply_to_message as { text?: string }).text,
+                          }
                         : undefined,
                 };
 
                 await this.emit('onMessage', normalized);
             });
 
-            this.bot.start({ onStart: () => this.setStatus('connected') })
-                .catch((err) => {
-                    this.setStatus('error');
-                    this.emitError(toError(err));
-                });
+            this.bot.start({ onStart: () => this.setStatus('connected') }).catch((err) => {
+                this.setStatus('error');
+                this.emitError(toError(err));
+            });
         } catch (err) {
             this.setStatus('error');
             this.emitError(toError(err));
@@ -95,16 +109,32 @@ export class TelegramChannel extends BaseChannel {
                 let sent;
                 switch (media.type) {
                     case 'image':
-                        sent = await this.bot.api.sendPhoto(chatId, inputFile, caption ? { caption } : {});
+                        sent = await this.bot.api.sendPhoto(
+                            chatId,
+                            inputFile,
+                            caption ? { caption } : {},
+                        );
                         break;
                     case 'video':
-                        sent = await this.bot.api.sendVideo(chatId, inputFile, caption ? { caption } : {});
+                        sent = await this.bot.api.sendVideo(
+                            chatId,
+                            inputFile,
+                            caption ? { caption } : {},
+                        );
                         break;
                     case 'audio':
-                        sent = await this.bot.api.sendAudio(chatId, inputFile, caption ? { caption } : {});
+                        sent = await this.bot.api.sendAudio(
+                            chatId,
+                            inputFile,
+                            caption ? { caption } : {},
+                        );
                         break;
                     case 'document':
-                        sent = await this.bot.api.sendDocument(chatId, inputFile, caption ? { caption } : {});
+                        sent = await this.bot.api.sendDocument(
+                            chatId,
+                            inputFile,
+                            caption ? { caption } : {},
+                        );
                         break;
                     default:
                         sent = await this.bot.api.sendMessage(chatId, message.body ?? '');
@@ -117,7 +147,8 @@ export class TelegramChannel extends BaseChannel {
         const body = message.body ?? '';
         if (!body.trim()) return '';
 
-        const sent = await this.bot.api.sendMessage(chatId, body, { parse_mode: 'Markdown' })
+        const sent = await this.bot.api
+            .sendMessage(chatId, body, { parse_mode: 'Markdown' })
             .catch(() => this.bot!.api.sendMessage(chatId, body));
         return String(sent.message_id);
     }
@@ -145,7 +176,8 @@ export class TelegramChannel extends BaseChannel {
 
     async editMessage(messageId: string, peer: Peer, body: string): Promise<void> {
         if (!this.bot) throw new Error('Telegram not connected');
-        await this.bot.api.editMessageText(peer.id, parseInt(messageId, 10), body, { parse_mode: 'Markdown' })
+        await this.bot.api
+            .editMessageText(peer.id, parseInt(messageId, 10), body, { parse_mode: 'Markdown' })
             .catch(() => this.bot!.api.editMessageText(peer.id, parseInt(messageId, 10), body));
     }
 }

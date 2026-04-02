@@ -76,10 +76,7 @@ class StubChannel extends BaseChannel {
     }
 }
 
-function createChannel(
-    name = 'test',
-    overrides: Partial<BaseChannelConfig> = {},
-): StubChannel {
+function createChannel(name = 'test', overrides: Partial<BaseChannelConfig> = {}): StubChannel {
     return new StubChannel(name, {
         enabled: true,
         dmPolicy: 'open',

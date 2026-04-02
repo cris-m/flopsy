@@ -260,12 +260,16 @@ describe('ChannelWorker - mid-turn injection', () => {
         let invokeStarted = false;
 
         const slowHandler: AgentHandler = {
-            invoke: vi.fn().mockImplementation(async (_text: string, _threadId: string, callbacks: AgentCallbacks) => {
-                invokeStarted = true;
-                await sleep(300);
-                pendingAtInvokeEnd = [...callbacks.pending];
-                return { reply: 'done', didSendViaTool: false };
-            }),
+            invoke: vi
+                .fn()
+                .mockImplementation(
+                    async (_text: string, _threadId: string, callbacks: AgentCallbacks) => {
+                        invokeStarted = true;
+                        await sleep(300);
+                        pendingAtInvokeEnd = [...callbacks.pending];
+                        return { reply: 'done', didSendViaTool: false };
+                    },
+                ),
         };
 
         const worker = new ChannelWorker({

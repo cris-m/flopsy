@@ -1,4 +1,3 @@
-
 export type {
     FlopsyConfig,
     ChannelsConfig,
@@ -14,4 +13,9 @@ export type {
     ExternalWebhookConfigSchema,
     LoggingConfig,
     WebhookSection,
+    ProactiveConfig,
+    HeartbeatDefinitionConfig,
+    JobDefinitionConfig,
+    DeliveryTargetConfig,
+    HealthMonitorConfig,
 } from '../config/schema';

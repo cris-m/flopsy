@@ -1,18 +1,17 @@
-export type {
-    Platform,
-    GatewayConfig,
-    Gateway,
-} from './gateway';
+export type { Platform, GatewayConfig, Gateway } from './gateway';
 
 export type {
     AgentCallbacks,
     AgentChunk,
     AgentHandler,
     AgentResult,
+    BackgroundTask,
     ChannelEvent,
     IEventQueue,
+    ITaskStore,
     InvokeRole,
     StreamingCallbacks,
+    TaskStatus,
 } from './agent';
 
 export type {

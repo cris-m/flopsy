@@ -314,13 +314,23 @@ describe('RateLimiter', () => {
     });
 
     it('should allow requests under the limit', () => {
-        limiter = new RateLimiter({ windowMs: 60_000, maxRequests: 5, blockDurationMs: 1_000, maxTrackedClients: 100 });
+        limiter = new RateLimiter({
+            windowMs: 60_000,
+            maxRequests: 5,
+            blockDurationMs: 1_000,
+            maxTrackedClients: 100,
+        });
         const result = limiter.checkRequest('client-1');
         expect(result.allowed).toBe(true);
     });
 
     it('should block after exceeding max requests', () => {
-        limiter = new RateLimiter({ windowMs: 60_000, maxRequests: 3, blockDurationMs: 5_000, maxTrackedClients: 100 });
+        limiter = new RateLimiter({
+            windowMs: 60_000,
+            maxRequests: 3,
+            blockDurationMs: 5_000,
+            maxTrackedClients: 100,
+        });
 
         for (let i = 0; i < 3; i++) {
             expect(limiter.checkRequest('client-1').allowed).toBe(true);
@@ -333,7 +343,12 @@ describe('RateLimiter', () => {
     });
 
     it('should track clients independently', () => {
-        limiter = new RateLimiter({ windowMs: 60_000, maxRequests: 2, blockDurationMs: 1_000, maxTrackedClients: 100 });
+        limiter = new RateLimiter({
+            windowMs: 60_000,
+            maxRequests: 2,
+            blockDurationMs: 1_000,
+            maxTrackedClients: 100,
+        });
 
         limiter.checkRequest('client-a');
         limiter.checkRequest('client-a');
@@ -367,7 +382,12 @@ describe('RateLimiter', () => {
     });
 
     it('should evict oldest clients when exceeding maxTrackedClients', () => {
-        limiter = new RateLimiter({ maxTrackedClients: 3, windowMs: 60_000, maxRequests: 100, blockDurationMs: 1_000 });
+        limiter = new RateLimiter({
+            maxTrackedClients: 3,
+            windowMs: 60_000,
+            maxRequests: 100,
+            blockDurationMs: 1_000,
+        });
 
         limiter.checkRequest('c1');
         limiter.checkRequest('c2');
@@ -502,9 +522,11 @@ describe('extractToken', () => {
         expect(token).toBeNull();
     });
 
-    it('should extract from query string parameter', () => {
-        const token = extractToken({}, '/?token=query-token-789');
-        expect(token).toBe('query-token-789');
+    it('should NOT extract from query string (tokens in URLs leak to logs)', () => {
+        // URL query string token extraction was removed — tokens in URLs appear
+        // in server access logs and proxy logs. Use Authorization: Bearer instead.
+        const token = extractToken({});
+        expect(token).toBeNull();
     });
 
     it('should return null when no token source is present', () => {
@@ -528,18 +550,14 @@ describe('extractToken', () => {
         expect(token).toBe('ws-token');
     });
 
-    it('should return null for malformed URL', () => {
-        const token = extractToken({}, ':::not-a-url');
-        expect(token).toBeNull();
-    });
-
-    it('should return null when query has no token param', () => {
-        const token = extractToken({}, '/?other=value');
-        expect(token).toBeNull();
+    it('should return null when no token source is present (no URL param accepted)', () => {
+        expect(extractToken({})).toBeNull();
     });
 
     it('should handle array header values by ignoring them', () => {
-        const token = extractToken({ authorization: ['Bearer a', 'Bearer b'] as unknown as string });
+        const token = extractToken({
+            authorization: ['Bearer a', 'Bearer b'] as unknown as string,
+        });
         // authorization is an array, not a string — should not match
         expect(token).toBeNull();
     });
@@ -593,11 +611,15 @@ describe('resolveSafePath', () => {
     });
 
     it('should throw on directory traversal', () => {
-        expect(() => resolveSafePath(base, '../../../etc/passwd')).toThrow('Path traversal detected');
+        expect(() => resolveSafePath(base, '../../../etc/passwd')).toThrow(
+            'Path traversal detected',
+        );
     });
 
     it('should throw on double-dot traversal', () => {
-        expect(() => resolveSafePath(base, 'subdir/../../etc/shadow')).toThrow('Path traversal detected');
+        expect(() => resolveSafePath(base, 'subdir/../../etc/shadow')).toThrow(
+            'Path traversal detected',
+        );
     });
 
     it('should strip null bytes before resolving', () => {
@@ -612,7 +634,9 @@ describe('resolveSafePath', () => {
     });
 
     it('should throw when traversal with null bytes', () => {
-        expect(() => resolveSafePath(base, '..\0/../etc/passwd')).toThrow('Path traversal detected');
+        expect(() => resolveSafePath(base, '..\0/../etc/passwd')).toThrow(
+            'Path traversal detected',
+        );
     });
 });
 
@@ -624,11 +648,7 @@ describe('verifyWebhookSignature', () => {
     const secret = 'webhook-secret-key';
     const body = '{"event":"push","data":123}';
 
-    function computeSignature(
-        algo: string,
-        fmt: 'hex' | 'base64',
-        prefix?: string,
-    ): string {
+    function computeSignature(algo: string, fmt: 'hex' | 'base64', prefix?: string): string {
         const sig = createHmac(algo, secret).update(body).digest(fmt);
         return prefix ? prefix + sig : sig;
     }

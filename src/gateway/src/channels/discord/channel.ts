@@ -1,4 +1,10 @@
-import type { Peer, OutboundMessage, ReactionOptions, Message, StreamingCapability } from '@gateway/types';
+import type {
+    Peer,
+    OutboundMessage,
+    ReactionOptions,
+    Message,
+    StreamingCapability,
+} from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
 import { isSafeMediaUrl } from '@gateway/core/security';
 import type { DiscordChannelConfig } from './types';
@@ -15,7 +21,10 @@ export class DiscordChannel extends BaseChannel {
 
     private client: import('discord.js').Client | null = null;
     private readonly channelConfig: DiscordChannelConfig;
-    private readonly pendingInteractions = new Map<string, { interaction: unknown; createdAt: number }>();
+    private readonly pendingInteractions = new Map<
+        string,
+        { interaction: unknown; createdAt: number }
+    >();
     private sweepTimer: ReturnType<typeof setInterval> | null = null;
 
     constructor(config: DiscordChannelConfig) {
@@ -27,7 +36,8 @@ export class DiscordChannel extends BaseChannel {
         this.setStatus('connecting');
 
         try {
-            const { Client, GatewayIntentBits, Partials, Events, ChannelType } = await import('discord.js');
+            const { Client, GatewayIntentBits, Partials, Events, ChannelType } =
+                await import('discord.js');
 
             this.client = new Client({
                 intents: [
@@ -55,7 +65,7 @@ export class DiscordChannel extends BaseChannel {
                 if (msg.author.bot) return;
 
                 const isDM = msg.channel.type === ChannelType.DM;
-                const peerType = isDM ? 'user' as const : 'group' as const;
+                const peerType = isDM ? ('user' as const) : ('group' as const);
                 const peerId = isDM ? msg.author.id : msg.channelId;
                 const senderId = msg.author.id;
 
@@ -65,13 +75,15 @@ export class DiscordChannel extends BaseChannel {
                 const normalized: Message = {
                     id: msg.id,
                     channelName: this.name,
-                    peer: { id: peerId, type: peerType, name: isDM ? msg.author.username : (msg.channel as { name?: string }).name },
+                    peer: {
+                        id: peerId,
+                        type: peerType,
+                        name: isDM ? msg.author.username : (msg.channel as { name?: string }).name,
+                    },
                     sender: { id: senderId, name: msg.author.username },
                     body: msg.content,
                     timestamp: msg.createdAt.toISOString(),
-                    replyTo: msg.reference?.messageId
-                        ? { id: msg.reference.messageId }
-                        : undefined,
+                    replyTo: msg.reference?.messageId ? { id: msg.reference.messageId } : undefined,
                 };
 
                 await this.emit('onMessage', normalized);
@@ -84,7 +96,7 @@ export class DiscordChannel extends BaseChannel {
                 const channelId = interaction.channelId;
                 const isDM = !interaction.guildId;
                 const peerId = isDM ? senderId : channelId;
-                const peerType = isDM ? 'user' as const : 'group' as const;
+                const peerType = isDM ? ('user' as const) : ('group' as const);
 
                 if (!channelId) {
                     await interaction.reply({ content: 'Unable to process.', ephemeral: true });
@@ -112,12 +124,18 @@ export class DiscordChannel extends BaseChannel {
                 };
 
                 if (this.pendingInteractions.size >= MAX_PENDING_INTERACTIONS) {
-                    await interaction.reply({ content: 'Too many pending requests. Try again later.', ephemeral: true });
+                    await interaction.reply({
+                        content: 'Too many pending requests. Try again later.',
+                        ephemeral: true,
+                    });
                     return;
                 }
 
                 await interaction.deferReply();
-                this.pendingInteractions.set(interaction.id, { interaction, createdAt: Date.now() });
+                this.pendingInteractions.set(interaction.id, {
+                    interaction,
+                    createdAt: Date.now(),
+                });
                 this.ensureSweep();
                 await this.emit('onMessage', normalized);
             });
@@ -151,7 +169,8 @@ export class DiscordChannel extends BaseChannel {
             const pending = this.pendingInteractions.get(message.replyTo);
             if (pending) {
                 this.pendingInteractions.delete(message.replyTo);
-                const interaction = pending.interaction as import('discord.js').ChatInputCommandInteraction;
+                const interaction =
+                    pending.interaction as import('discord.js').ChatInputCommandInteraction;
                 const reply = await interaction.editReply({
                     content: (message.body ?? '').slice(0, MAX_DISCORD_LENGTH),
                     ...(files.length && { files }),
@@ -217,7 +236,9 @@ export class DiscordChannel extends BaseChannel {
             new SlashCommandBuilder()
                 .setName(cmd.name)
                 .setDescription(cmd.description)
-                .addStringOption((opt) => opt.setName('input').setDescription('Your message').setRequired(false))
+                .addStringOption((opt) =>
+                    opt.setName('input').setDescription('Your message').setRequired(false),
+                )
                 .toJSON(),
         );
 
@@ -227,7 +248,9 @@ export class DiscordChannel extends BaseChannel {
         } else {
             const existing = await this.client.application.commands.fetch();
             const existingNames = new Set(existing.map((c) => c.name));
-            const needsUpdate = commands.length !== existing.size || commands.some((c) => !existingNames.has(c.name));
+            const needsUpdate =
+                commands.length !== existing.size ||
+                commands.some((c) => !existingNames.has(c.name));
             if (needsUpdate) {
                 await this.client.application.commands.set(builders);
             }
@@ -250,11 +273,17 @@ export class DiscordChannel extends BaseChannel {
 
         this.client.user.setPresence({
             status: p.status ?? 'online',
-            activities: p.activity ? [{
-                name: p.activity,
-                type: activityTypeMap[p.activityType ?? 'playing'] ?? ActivityType.Playing,
-                ...((p.activityType ?? 'playing') === 'streaming' && p.activityUrl && { url: p.activityUrl }),
-            }] : [],
+            activities: p.activity
+                ? [
+                      {
+                          name: p.activity,
+                          type:
+                              activityTypeMap[p.activityType ?? 'playing'] ?? ActivityType.Playing,
+                          ...((p.activityType ?? 'playing') === 'streaming' &&
+                              p.activityUrl && { url: p.activityUrl }),
+                      },
+                  ]
+                : [],
         });
     }
 
@@ -278,9 +307,10 @@ export class DiscordChannel extends BaseChannel {
     private async resolveTextChannel(peer: Peer) {
         if (!this.client) throw new Error('Discord not connected');
 
-        const channel = peer.type === 'user'
-            ? await this.client.users.fetch(peer.id).then((u) => u.createDM())
-            : await this.client.channels.fetch(peer.id);
+        const channel =
+            peer.type === 'user'
+                ? await this.client.users.fetch(peer.id).then((u) => u.createDM())
+                : await this.client.channels.fetch(peer.id);
 
         if (!channel || !('send' in channel)) {
             throw new Error(`Cannot resolve text channel for ${peer.id}`);

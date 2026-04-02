@@ -4,11 +4,12 @@
   "description": "",
   "main": "index.ts",
   "scripts": {
-    "chat": "tsx src/agent/src/chat_cli.ts",
+    "gateway": "npm run start --workspace=src/gateway",
     "build": "tsc --build",
     "build:clean": "tsc --build --clean",
     "format": "prettier --write \"src/**/*.ts\"",
     "format:check": "prettier --check \"src/**/*.ts\"",
+    "lint": "prettier --check \"src/**/*.ts\"",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

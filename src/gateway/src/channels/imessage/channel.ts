@@ -32,9 +32,7 @@ export class IMessageChannel extends BaseChannel {
             this.lastTimestamp = new Date().toISOString();
 
             this.pollTimer = setInterval(() => {
-                this.poll().catch((err) =>
-                    this.emitError(toError(err)),
-                );
+                this.poll().catch((err) => this.emitError(toError(err)));
             }, POLL_INTERVAL_MS);
             this.pollTimer.unref();
 
@@ -60,12 +58,18 @@ export class IMessageChannel extends BaseChannel {
         if (message.media?.length) {
             for (const media of message.media) {
                 if (!media.url) continue;
-                await execFileAsync(this.cliPath, ['send', '--to', recipient, '--file', media.url], { timeout: EXEC_TIMEOUT_MS });
+                await execFileAsync(
+                    this.cliPath,
+                    ['send', '--to', recipient, '--file', media.url],
+                    { timeout: EXEC_TIMEOUT_MS },
+                );
             }
         }
 
         if (message.body?.trim()) {
-            await execFileAsync(this.cliPath, ['send', '--to', recipient, '--text', message.body], { timeout: EXEC_TIMEOUT_MS });
+            await execFileAsync(this.cliPath, ['send', '--to', recipient, '--text', message.body], {
+                timeout: EXEC_TIMEOUT_MS,
+            });
         }
 
         return `imsg-${Date.now()}`;

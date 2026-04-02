@@ -1,4 +1,10 @@
-import type { Peer, OutboundMessage, ReactionOptions, Message, StreamingCapability } from '@gateway/types';
+import type {
+    Peer,
+    OutboundMessage,
+    ReactionOptions,
+    Message,
+    StreamingCapability,
+} from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
 import type { SlackChannelConfig } from './types';
 
@@ -33,14 +39,19 @@ export class SlackChannel extends BaseChannel {
 
             this.app.message(async ({ message, client }) => {
                 const msg = message as unknown as {
-                    subtype?: string; bot_id?: string; text?: string;
-                    channel_type?: string; user?: string; channel?: string;
-                    ts?: string; thread_ts?: string;
+                    subtype?: string;
+                    bot_id?: string;
+                    text?: string;
+                    channel_type?: string;
+                    user?: string;
+                    channel?: string;
+                    ts?: string;
+                    thread_ts?: string;
                 };
                 if (msg.subtype || msg.bot_id || !msg.text) return;
 
                 const isDm = msg.channel_type === 'im';
-                const peerType = isDm ? 'user' as const : 'group' as const;
+                const peerType = isDm ? ('user' as const) : ('group' as const);
                 const senderId = msg.user ?? '';
                 const peerId = msg.channel ?? '';
 
@@ -74,9 +85,8 @@ export class SlackChannel extends BaseChannel {
                     sender: { id: senderId, name: senderName },
                     body: msg.text,
                     timestamp: new Date(parseFloat(ts) * 1000).toISOString(),
-                    replyTo: msg.thread_ts && msg.thread_ts !== ts
-                        ? { id: msg.thread_ts }
-                        : undefined,
+                    replyTo:
+                        msg.thread_ts && msg.thread_ts !== ts ? { id: msg.thread_ts } : undefined,
                 };
 
                 await this.emit('onMessage', normalized);

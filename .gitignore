@@ -16,6 +16,9 @@ dist/
 .env.local
 .env.*.local
 
+# Workspace data (runtime, user-specific)
+.flopsy/
+
 # Sessions & credentials (sensitive)
 sessions/
 assets/sessions/

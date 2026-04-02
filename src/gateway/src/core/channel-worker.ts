@@ -9,7 +9,7 @@ import { isSafeIdentifier, sanitize } from './security';
 
 const ABORT_PHRASES = new Set(['stop', 'cancel', 'forget it', 'nevermind', 'abort']);
 const MAX_PENDING = 100;
-const AGENT_TIMEOUT_MS = 120_000;        // 2 min — regular user turns
+const AGENT_TIMEOUT_MS = 120_000; // 2 min — regular user turns
 const BACKGROUND_TURN_TIMEOUT_MS = 600_000; // 10 min — background task result turns
 const STOP_TIMEOUT_MS = 5_000;
 const MAX_TASK_RESULT_LENGTH = 10_000;
@@ -66,8 +66,14 @@ export class ChannelWorker {
 
         if (isAbortRequest(text)) {
             if (this.currentAbort) {
+                this.log.info({ channel: this.channel.name, text }, 'abort requested');
                 this.currentAbort.abort();
                 this.sendReply('Stopped.', message.peer).catch(() => {});
+            } else {
+                this.log.debug(
+                    { channel: this.channel.name },
+                    'abort requested but no active turn',
+                );
             }
             return;
         }
@@ -78,6 +84,15 @@ export class ChannelWorker {
         if (this.turnActive) {
             if (this.pending.length < MAX_PENDING) {
                 this.pending.push(text);
+                this.log.debug(
+                    { channel: this.channel.name, pendingCount: this.pending.length },
+                    'message queued as pending (turn active)',
+                );
+            } else {
+                this.log.warn(
+                    { channel: this.channel.name },
+                    'pending buffer full, message dropped',
+                );
             }
         } else {
             this.msgQueue.enqueue(text);
@@ -91,6 +106,7 @@ export class ChannelWorker {
     }
 
     async stop(): Promise<void> {
+        this.log.debug({ channel: this.channel.name }, 'worker stopping');
         this.running = false;
         this.currentAbort?.abort();
         this.msgQueue.clear();
@@ -117,16 +133,17 @@ export class ChannelWorker {
                 const [waitPromise, cleanup] = this.createWaitForEventOrStop();
                 this.waitCleanup = cleanup;
 
-                const batch = await Promise.race([
-                    this.msgQueue.dequeue(),
-                    waitPromise,
-                ]);
+                const batch = await Promise.race([this.msgQueue.dequeue(), waitPromise]);
 
                 this.cancelWait();
 
                 if (!batch || batch.length === 0) continue;
 
                 const text = coalesce(batch);
+                this.log.debug(
+                    { channel: this.channel.name, messages: batch.length, textLength: text.length },
+                    'coalesced messages for agent turn',
+                );
                 await this.runAgentTurn(text, 'user', this.agentTimeoutMs);
             } catch (err) {
                 if (!this.running) break;
@@ -138,10 +155,15 @@ export class ChannelWorker {
         this.log.info({ channel: this.channel.name }, 'worker stopped');
     }
 
-    private async runAgentTurn(text: string, role: InvokeRole, timeoutMs = AGENT_TIMEOUT_MS): Promise<void> {
+    private async runAgentTurn(
+        text: string,
+        role: InvokeRole,
+        timeoutMs = AGENT_TIMEOUT_MS,
+    ): Promise<void> {
         const abort = new AbortController();
         this.currentAbort = abort;
         this.turnActive = true;
+        const turnStartedAt = Date.now();
 
         let didSendViaTool = false;
         const peer = this.currentPeer;
@@ -153,9 +175,23 @@ export class ChannelWorker {
             return;
         }
 
+        this.log.debug(
+            {
+                channel: this.channel.name,
+                role,
+                timeoutMs,
+                textLength: text.length,
+                peer: peer.id,
+            },
+            'agent turn started',
+        );
+
         const callbacks: AgentCallbacks = {
             onReply: async (reply: string): Promise<void> => {
                 await this.sendReply(reply, peer, replyTo);
+            },
+            onProgress: (taskId: string, message: string): void => {
+                this.sendReply(`[Task #${taskId}] ${message}`, peer).catch(() => {});
             },
             setDidSendViaTool: (): void => {
                 didSendViaTool = true;
@@ -165,7 +201,10 @@ export class ChannelWorker {
             signal: abort.signal,
         };
 
-        const { promise: timeoutPromise, cleanup: timeoutCleanup } = rejectAfterTimeout(timeoutMs, abort.signal);
+        const { promise: timeoutPromise, cleanup: timeoutCleanup } = rejectAfterTimeout(
+            timeoutMs,
+            abort.signal,
+        );
 
         try {
             await this.sendTyping(peer);
@@ -178,20 +217,60 @@ export class ChannelWorker {
             if (!didSendViaTool && !result.didSendViaTool && result.reply) {
                 await this.sendReply(result.reply, peer, replyTo);
             }
+
+            const durationMs = Date.now() - turnStartedAt;
+            this.log.info(
+                {
+                    channel: this.channel.name,
+                    role,
+                    durationMs,
+                    didSendViaTool: didSendViaTool || result.didSendViaTool,
+                    hasReply: !!result.reply,
+                    tokenUsage: result.tokenUsage,
+                },
+                'agent turn completed',
+            );
         } catch (err: unknown) {
+            const durationMs = Date.now() - turnStartedAt;
             if (err instanceof Error && err.name === 'AbortError') {
+                this.log.info(
+                    { channel: this.channel.name, durationMs },
+                    'agent turn aborted by user',
+                );
                 if (!didSendViaTool) {
-                    await this.sendReply('Stopped. What would you like instead?', peer).catch(() => {});
+                    await this.sendReply('Stopped. What would you like instead?', peer).catch(
+                        () => {},
+                    );
                 }
+            } else if (err instanceof Error && err.message === 'Agent invocation timed out') {
+                this.log.warn(
+                    { channel: this.channel.name, durationMs, timeoutMs },
+                    'agent turn timed out',
+                );
+                await this.sendReply('Something went wrong. Please try again.', peer).catch(
+                    () => {},
+                );
             } else {
-                this.log.error({ err, channel: this.channel.name }, 'agent turn failed');
-                await this.sendReply('Something went wrong. Please try again.', peer).catch(() => {});
+                this.log.error(
+                    { err, channel: this.channel.name, durationMs },
+                    'agent turn failed',
+                );
+                await this.sendReply('Something went wrong. Please try again.', peer).catch(
+                    () => {},
+                );
             }
         } finally {
             timeoutCleanup();
             this.currentAbort = null;
             this.turnActive = false;
+            const pendingCount = this.pending.length;
             this.drainPendingToQueue();
+            if (pendingCount > 0) {
+                this.log.debug(
+                    { channel: this.channel.name, drained: pendingCount },
+                    'pending messages drained to queue',
+                );
+            }
         }
     }
 
@@ -204,21 +283,52 @@ export class ChannelWorker {
 
     private async handleEvent(event: ChannelEvent): Promise<void> {
         const peer = this.currentPeer;
-        if (!peer) return;
+        if (!peer) {
+            this.log.warn(
+                { channel: this.channel.name, eventType: event.type },
+                'event received but no peer — dropped',
+            );
+            return;
+        }
 
         if (!isSafeIdentifier(event.taskId)) {
-            this.log.warn({ taskId: event.taskId }, 'invalid taskId in event — dropped');
+            this.log.warn(
+                { taskId: event.taskId, channel: this.channel.name },
+                'invalid taskId in event — dropped',
+            );
+            return;
+        }
+
+        if (event.type === 'task_progress') {
+            const safeProgress = sanitize(event.progress ?? '', 500);
+            this.log.debug(
+                { taskId: event.taskId, channel: this.channel.name },
+                'task progress received',
+            );
+            await this.sendReply(safeProgress, peer).catch(() => {});
             return;
         }
 
         if (event.type === 'task_error') {
-            this.log.error({ taskId: event.taskId, error: event.error }, 'background task failed');
+            this.log.error(
+                { taskId: event.taskId, error: event.error, channel: this.channel.name },
+                'background task failed',
+            );
             await this.sendReply(
                 `Background task #${event.taskId} failed. Please try again.`,
                 peer,
             ).catch(() => {});
             return;
         }
+
+        this.log.info(
+            {
+                taskId: event.taskId,
+                channel: this.channel.name,
+                resultLength: (event.result ?? '').length,
+            },
+            'background task completed — invoking agent',
+        );
 
         const rawResult = event.result ?? '(no result)';
         const safeResult = sanitize(rawResult, MAX_TASK_RESULT_LENGTH);
@@ -248,7 +358,9 @@ export class ChannelWorker {
         const stopPromise = new Promise<null>((resolve) => {
             stopResolve = () => resolve(null);
         });
-        const cleanup = (): void => { stopResolve?.(); };
+        const cleanup = (): void => {
+            stopResolve?.();
+        };
         return [Promise.race([eventPromise, stopPromise]), cleanup];
     }
 
@@ -268,12 +380,17 @@ function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function rejectAfterTimeout(ms: number, signal: AbortSignal): { promise: Promise<never>; cleanup: () => void } {
+function rejectAfterTimeout(
+    ms: number,
+    signal: AbortSignal,
+): { promise: Promise<never>; cleanup: () => void } {
     let timer: ReturnType<typeof setTimeout>;
     const promise = new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new Error('Agent invocation timed out')), ms);
         signal.addEventListener('abort', () => clearTimeout(timer), { once: true });
     });
-    const cleanup = (): void => { clearTimeout(timer!); };
+    const cleanup = (): void => {
+        clearTimeout(timer!);
+    };
     return { promise, cleanup };
 }

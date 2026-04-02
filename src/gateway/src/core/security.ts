@@ -28,15 +28,15 @@ export interface WebhookSignatureConfig {
 }
 
 const BLOCKED_HOSTS = new Set([
-    'localhost', 
-    '127.0.0.1', 
-    '0.0.0.0', 
-    '[::1]', 
+    'localhost',
+    '127.0.0.1',
+    '0.0.0.0',
+    '[::1]',
     '::1',
-    '169.254.169.254', 
+    '169.254.169.254',
     '169.254.170.2',
     '100.100.100.200',
-    'metadata.google.internal', 
+    'metadata.google.internal',
     'metadata.azure.internal',
     'kubernetes.default.svc',
 ]);
@@ -77,10 +77,7 @@ const PRIVATE_PATTERNS = [
     /\.internal$/i,
 ];
 
-export function validateToken(
-    expected: string,
-    provided: string | null | undefined,
-): boolean {
+export function validateToken(expected: string, provided: string | null | undefined): boolean {
     if (!provided || !expected) return false;
     const a = Buffer.from(expected, 'utf8');
     const b = Buffer.from(provided, 'utf8');
@@ -90,7 +87,6 @@ export function validateToken(
 
 export function extractToken(
     headers: Record<string, string | string[] | undefined>,
-    url?: string,
 ): string | null {
     const auth = headers['authorization'];
     if (typeof auth === 'string' && auth.startsWith('Bearer ')) {
@@ -101,15 +97,6 @@ export function extractToken(
     if (typeof protocol === 'string') {
         const match = protocol.match(/^auth\.(.+)$/);
         if (match?.[1]) return match[1];
-    }
-
-    if (url) {
-        try {
-            const parsed = new URL(url, 'http://localhost');
-            return parsed.searchParams.get('token');
-        } catch {
-            return null;
-        }
     }
 
     return null;
@@ -232,7 +219,11 @@ export class RateLimiter {
             state.requests = state.requests.filter((ts) => ts > windowStart);
             if (state.requests.length === 0 && !state.blockedUntil) {
                 this.clients.delete(id);
-            } else if (state.blockedUntil && now >= state.blockedUntil && state.requests.length === 0) {
+            } else if (
+                state.blockedUntil &&
+                now >= state.blockedUntil &&
+                state.requests.length === 0
+            ) {
                 this.clients.delete(id);
             }
         }
@@ -271,9 +262,7 @@ export function verifyWebhookSignature(
         provided = provided.slice(config.prefix.length);
     }
 
-    const expected = createHmac(config.algorithm, secret)
-        .update(body)
-        .digest(config.format);
+    const expected = createHmac(config.algorithm, secret).update(body).digest(config.format);
 
     try {
         return timingSafeEqual(
