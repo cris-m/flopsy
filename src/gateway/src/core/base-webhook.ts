@@ -172,13 +172,105 @@ export class WebhookServer {
 
     private findSignatureHeader(req: IncomingMessage): string | null {
         const candidates = [
+            // ─── Generic / Common ──────────────────────────────────────────
             'x-hub-signature-256',
+            'x-hub-signature',
             'x-webhook-signature',
-            'x-slack-signature',
-            'x-linear-signature',
-            'stripe-signature',
-            'x-line-signature',
             'x-signature',
+            'x-signature-256',
+            'x-request-signature',
+            'x-payload-signature',
+            'x-hmac-signature',
+
+            // ─── Standard Webhooks spec (Svix, Clerk, Resend, WorkOS…) ────
+            'webhook-signature',
+            'webhook-id',
+            'webhook-timestamp',
+
+            // ─── Source Control ────────────────────────────────────────────
+            'x-gitlab-token',            // GitLab
+
+            // ─── CI/CD ─────────────────────────────────────────────────────
+            'circleci-signature',        // CircleCI
+            'signature',                 // Travis CI (bare — no x- prefix)
+
+            // ─── Payments ──────────────────────────────────────────────────
+            'stripe-signature',
+            'paddle-signature',
+            'x-razorpay-signature',
+            'paypal-transmission-sig',
+            'paypal-cert-url',           // PayPal asymmetric cert retrieval
+            'x-square-hmacsha256-signature',
+            'x-lemon-squeezy-signature',
+
+            // ─── E-commerce ────────────────────────────────────────────────
+            'x-shopify-hmac-sha256',
+            'x-wc-webhook-signature',    // WooCommerce
+
+            // ─── Messaging / Comms ─────────────────────────────────────────
+            'x-slack-signature',
+            'x-twilio-signature',
+            'x-twilio-email-event-webhook-signature', // SendGrid (ECDSA)
+            'x-twilio-email-event-webhook-timestamp', // SendGrid timestamp
+            'x-zm-signature',            // Zoom
+            'x-zoom-signature',          // Zoom (alternate)
+            'x-line-signature',
+
+            // ─── Email Deliverability ──────────────────────────────────────
+            'x-mailgun-signature',
+            'x-mailgun-signature-256',
+            'x-postmark-signature',
+
+            // ─── Developer / Auth Platforms ────────────────────────────────
+            'svix-signature',
+            'svix-id',
+            'svix-timestamp',
+
+            // ─── Project Management / Productivity ────────────────────────
+            'x-linear-signature',
+            'x-hook-signature',          // Asana
+            'x-pagerduty-signature',
+
+            // ─── CRM / Marketing ───────────────────────────────────────────
+            'x-hubspot-signature',
+            'x-hubspot-signature-v3',
+            'x-zendesk-webhook-signature',
+
+            // ─── File Storage ──────────────────────────────────────────────
+            'x-dropbox-signature',
+            'box-signature-primary',
+            'box-signature-secondary',
+
+            // ─── CMS / Content ─────────────────────────────────────────────
+            'x-contentful-signature',
+            'sanity-webhook-signature',
+            'x-webflow-signature',
+
+            // ─── Identity / Auth ───────────────────────────────────────────
+            'x-okta-verification-challenge',
+
+            // ─── Scheduling / Forms ────────────────────────────────────────
+            'oncehub-signature',
+            'typeform-signature',
+
+            // ─── Finance / Fintech ─────────────────────────────────────────
+            'x-xero-signature',
+            'plaid-verification',
+            'moneyhash-signature',
+
+            // ─── Video / Media ─────────────────────────────────────────────
+            'mux-signature',
+
+            // ─── Gaming / Social ───────────────────────────────────────────
+            'x-signature-ed25519',       // Discord (Ed25519 asymmetric)
+            'x-signature-timestamp',     // Discord (paired with above)
+
+            // ─── DevOps / Cloud ────────────────────────────────────────────
+            'x-vercel-signature',
+
+            // ─── APIs / Integration Platforms ──────────────────────────────
+            'x-apideck-signature',
+            'x-algolia-signature',
         ];
         for (const name of candidates) {
             const value = req.headers[name];
