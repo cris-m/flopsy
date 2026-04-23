@@ -7,8 +7,9 @@
 import type { AuthProvider } from '../types';
 import { googleProvider } from './google';
 import { spotifyProvider } from './spotify';
+import { twitterProvider } from './twitter';
 
-export const PROVIDERS: readonly AuthProvider[] = [googleProvider, spotifyProvider];
+export const PROVIDERS: readonly AuthProvider[] = [googleProvider, spotifyProvider, twitterProvider];
 
 export function getProvider(name: string): AuthProvider | undefined {
     const normalized = name.trim().toLowerCase();

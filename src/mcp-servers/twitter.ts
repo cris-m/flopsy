@@ -1,30 +1,30 @@
-// MCP Twitter/X Server
-// Twitter/X integration using bird CLI (cookie-based auth)
-// Install: npm install -g @steipete/bird
-// Auth: Extracts cookies from browser (Chrome/Arc/Firefox/Safari)
+// MCP Twitter/X Server — cookie-based via bird CLI.
+// Auth is managed externally: run `flopsy auth twitter` once.
+// The server never opens a browser; it checks the credential file written
+// by the CLI and runs `bird check` to verify cookies are still valid.
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { resolveFlopsyHome } from '@flopsy/shared';
 
 const execFileAsync = promisify(execFile);
 
 const TIMEOUT_MS = 60000;
-const TWITTER_LOGIN_URL = 'https://x.com/login';
 
-/**
- * Open URL in default browser (safe - no shell injection)
- */
-function openBrowser(url: string): void {
-    const platform = process.platform;
-    if (platform === 'darwin') {
-        execFile('open', [url]);
-    } else if (platform === 'win32') {
-        execFile('cmd', ['/c', 'start', '', url]);
-    } else {
-        execFile('xdg-open', [url]);
+/** Check whether the CLI has stored a twitter sentinel credential. */
+function hasStoredCredential(): boolean {
+    const path = join(resolveFlopsyHome(), 'auth', 'twitter.json');
+    if (!existsSync(path)) return false;
+    try {
+        const raw = JSON.parse(readFileSync(path, 'utf-8')) as { provider?: string };
+        return raw.provider === 'twitter';
+    } catch {
+        return false;
     }
 }
 
@@ -55,87 +55,30 @@ async function isTwitterAuthenticated(): Promise<boolean> {
 }
 
 /**
- * Poll for authentication after user logs in
- * Checks every 5 seconds for up to 2 minutes
- */
-async function pollForAuthentication(): Promise<boolean> {
-    const maxAttempts = 24; // 24 * 5 seconds = 2 minutes
-    const pollInterval = 5000;
-
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, pollInterval));
-        console.error(`[Twitter Auth] Checking... (attempt ${attempt}/${maxAttempts})`);
-
-        if (await isTwitterAuthenticated()) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-/**
- * Prompt user to log in to Twitter and wait for authentication
- */
-async function promptTwitterLogin(): Promise<boolean> {
-    console.error(`
-+---------------------------------------------------------------------+
-|  Twitter/X Authentication Required                                   |
-+---------------------------------------------------------------------+
-|  Opening X/Twitter in your browser...                               |
-|  Please log in to your account.                                     |
-|                                                                     |
-|  Bird CLI extracts cookies from your browser after you log in.      |
-|  Waiting for authentication (up to 2 minutes)...                    |
-+---------------------------------------------------------------------+
-`);
-
-    openBrowser(TWITTER_LOGIN_URL);
-
-    const success = await pollForAuthentication();
-
-    if (success) {
-        console.error(`
-+---------------------------------------------------------------------+
-|  Authentication successful!                                          |
-+---------------------------------------------------------------------+
-`);
-    } else {
-        console.error(`
-+---------------------------------------------------------------------+
-|  Authentication timeout.                                             |
-|  Twitter tools may not work until you log in.                       |
-|  You can log in to x.com and restart to enable Twitter.             |
-+---------------------------------------------------------------------+
-`);
-    }
-
-    return success;
-}
-
-/**
- * Ensure Twitter authentication at startup
- * Opens browser for login if not authenticated
+ * Verify Twitter auth at startup — reads the credential file written by
+ * `flopsy auth twitter` and confirms bird cookies are still valid.
+ * Never opens a browser; tells the user to run the CLI command instead.
  */
 async function ensureTwitterAuth(): Promise<boolean> {
     const installed = await isBirdInstalled();
     if (!installed) {
-        console.error('[Twitter Auth] bird CLI not accessible. Install with:');
-        console.error('  npm install -g @steipete/bird');
-        console.error('  or ensure npx can run: npx @steipete/bird --version');
+        console.error('[Twitter] bird CLI not found. Install with: npm install -g @steipete/bird');
         return false;
     }
 
-    console.error('[Twitter Auth] Checking authentication...');
-
-    const authenticated = await isTwitterAuthenticated();
-    if (authenticated) {
-        console.error('[Twitter Auth] Already authenticated');
-        return true;
+    if (!hasStoredCredential()) {
+        console.error('[Twitter] No credential found. Run: flopsy auth twitter');
+        return false;
     }
 
-    console.error('[Twitter Auth] Not authenticated. Starting login flow...');
-    return await promptTwitterLogin();
+    const authenticated = await isTwitterAuthenticated();
+    if (!authenticated) {
+        console.error('[Twitter] Cookies expired or invalid. Re-run: flopsy auth twitter');
+        return false;
+    }
+
+    console.error('[Twitter] Authenticated via bird cookies.');
+    return true;
 }
 
 interface TwitterResult {
@@ -579,13 +522,107 @@ server.registerTool(
     },
 );
 
+/**
+ * Classify a Twitter/X URL and dispatch to the right bird command.
+ *
+ * Supported URL shapes:
+ *   https://x.com/<user>/status/<id>     → single tweet (bird read)
+ *   https://twitter.com/<user>/status/<id>
+ *   https://x.com/<user>                 → user profile (bird about)
+ *   https://twitter.com/<user>
+ *   Raw tweet ID (digits only)           → bird read
+ */
+function classifyUrl(raw: string): { kind: 'tweet' | 'profile' | 'unknown'; handle?: string; id?: string } {
+    const trimmed = raw.trim();
+
+    // Raw numeric ID
+    if (/^\d+$/.test(trimmed)) return { kind: 'tweet', id: trimmed };
+
+    let parsed: URL;
+    try {
+        parsed = new URL(trimmed.startsWith('http') ? trimmed : `https://${trimmed}`);
+    } catch {
+        return { kind: 'unknown' };
+    }
+
+    const host = parsed.hostname.replace(/^www\./, '');
+    if (host !== 'x.com' && host !== 'twitter.com') return { kind: 'unknown' };
+
+    // /username/status/id
+    const statusMatch = parsed.pathname.match(/^\/@?([^/]+)\/status\/(\d+)/i);
+    if (statusMatch) return { kind: 'tweet', handle: statusMatch[1], id: statusMatch[2] };
+
+    // /username (profile)
+    const profileMatch = parsed.pathname.match(/^\/@?([^/]+)\/?$/i);
+    if (profileMatch) return { kind: 'profile', handle: profileMatch[1] };
+
+    return { kind: 'unknown' };
+}
+
+server.registerTool(
+    'twitter_extract',
+    {
+        description:
+            'Extract content from any Twitter/X URL — tweet, thread, or profile page. ' +
+            'Pass the full URL (e.g. https://x.com/user/status/123) or a bare tweet ID. ' +
+            'Returns the full tweet text, author, metrics, and for threads all replies in order.',
+        inputSchema: {
+            url: z.string().describe('Twitter/X URL or tweet ID to extract content from'),
+            thread: z
+                .boolean()
+                .optional()
+                .default(false)
+                .describe('Fetch the full thread context instead of just the single tweet'),
+        },
+    },
+    async ({ url, thread }) => {
+        const classified = classifyUrl(url);
+
+        if (classified.kind === 'unknown') {
+            return {
+                content: [{
+                    type: 'text',
+                    text: `Cannot extract: "${url}" is not a recognised Twitter/X URL.\n` +
+                        'Expected: https://x.com/user/status/<id>, https://x.com/<user>, or a tweet ID.',
+                }],
+            };
+        }
+
+        if (classified.kind === 'profile') {
+            const handle = classified.handle!;
+            const result = await runBird(['about', `@${handle}`]);
+            if (!result.success) {
+                return { content: [{ type: 'text', text: `Error fetching profile: ${result.error}` }] };
+            }
+            return { content: [{ type: 'text', text: JSON.stringify(result.data, null, 2) }] };
+        }
+
+        // Tweet — use thread mode or single read
+        const target = classified.id ?? url;
+        if (thread) {
+            const result = await runBird(['thread', target]);
+            if (!result.success) {
+                return { content: [{ type: 'text', text: `Error fetching thread: ${result.error}` }] };
+            }
+            return { content: [{ type: 'text', text: formatTweets(result.data as unknown[]) }] };
+        }
+
+        const result = await runBird(['read', target]);
+        if (!result.success) {
+            return { content: [{ type: 'text', text: `Error: ${result.error}` }] };
+        }
+        return {
+            content: [{ type: 'text', text: formatTweet(result.data as Record<string, unknown>) }],
+        };
+    },
+);
+
 async function main() {
     console.error('[Twitter MCP] Starting server...');
 
-    // Check authentication on startup - opens browser if not authenticated
     const authed = await ensureTwitterAuth();
     if (!authed) {
-        console.error('[Twitter MCP] Warning: Not authenticated. Tools may fail.');
+        console.error('[Twitter MCP] Warning: not authenticated — run `flopsy auth twitter` to fix.');
     }
 
     const transport = new StdioServerTransport();
