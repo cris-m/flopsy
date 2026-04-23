@@ -12,7 +12,26 @@
     "paths": {
       "@/*": ["./*"],
       "@shared": ["./src/shared/src/index.ts"],
-      "@shared/*": ["./src/shared/src/*"]
+      "@shared/*": ["./src/shared/src/*"],
+      "@gateway/*": ["./src/gateway/src/*"],
+      "@gateway/types": ["./src/gateway/src/types/index.ts"],
+      "@gateway/core/*": ["./src/gateway/src/core/*"],
+      "@gateway/channels/*": ["./src/gateway/src/channels/*"],
+      "@core/*": ["./flopsygraph/src/core/*"],
+      "@llm/*": ["./flopsygraph/src/llm/*"],
+      "@agent/*": ["./flopsygraph/src/agent/*"],
+      "@graph/*": ["./flopsygraph/src/graph/*"],
+      "@orchestration/*": ["./flopsygraph/src/orchestration/*"],
+      "@exporters/*": ["./flopsygraph/src/exporters/*"],
+      "@checkpoint/*": ["./flopsygraph/src/checkpoint/*"],
+      "@memory/*": ["./flopsygraph/src/memory/*"],
+      "@mcp/*": ["./flopsygraph/src/mcp/*"],
+      "@embedding/*": ["./flopsygraph/src/embedding/*"],
+      "@prebuilt/*": ["./flopsygraph/src/prebuilt/*"],
+      "@utils/*": ["./flopsygraph/src/utils/*"],
+      "@sandbox/*": ["./flopsygraph/src/sandbox/*"],
+      "@a2a/*": ["./flopsygraph/src/a2a/*"],
+      "@server/*": ["./flopsygraph/src/server/*"]
     }
   }
 }

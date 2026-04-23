@@ -3,11 +3,11 @@ import { StateStore } from './state/store';
 import { PresenceManager } from './state/presence';
 import { QueueManager } from './state/queue';
 import { RetryQueue } from './state/retry-queue';
-import { ChannelRouter } from './delivery/router';
-import { JobExecutor } from './pipeline/executor';
 import { HeartbeatTrigger } from './triggers/heartbeat';
 import { CronTrigger } from './triggers/cron';
 import { WebhookTrigger, type WebhookTriggerConfig } from './triggers/webhook';
+import { ChannelRouter } from './delivery/router';
+import { JobExecutor } from './pipeline/executor';
 import { ChannelHealthMonitor } from './health/monitor';
 import type {
     HeartbeatDefinition,
@@ -193,6 +193,10 @@ export class ProactiveEngine {
     }
     getHeartbeat(): HeartbeatTrigger | null {
         return this.heartbeat;
+    }
+    /** Convenience for /status — millis of the last heartbeat fire, or undefined. */
+    getLastHeartbeatAt(): number | undefined {
+        return this.heartbeat?.getLastFiredAt();
     }
     isRunning(): boolean {
         return this.running;

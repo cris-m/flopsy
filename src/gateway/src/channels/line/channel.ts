@@ -4,11 +4,14 @@ import type {
     OutboundMessage,
     ReactionOptions,
     Message,
+    Media,
     WebhookChannel,
 } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
 import { isSafeMediaUrl, verifyWebhookSignature } from '@gateway/core/security';
 import type { LineChannelConfig } from './types';
+
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 
 export class LineChannel extends BaseChannel implements WebhookChannel {
     readonly name = 'line';
@@ -16,6 +19,7 @@ export class LineChannel extends BaseChannel implements WebhookChannel {
     readonly webhookPath: string;
 
     private client: import('@line/bot-sdk').messagingApi.MessagingApiClient | null = null;
+    private blobClient: import('@line/bot-sdk').messagingApi.MessagingApiBlobClient | null = null;
     private readonly channelConfig: LineChannelConfig;
 
     constructor(config: LineChannelConfig) {
@@ -47,6 +51,9 @@ export class LineChannel extends BaseChannel implements WebhookChannel {
             this.client = new line.messagingApi.MessagingApiClient({
                 channelAccessToken: this.channelConfig.channelAccessToken,
             });
+            this.blobClient = new line.messagingApi.MessagingApiBlobClient({
+                channelAccessToken: this.channelConfig.channelAccessToken,
+            });
 
             await this.client.getBotInfo();
             this.setStatus('connected');
@@ -59,6 +66,7 @@ export class LineChannel extends BaseChannel implements WebhookChannel {
 
     async disconnect(): Promise<void> {
         this.client = null;
+        this.blobClient = null;
         this.setStatus('disconnected');
     }
 
@@ -119,11 +127,23 @@ export class LineChannel extends BaseChannel implements WebhookChannel {
     async handleWebhookEvent(event: {
         type: string;
         source?: { userId?: string; groupId?: string; type?: string };
-        message?: { id?: string; text?: string; type?: string };
+        message?: {
+            id?: string;
+            text?: string;
+            type?: string;
+            latitude?: number;
+            longitude?: number;
+            title?: string;
+            address?: string;
+        };
         timestamp?: number;
         replyToken?: string;
     }): Promise<void> {
-        if (event.type !== 'message' || event.message?.type !== 'text') return;
+        if (event.type !== 'message') return;
+
+        const msgType = event.message?.type;
+        const allowedTypes = ['text', 'image', 'video', 'sticker', 'location', 'file'];
+        if (!msgType || !allowedTypes.includes(msgType)) return;
 
         const source = event.source;
         if (!source) return;
@@ -135,15 +155,57 @@ export class LineChannel extends BaseChannel implements WebhookChannel {
 
         if (!this.isAllowed(isGroup ? peerId : senderId, peerType)) return;
 
+        const m = event.message!;
+        let body = m.text ?? '';
+        let synthetic = false;
+        const media: Media[] = [];
+
+        if (msgType === 'location') {
+            body = `[Location: lat=${m.latitude}, lon=${m.longitude}${m.title ? `, "${m.title}"` : ''}${m.address ? `, ${m.address}` : ''}]`;
+        }
+
+        if (msgType === 'image' && m.id && this.blobClient) {
+            try {
+                const stream = await this.blobClient.getMessageContent(m.id);
+                const chunks: Buffer[] = [];
+                for await (const chunk of stream as AsyncIterable<Buffer>) {
+                    chunks.push(chunk);
+                }
+                const buffer = Buffer.concat(chunks);
+                if (buffer.length <= MAX_IMAGE_BYTES) {
+                    media.push({ type: 'image', data: buffer.toString('base64'), mimeType: 'image/jpeg' });
+                } else {
+                    media.push({ type: 'image' });
+                }
+            } catch {
+                media.push({ type: 'image' });
+            }
+            if (!body) { body = '[Image]'; synthetic = true; }
+        }
+
+        if (msgType === 'video') {
+            media.push({ type: 'video' });
+            if (!body) { body = '[Video]'; synthetic = true; }
+        }
+
+        if (msgType === 'sticker') {
+            media.push({ type: 'sticker' });
+            if (!body) { body = '[Sticker]'; synthetic = true; }
+        }
+
+        if (!body && media.length === 0) return;
+
         const normalized: Message = {
-            id: event.message?.id ?? '',
+            id: m.id ?? '',
             channelName: this.name,
             peer: { id: peerId, type: peerType },
             sender: { id: senderId },
-            body: event.message?.text ?? '',
+            body,
+            synthetic: synthetic || undefined,
             timestamp: event.timestamp
                 ? new Date(event.timestamp).toISOString()
                 : new Date().toISOString(),
+            media: media.length > 0 ? media : undefined,
         };
 
         await this.emit('onMessage', normalized);

@@ -18,4 +18,50 @@ export type {
     JobDefinitionConfig,
     DeliveryTargetConfig,
     HealthMonitorConfig,
+    AgentDefinition,
+    ModelConfig,
+    ModelRef,
+    ModelRouting,
+    ModelSource,
 } from '../config/schema';
+
+// Harness types (learning system)
+export type {
+    Signal,
+    SignalType,
+    SignalCategory,
+    Strategy,
+    Lesson,
+    Skill,
+    SkillStep,
+    HarnessContext,
+    AgentResponse,
+    UserFeedback,
+    DetectedSignals,
+} from './harness';
+
+// Proactive types (scheduling, triggers, execution, state)
+export type {
+    Peer,
+    CronSchedule,
+    DeliveryMode,
+    DeliveryTarget,
+    TriggerKind,
+    HeartbeatDefinition,
+    CronPayload,
+    JobDefinition,
+    ExecutionJob,
+    ExecutionResult,
+    JobExecutor,
+    PresenceManager,
+    ActivityWindow,
+    ExplicitStatus,
+    UserPresence,
+    JobState,
+    ReportedItemType,
+    QueuedItem,
+    RetryTaskType,
+    RetryTask,
+    ProactiveState,
+} from './proactive';
+export { BACKOFF_SCHEDULE_MS, RETRY_BACKOFF_MS, RETRY_MAX_ATTEMPTS } from './proactive';

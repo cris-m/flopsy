@@ -1,9 +1,13 @@
+import type { Media } from '@gateway/types';
+
 const DEFAULT_COALESCE_DELAY_MS = 300;
 const MAX_QUEUED_MESSAGES = 500;
 
 export interface QueuedMessage {
     readonly text: string;
     readonly enqueuedAt: number;
+    readonly media?: ReadonlyArray<Media>;
+    readonly synthetic?: boolean;
 }
 
 export class MessageQueue {
@@ -20,12 +24,12 @@ export class MessageQueue {
         return this.buffer.length;
     }
 
-    enqueue(text: string): void {
+    enqueue(text: string, media?: ReadonlyArray<Media>, synthetic?: boolean): void {
         if (this.buffer.length >= MAX_QUEUED_MESSAGES) {
             this.buffer.shift();
         }
 
-        this.buffer.push({ text, enqueuedAt: Date.now() });
+        this.buffer.push({ text, enqueuedAt: Date.now(), media, synthetic });
 
         if (this.waiter) {
             if (this.coalesceTimer) {
@@ -82,8 +86,32 @@ export class MessageQueue {
     }
 }
 
-export function coalesce(batch: readonly QueuedMessage[]): string {
-    if (batch.length === 0) return '';
-    if (batch.length === 1) return batch[0].text;
-    return batch.map((msg, i) => `[${i + 1}] ${msg.text}`).join('\n');
+export interface CoalescedTurn {
+    readonly text: string;
+    readonly media: ReadonlyArray<Media>;
+}
+
+export function coalesce(batch: readonly QueuedMessage[]): CoalescedTurn {
+    if (batch.length === 0) return { text: '', media: [] };
+
+    const allMedia: Media[] = batch.flatMap((m) => (m.media ? [...m.media] : []));
+
+    // Prefer messages with real user text over channel-generated placeholders.
+    // When a photo arrives without a caption, the adapter marks it synthetic=true
+    // and sets body="[Image]". If the user then sends the caption as a follow-up
+    // message, the coalesce window captures both — we keep only the caption.
+    const realItems = batch.filter((m) => !m.synthetic);
+
+    let text: string;
+    if (realItems.length === 1) {
+        text = realItems[0].text;
+    } else if (realItems.length > 1) {
+        text = realItems.map((m, i) => `[${i + 1}] ${m.text}`).join('\n');
+    } else {
+        // All items are synthetic (e.g. photo with no caption, or 3 images).
+        // The LLM will see the image blocks; a single label is sufficient.
+        text = batch[0].text;
+    }
+
+    return { text, media: allMedia };
 }

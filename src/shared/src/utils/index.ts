@@ -5,6 +5,7 @@ export {
     ensureDir,
     createWorkspace,
     workspace,
+    primeFlopsyHome,
     type WorkspacePathResolver,
 } from './workspace';
 export { installWarningFilter, shouldIgnoreWarning } from './warning-filter';

@@ -1,0 +1,8 @@
+{
+  "name": "@flopsy/skills",
+  "version": "1.0.0",
+  "description": "FlopsyBot skill library — SKILL.md templates loaded by the team at runtime",
+  "private": true,
+  "type": "module",
+  "main": "./index.js"
+}

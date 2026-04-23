@@ -1,8 +1,10 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import type { Peer, OutboundMessage, ReactionOptions, Message } from '@gateway/types';
+import type { Peer, OutboundMessage, ReactionOptions, Message, Media } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
 import type { IMessageChannelConfig } from './types';
+
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 
 const execFileAsync = promisify(execFile);
 const POLL_INTERVAL_MS = 3_000;
@@ -116,20 +118,44 @@ export class IMessageChannel extends BaseChannel {
             const senderId = msg.sender ?? '';
             if (!this.isAllowed(senderId, 'user')) continue;
 
-            const media = msg.attachments?.map((a) => ({
-                type: 'document' as const,
-                url: a.path,
-                mimeType: a.mime_type,
-            }));
+            const media: Media[] = [];
+            for (const a of msg.attachments ?? []) {
+                const mimeType = a.mime_type ?? '';
+                if (mimeType.startsWith('image/') && a.path) {
+                    try {
+                        const { readFile } = await import('fs/promises');
+                        const buffer = await readFile(a.path);
+                        if (buffer.length <= MAX_IMAGE_BYTES) {
+                            media.push({ type: 'image', data: buffer.toString('base64'), mimeType });
+                        } else {
+                            media.push({ type: 'image', url: a.path, mimeType });
+                        }
+                    } catch {
+                        media.push({ type: 'image', url: a.path, mimeType });
+                    }
+                } else if (mimeType.startsWith('video/')) {
+                    media.push({ type: 'video', url: a.path, mimeType });
+                } else {
+                    media.push({ type: 'document', url: a.path, mimeType: mimeType || undefined });
+                }
+            }
+
+            let body = msg.text ?? '';
+            let synthetic = false;
+            if (!body && media.length > 0) {
+                body = media[0]!.type === 'image' ? '[Image]' : '[File]';
+                synthetic = true;
+            }
 
             const normalized: Message = {
                 id: msg.id ?? `imsg-${Date.now()}`,
                 channelName: this.name,
                 peer: { id: msg.chat_id ?? senderId, type: 'user' },
                 sender: { id: senderId },
-                body: msg.text ?? '',
+                body,
+                synthetic: synthetic || undefined,
                 timestamp: msg.date ?? new Date().toISOString(),
-                ...(media?.length && { media }),
+                media: media.length > 0 ? media : undefined,
             };
 
             this.lastTimestamp = normalized.timestamp;

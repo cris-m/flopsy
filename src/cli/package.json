@@ -1,16 +1,31 @@
 {
   "name": "@flopsy/cli",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.ts",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+  "description": "FlopsyBot CLI — auth, MCP, admin",
+  "main": "./src/package-exports.ts",
+  "types": "./src/package-exports.ts",
+  "type": "module",
+  "bin": {
+    "flopsy": "./src/index.ts"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@flopsy/shared": "*",
+    "@inquirer/prompts": "^7.10.1",
+    "chalk": "^5.6.2",
+    "cli-boxes": "^3.0.0",
+    "commander": "^12.1.0",
+    "dotenv": "^16.4.5",
+    "json5": "^2.2.3",
+    "log-symbols": "^7.0.1",
+    "strip-ansi": "^7.2.0",
+    "supports-hyperlinks": "^3.2.0"
+  },
   "devDependencies": {
-    "typescript": "^5.9.3"
+    "@types/node": "^25.5.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
   }
 }

@@ -4,13 +4,17 @@
   "description": "",
   "main": "index.ts",
   "scripts": {
-    "gateway": "npm run start --workspace=src/gateway",
-    "build": "tsc --build",
+    "start": "npm run start --workspace=src/app",
+    "dev": "npm run dev --workspace=src/app",
+    "stop": "lsof -ti :18789 | xargs -r kill -9 2>/dev/null; pkill -9 -f 'tsx src/main.ts' 2>/dev/null; pkill -9 -f 'preflight.cjs' 2>/dev/null; pkill -9 -f 'src/main\\.ts' 2>/dev/null; true",
+    "restart": "npm run stop && sleep 1 && npm start",
+    "build": "tsc --build src/app",
     "build:clean": "tsc --build --clean",
     "format": "prettier --write \"src/**/*.ts\"",
     "format:check": "prettier --check \"src/**/*.ts\"",
     "lint": "prettier --check \"src/**/*.ts\"",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "npm run test --workspace=src/team",
+    "flopsy": "tsx src/cli/src/index.ts"
   },
   "keywords": [],
   "author": "",
@@ -18,7 +22,8 @@
   "type": "module",
   "workspaces": [
     "src/*",
-    "flopsygraph"
+    "flopsygraph",
+    "flopsy-server"
   ],
   "devDependencies": {
     "prettier": "^3.8.1",

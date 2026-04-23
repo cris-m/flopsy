@@ -1,5 +1,55 @@
 import { z } from 'zod';
 
+// ============================================================================
+// MODEL CONFIGURATION (Simple provider:name references with per-model config)
+// ============================================================================
+
+const modelConfigSchema = z
+    .object({
+        temperature: z.number().min(0).max(2).optional(),
+        maxTokens: z.number().int().min(100).optional(),
+        topP: z.number().min(0).max(1).optional(),
+        topK: z.number().int().optional(),
+        frequencyPenalty: z.number().min(-2).max(2).optional(),
+        presencePenalty: z.number().min(-2).max(2).optional(),
+        seed: z.number().int().optional(),
+        reasoning: z.boolean().optional(),
+        baseUrl: z.string().url().optional(),
+        stopSequences: z.array(z.string()).optional(),
+    })
+    .strict()
+    .optional();
+
+const modelRefSchema = z.object({
+    provider: z.string().min(1),
+    name: z.string().min(1),
+    config: modelConfigSchema,
+});
+
+const modelRoutingSchema = z
+    .object({
+        enabled: z.boolean().default(true),
+        tiers: z.object({
+            fast: modelRefSchema,
+            balanced: modelRefSchema,
+            powerful: modelRefSchema,
+        }),
+    })
+    .optional();
+
+const modelSourceSchema = z.object({
+    name: z.string().min(1),
+    model: modelRefSchema,
+    fallback_models: z.array(modelRefSchema).default([]),
+    routing: modelRoutingSchema,
+});
+
+const modelsConfigSchema = z.object({}).default({});
+
+// ============================================================================
+// CHANNELS & GATEWAY (existing)
+// ============================================================================
+
 const dmPolicySchema = z.enum(['pairing', 'allowlist', 'open', 'disabled']);
 const groupPolicySchema = z.enum(['allowlist', 'open', 'disabled']);
 const groupActivationSchema = z.enum(['mention', 'always']);
@@ -179,6 +229,19 @@ const gatewaySchema = z.object({
             maxEntries: z.number().default(10_000),
         })
         .default({}),
+    /**
+     * Management HTTP endpoint for CLI live-queries (e.g. `flopsy mgmt status`).
+     * Listens on 127.0.0.1 only. Auth via env `FLOPSY_MGMT_TOKEN` (optional —
+     * when unset, any localhost caller is trusted since the socket isn't
+     * reachable off-box anyway). Defaults to port = gateway.port + 1.
+     */
+    mgmt: z
+        .object({
+            enabled: z.boolean().default(true),
+            host: z.string().default('127.0.0.1'),
+            port: z.number().int().min(1).max(65535).optional(),
+        })
+        .default({}),
 });
 
 const loggingSchema = z.object({
@@ -305,6 +368,151 @@ const workspaceSchema = z
     })
     .default({});
 
+// Human-in-the-loop approval — thin wrapper over flopsygraph's humanApproval()
+// interceptor. When a gated tool is called, the graph pauses via GraphInterrupt
+// and the gateway renders a review prompt on the active channel.
+const approvalsSchema = z.object({
+    // Which tools require approval. Accepts a string[] of tool names or 'all'.
+    tools: z.union([z.array(z.string()), z.literal('all')]),
+    // Which review actions the user can choose from. Default: all four.
+    actions: z
+        .array(z.enum(['approve', 'skip', 'revise', 'feedback']))
+        .optional(),
+});
+
+const agentDefinitionSchema = z.object({
+    name: z.string().min(1),
+    enabled: z.boolean().default(true),
+    // Only 'main' is load-bearing (team bootstrap looks for it); all
+    // other values are informational labels for specialist workers
+    // (e.g. 'security', 'media'). Keep 'main' strict, accept any string
+    // otherwise so new worker archetypes don't force schema edits.
+    type: z.string().default('main'),
+    domain: z.string().optional(),
+    config: z.record(z.unknown()).optional(),
+
+    // Model: "provider:name" format (e.g., "anthropic:claude-3-5-sonnet")
+    model: z.string().optional(),
+    // Per-model config overrides (temperature, maxTokens, etc.)
+    model_config: modelConfigSchema,
+    // Fallback models in priority order
+    fallback_models: z.array(modelRefSchema).default([]),
+    // Cost tier for model selection: low=faster/cheaper, high=more capable
+    cost_tier: z.enum(['low', 'medium', 'high']).default('medium'),
+    // Tier-routed model aliases (fast / balanced / powerful) — the LLM can
+    // request a specific tier for a sub-task; absent tier → fall through to
+    // `model` as the default.
+    routing: modelRoutingSchema,
+
+    // Named toolset bundles the agent subscribes to. Resolved at runtime via
+    // the TOOLSETS registry (src/agent/src/tools/index.ts). Unknown names fail
+    // loud at startup.
+    toolsets: z.array(z.string()).default([]),
+
+    // Optional path (relative to FLOPSY_HOME) to a markdown prompt file that
+    // overrides the default built-in prompt for this agent's `type`.
+    promptPath: z.string().optional(),
+
+    // Human-in-the-loop tool approval. Absent → tools run unattended.
+    approvals: approvalsSchema.optional(),
+
+    // Role in the fellowship.
+    //   'main'   — the gateway entry point (exactly one per config). Gets
+    //              send_message + spawn_background_task + delegate_task
+    //              auto-injected on top of `toolsets`.
+    //   'worker' — a named teammate the main agent can delegate to. Runs
+    //              ephemeral per sub-task; does not talk to the user directly
+    //              and does not get delegation tools (max depth = 1).
+    // Defaults from `type`: type='main' → role='main', otherwise 'worker'.
+    role: z.enum(['main', 'worker']).optional(),
+
+    // Which teammate names the main agent is allowed to delegate to. Ignored
+    // when role !== 'main'. Each entry must match another agent's `name`.
+    // Defaults to every enabled non-main agent at bootstrap.
+    workers: z.array(z.string()).optional(),
+
+    // Per-agent MCP server allow-list. When set, ONLY these MCP servers'
+    // tools are attached to this agent — overrides the server-side
+    // `assignTo` field. When unset (default), the agent receives every
+    // MCP server whose `assignTo` includes this agent's name OR "*".
+    mcpServers: z.array(z.string()).optional(),
+
+    // Which flopsygraph graph type to build for this agent.
+    //   'react'          — default; standard ReactAgent with tools + system prompt.
+    //                      Use for main agents and most workers.
+    //   'deep-research'  — multi-round search/summarise/reflect pipeline
+    //                      (createDeepResearcher). Good for deep-research workers.
+    //                      Does NOT support arbitrary tools or our harness/role
+    //                      interceptors — its workflow is hardcoded.
+    graph: z.enum(['react', 'deep-research']).default('react'),
+});
+
+/**
+ * Semantic memory store configuration. Backs the `manage_memory` +
+ * `search_memory` tools flopsygraph auto-wires into every ReactAgent.
+ *
+ * When `embedder` is set, an Ollama-backed embedder is wired so
+ * `search_memory` does cosine similarity; without it the store falls back
+ * to keyed listing. `enabled: false` disables the memory tools entirely.
+ */
+const memorySchema = z.object({
+    enabled: z.boolean().default(true),
+    embedder: z
+        .object({
+            provider: z.enum(['ollama']).default('ollama'),
+            model: z.string().default('nomic-embed-text:v1.5'),
+            baseUrl: z.string().url().optional(),
+        })
+        .optional(),
+});
+
+/**
+ * MCP (Model Context Protocol) server registry. Each entry describes a
+ * child-process tool server (stdio) or remote HTTP endpoint that
+ * flopsygraph-wired agents can call at runtime.
+ *
+ * Design choices:
+ *   - `requires` gates servers on env-var presence so credentials missing
+ *     → server silently disabled with a log, not a crash
+ *   - `requiresAuth` points at Layer-1 auth providers (e.g. "google") —
+ *     the loader pulls a fresh access_token via getValidAccessToken() and
+ *     injects it as FLOPSY_<PROVIDER>_ACCESS_TOKEN before spawning
+ *   - `platform` gates OS-specific servers (apple-notes, spotify-darwin)
+ *   - `assignTo` routes each server's tool bundle to specific team
+ *     members (["gandalf"], ["saruman"], or ["*"] for everyone)
+ *   - `env` values support `${VAR}` and `${VAR:-default}` expansion at
+ *     spawn time, not parse time, so FLOPSY_HOME / runtime vars land
+ */
+const mcpServerSchema = z.object({
+    enabled: z.boolean().default(true),
+    transport: z.enum(['stdio', 'http', 'sse']).default('stdio'),
+    // stdio transport
+    command: z.string().optional(),
+    args: z.array(z.string()).default([]),
+    // http / sse transport
+    url: z.string().url().optional(),
+    headers: z.record(z.string()).optional(),
+    // shared
+    env: z.record(z.string()).default({}),
+    requires: z.array(z.string()).default([]),
+    requiresAuth: z.array(z.string()).default([]),
+    platform: z.enum(['darwin', 'linux', 'win32']).optional(),
+    assignTo: z.array(z.string()).default([]),
+    description: z.string().optional(),
+    // Full OAuth redirect URI for provider auth flows that need a
+    // dashboard-registered URI (e.g. Spotify). Must match exactly what
+    // you register in the provider's developer dashboard. The CLI's
+    // auth provider parses host+port+path from this one field to bind
+    // the local callback listener. Only consulted by `flopsy auth
+    // <provider>` — the MCP server itself never reads it.
+    redirectBase: z.string().url().optional(),
+});
+
+const mcpSchema = z.object({
+    enabled: z.boolean().default(true),
+    servers: z.record(mcpServerSchema).default({}),
+});
+
 export const flopsyConfigSchema = z
     .object({
         workspace: workspaceSchema,
@@ -313,6 +521,10 @@ export const flopsyConfigSchema = z
         webhook: webhookSchema,
         proactive: proactiveSchema,
         logging: loggingSchema.default({}),
+        models: modelsConfigSchema.default({}),
+        agents: z.array(agentDefinitionSchema).default([]),
+        memory: memorySchema.default({}),
+        mcp: mcpSchema.default({}),
         timezone: z.string().default('UTC'),
     })
     .strict();
@@ -336,3 +548,13 @@ export type HeartbeatDefinitionConfig = z.infer<typeof heartbeatDefinitionSchema
 export type JobDefinitionConfig = z.infer<typeof jobDefinitionSchema>;
 export type DeliveryTargetConfig = z.infer<typeof deliveryTargetSchema>;
 export type HealthMonitorConfig = z.infer<typeof healthMonitorSchema>;
+export type AgentDefinition = z.infer<typeof agentDefinitionSchema>;
+export type ApprovalsConfig = z.infer<typeof approvalsSchema>;
+export type ModelConfig = z.infer<typeof modelConfigSchema>;
+export type ModelRef = z.infer<typeof modelRefSchema>;
+export type ModelRouting = z.infer<typeof modelRoutingSchema>;
+export type ModelSource = z.infer<typeof modelSourceSchema>;
+export type ModelsConfig = z.infer<typeof modelsConfigSchema>;
+export type MemoryConfig = z.infer<typeof memorySchema>;
+export type McpConfig = z.infer<typeof mcpSchema>;
+export type McpServerConfig = z.infer<typeof mcpServerSchema>;

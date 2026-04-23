@@ -1,9 +1,11 @@
 import type { WASocket, ConnectionState, AnyMessageContent } from '@whiskeysockets/baileys';
 import type { Boom } from '@hapi/boom';
-import type { Peer, OutboundMessage, ReactionOptions, Message } from '@gateway/types';
+import type { Peer, OutboundMessage, ReactionOptions, Message, Media } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
 import { isSafeMediaUrl } from '@gateway/core/security';
 import type { WhatsAppChannelConfig } from './types';
+
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 
 export class WhatsAppChannel extends BaseChannel {
     readonly name = 'whatsapp';
@@ -79,11 +81,57 @@ export class WhatsAppChannel extends BaseChannel {
 
                         if (!this.isAllowed(senderId, peerType)) continue;
 
-                        const body =
-                            msg.message.conversation ??
-                            msg.message.extendedTextMessage?.text ??
-                            msg.message.imageMessage?.caption ??
+                        const m = msg.message;
+                        let body =
+                            m.conversation ??
+                            m.extendedTextMessage?.text ??
+                            m.imageMessage?.caption ??
                             '';
+
+                        const media: Media[] = [];
+                        let synthetic = false;
+
+                        // Location
+                        if (m.locationMessage) {
+                            const loc = m.locationMessage;
+                            const name = (loc as { name?: string }).name;
+                            body = `[Location: lat=${loc.degreesLatitude}, lon=${loc.degreesLongitude}${name ? `, "${name}"` : ''}]${body ? ' ' + body : ''}`;
+                        }
+
+                        // Image
+                        if (m.imageMessage) {
+                            try {
+                                const { downloadMediaMessage } = await import('@whiskeysockets/baileys');
+                                const buffer = await downloadMediaMessage(msg, 'buffer', {});
+                                if (buffer instanceof Buffer && buffer.length <= MAX_IMAGE_BYTES) {
+                                    media.push({
+                                        type: 'image',
+                                        data: buffer.toString('base64'),
+                                        mimeType: m.imageMessage.mimetype ?? 'image/jpeg',
+                                    });
+                                } else {
+                                    media.push({ type: 'image', mimeType: m.imageMessage.mimetype ?? 'image/jpeg' });
+                                }
+                            } catch {
+                                media.push({ type: 'image', mimeType: m.imageMessage.mimetype ?? 'image/jpeg' });
+                            }
+                            if (!body) { body = '[Image]'; synthetic = true; }
+                        }
+
+                        // Document
+                        if (m.documentMessage) {
+                            const doc = m.documentMessage;
+                            media.push({ type: 'document', fileName: doc.fileName ?? undefined, mimeType: doc.mimetype ?? undefined });
+                            if (!body) { body = `[Document: ${doc.fileName ?? doc.mimetype ?? 'file'}]`; synthetic = true; }
+                        }
+
+                        // Video
+                        if (m.videoMessage) {
+                            media.push({ type: 'video', mimeType: m.videoMessage.mimetype ?? undefined });
+                            if (!body) { body = '[Video]'; synthetic = true; }
+                        }
+
+                        if (!body && media.length === 0) continue;
 
                         await this.emit('onMessage', {
                             id: msg.key.id ?? '',
@@ -91,9 +139,11 @@ export class WhatsAppChannel extends BaseChannel {
                             peer: { id: senderId, type: peerType },
                             sender: msg.key.participant ? { id: msg.key.participant } : undefined,
                             body,
+                            synthetic: synthetic || undefined,
                             timestamp: new Date(
                                 (msg.messageTimestamp as number) * 1000,
                             ).toISOString(),
+                            media: media.length > 0 ? media : undefined,
                         });
                     } catch (err) {
                         this.emitError(toError(err));
@@ -111,7 +161,14 @@ export class WhatsAppChannel extends BaseChannel {
     async clearSession(): Promise<void> {
         if (!this.channelConfig.sessionPath) return;
         const { rm } = await import('fs/promises');
-        await rm(this.channelConfig.sessionPath, { recursive: true, force: true }).catch(() => {});
+        await rm(this.channelConfig.sessionPath, { recursive: true, force: true }).catch(
+            (err: unknown) => {
+                this.log.warn(
+                    { err, path: this.channelConfig.sessionPath, op: 'clearSession' },
+                    'whatsapp session cleanup failed — next reconnect may inherit stale auth',
+                );
+            },
+        );
     }
 
     async disconnect(): Promise<void> {

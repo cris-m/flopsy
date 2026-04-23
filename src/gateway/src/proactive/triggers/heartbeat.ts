@@ -14,11 +14,18 @@ interface HeartbeatEntry {
 export class HeartbeatTrigger {
     private entries: Map<string, HeartbeatEntry> = new Map();
     private running = false;
+    /** Wall-clock ms of the most recent fire() call. Surfaced by /status. */
+    private lastFiredAt: number | null = null;
 
     constructor(
         private readonly executor: JobExecutor,
         private readonly presence: PresenceManager,
     ) {}
+
+    /** For /status — returns undefined when no heartbeat has fired yet. */
+    getLastFiredAt(): number | undefined {
+        return this.lastFiredAt ?? undefined;
+    }
 
     async start(heartbeats: HeartbeatDefinition[], defaultDelivery: DeliveryTarget): Promise<void> {
         if (this.running) return;
@@ -88,6 +95,10 @@ export class HeartbeatTrigger {
                 return;
             }
         }
+
+        // Stamp BEFORE executor.execute so an in-flight heartbeat is still
+        // visible as "just fired" in /status even while its job runs.
+        this.lastFiredAt = Date.now();
 
         const job: ExecutionJob = {
             id: `heartbeat-${hb.name}`,

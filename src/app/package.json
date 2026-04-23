@@ -1,0 +1,27 @@
+{
+  "name": "@flopsy/app",
+  "version": "1.0.0",
+  "description": "FlopsyBot process entry — the only executable package. Loads env/config, wires gateway + team, handles signals.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "dev": "tsx watch src/main.ts"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@flopsy/gateway": "*",
+    "@flopsy/shared": "*",
+    "@flopsy/team": "*",
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.213.0",
+    "@opentelemetry/resources": "^2.6.0",
+    "@opentelemetry/sdk-node": "^0.213.0",
+    "@opentelemetry/sdk-trace-base": "^2.6.0",
+    "@opentelemetry/semantic-conventions": "^1.40.0",
+    "dotenv": "^16.4.5",
+    "flopsygraph": "*"
+  }
+}

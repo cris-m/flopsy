@@ -1,84 +1,39 @@
-import type { Peer } from '@gateway/types';
+// Re-export shared proactive types that this file doesn't redefine locally.
+// (JobState, UserPresence, ActivityWindow, ExplicitStatus, ReportedItemType,
+// QueuedItem, RetryTaskType, RetryTask, ProactiveState, BACKOFF_SCHEDULE_MS,
+// RETRY_BACKOFF_MS, RETRY_MAX_ATTEMPTS are all defined below, so we only
+// import the remaining types for use here.)
+import type {
+    Peer,
+    CronSchedule,
+    DeliveryMode,
+    DeliveryTarget,
+    TriggerKind,
+    HeartbeatDefinition,
+    CronPayload,
+    JobDefinition,
+    ExecutionJob,
+    ExecutionResult,
+} from '@shared/types';
 
-// ── Schedule ────────────────────────────────────────────────────
+export type {
+    CronSchedule,
+    DeliveryMode,
+    DeliveryTarget,
+    TriggerKind,
+    HeartbeatDefinition,
+    CronPayload,
+    JobDefinition,
+    ExecutionJob,
+    ExecutionResult,
+};
 
-export type CronSchedule =
-    | { kind: 'at'; atMs: number }
-    | { kind: 'every'; everyMs: number; anchorMs?: number }
-    | { kind: 'cron'; expr: string; tz?: string };
-
-// ── Delivery ────────────────────────────────────────────────────
-
-export type DeliveryMode = 'always' | 'conditional' | 'silent';
-
-export interface DeliveryTarget {
-    channelName: string;
-    peer: Peer;
-    fallbacks?: Array<{
-        channelName: string;
-        peer: Peer;
-    }>;
-}
+// ── Gateway-specific response handling ────────────────────────────────
 
 export interface ConditionalResponse {
     status: 'promote' | 'suppress';
     reason: string;
     content?: string;
-}
-
-// ── Triggers ────────────────────────────────────────────────────
-
-export type TriggerKind = 'heartbeat' | 'cron' | 'webhook';
-
-export interface HeartbeatDefinition {
-    name: string;
-    enabled: boolean;
-    interval: string;
-    prompt: string;
-    deliveryMode: DeliveryMode;
-    activeHours?: { start: number; end: number; timezone?: string };
-    oneshot?: boolean;
-    delivery?: DeliveryTarget;
-}
-
-export interface CronPayload {
-    message?: string;
-    promptFile?: string;
-    delivery?: DeliveryTarget;
-    threadId?: string;
-    deliveryMode?: DeliveryMode;
-}
-
-export interface JobDefinition {
-    id: string;
-    name: string;
-    description?: string;
-    enabled: boolean;
-    schedule: CronSchedule;
-    payload: CronPayload;
-    requires?: string[];
-    createdAt?: number;
-    updatedAt?: number;
-}
-
-// ── Execution ───────────────────────────────────────────────────
-
-export interface ExecutionJob {
-    id: string;
-    name: string;
-    trigger: TriggerKind;
-    prompt: string;
-    delivery: DeliveryTarget;
-    deliveryMode: DeliveryMode;
-    context?: Record<string, unknown>;
-    threadId?: string;
-}
-
-export interface ExecutionResult {
-    action: 'delivered' | 'suppressed' | 'queued' | 'error';
-    response?: string;
-    error?: string;
-    durationMs: number;
 }
 
 // ── Job State ───────────────────────────────────────────────────
