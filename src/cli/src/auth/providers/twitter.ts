@@ -16,6 +16,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { saveCredential } from '../credential-store';
+import { openInBrowser } from '../browser';
 import type { AuthProvider, AuthorizeOptions, StoredCredential } from '../types';
 
 const execFileAsync = promisify(execFile);
@@ -95,12 +96,13 @@ export const twitterProvider: AuthProvider = {
             return cred;
         }
 
-        // 3. Not authenticated — guide the user without opening a browser.
+        // 3. Not authenticated — open the login page and poll.
+        const loginUrl = 'https://x.com/login';
         console.log('\n  Twitter/X Authentication');
         console.log('  ────────────────────────────────────────────');
-        console.log('  Bird uses cookies from your system browser.');
-        console.log('  Open x.com in your browser and log in, then');
-        console.log('  come back here — Flopsy will detect it automatically.\n');
+        console.log(`  Opening: ${loginUrl}`);
+        console.log('  Log in to X/Twitter, then come back here.\n');
+        openInBrowser(loginUrl);
         console.log('  Waiting up to 3 minutes...\n');
 
         const ok = await pollUntilAuthenticated();
