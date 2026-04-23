@@ -20,4 +20,13 @@ export type {
     JobDefinitionConfig,
     DeliveryTargetConfig,
     HealthMonitorConfig,
+    AgentDefinition,
+    ModelConfig,
+    ModelRef,
+    ModelRouting,
+    ModelSource,
+    ModelsConfig,
+    MemoryConfig,
+    McpConfig,
+    McpServerConfig,
 } from './schema';

@@ -1,3 +1,4 @@
+import { createLogger } from '@flopsy/shared';
 import type {
     Channel,
     ChannelStatus,
@@ -28,6 +29,22 @@ export abstract class BaseChannel implements Channel {
 
     protected reconnectAttempts = 0;
     protected reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+    /**
+     * Shared per-channel logger, scoped by the subclass's `this.name`
+     * (e.g. `{ name: 'telegram', ... }` tags every line). Exposed via a
+     * lazy getter because subclass `readonly name = '…'` field
+     * initialisers run AFTER `super()` returns — accessing `this.name`
+     * inside the base constructor would yield `undefined`. The getter
+     * defers `createLogger` until first use, when subclass initialisers
+     * have completed. Every channel gets `this.log.info/warn/error` for
+     * free without declaring a module-level logger per file.
+     */
+    private _log?: ReturnType<typeof createLogger>;
+    protected get log(): ReturnType<typeof createLogger> {
+        if (!this._log) this._log = createLogger(this.name || 'channel');
+        return this._log;
+    }
 
     private _status: ChannelStatus = 'disconnected';
     private _config: BaseChannelConfig;

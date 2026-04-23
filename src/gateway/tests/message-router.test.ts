@@ -30,12 +30,12 @@ function createMockHandler(): AgentHandler {
     };
 }
 
-function createMessage(channelName: string): Message {
+function createMessage(channelName: string, peerId = 'user-1'): Message {
     return {
-        id: `msg-${Date.now()}`,
+        id: `msg-${Date.now()}-${peerId}`,
         channelName,
-        peer: { id: 'user-1', type: 'user' },
-        sender: { id: 'user-1', name: 'User' },
+        peer: { id: peerId, type: 'user' },
+        sender: { id: peerId, name: `User ${peerId}` },
         body: 'test message',
         timestamp: new Date().toISOString(),
     };
@@ -87,34 +87,39 @@ describe('MessageRouter', () => {
         expect(router.getWorker('telegram')).toBeDefined();
     });
 
-    it('should register and start workers for channels', () => {
+    it('registerChannel does not eagerly create a worker (lazy per message)', () => {
         const handler = createMockHandler();
         router = new MessageRouter({ agentHandler: handler });
 
         const channel = createMockChannel('whatsapp');
         router.registerChannel(channel);
 
-        expect(router.getWorker('whatsapp')).toBeDefined();
+        // Under the per-routing-key model, workers materialise on first
+        // message — a bare registerChannel does NOT create one.
+        expect(router.getWorker('whatsapp')).toBeUndefined();
     });
 
-    it('should unregister channel worker', async () => {
+    it('unregisterChannel stops every worker belonging to that channel', async () => {
         const handler = createMockHandler();
         router = new MessageRouter({ agentHandler: handler });
 
         const channel = createMockChannel('signal');
-        router.registerChannel(channel);
+        await router.route(createMessage('signal', 'user-a'), channel);
+        await router.route(createMessage('signal', 'user-b'), channel);
         expect(router.getWorker('signal')).toBeDefined();
+        expect(router.getWorkersForChannel('signal')).toHaveLength(2);
 
         router.unregisterChannel('signal');
         expect(router.getWorker('signal')).toBeUndefined();
+        expect(router.getWorkersForChannel('signal')).toHaveLength(0);
     });
 
     it('should stop all workers', async () => {
         const handler = createMockHandler();
         router = new MessageRouter({ agentHandler: handler });
 
-        router.registerChannel(createMockChannel('discord'));
-        router.registerChannel(createMockChannel('telegram'));
+        await router.route(createMessage('discord'), createMockChannel('discord'));
+        await router.route(createMessage('telegram'), createMockChannel('telegram'));
 
         await router.stopAll();
 
@@ -122,15 +127,27 @@ describe('MessageRouter', () => {
         expect(router.getWorker('telegram')).toBeUndefined();
     });
 
-    it('should not duplicate workers on registerChannel', () => {
+    it('per-user DM isolation: two users on same platform get distinct workers', async () => {
         const handler = createMockHandler();
         router = new MessageRouter({ agentHandler: handler });
 
-        const channel = createMockChannel('line');
-        router.registerChannel(channel);
-        router.registerChannel(channel);
+        const channel = createMockChannel('telegram');
+        await router.route(createMessage('telegram', 'user-a'), channel);
+        await router.route(createMessage('telegram', 'user-b'), channel);
 
-        expect(router.getWorker('line')).toBeDefined();
+        const all = router.getWorkersForChannel('telegram');
+        expect(all).toHaveLength(2);
+    });
+
+    it('same user messaging twice reuses the same worker', async () => {
+        const handler = createMockHandler();
+        router = new MessageRouter({ agentHandler: handler });
+
+        const channel = createMockChannel('telegram');
+        await router.route(createMessage('telegram', 'user-a'), channel);
+        await router.route(createMessage('telegram', 'user-a'), channel);
+
+        expect(router.getWorkersForChannel('telegram')).toHaveLength(1);
     });
 
     it('should send reply back through channel.send', async () => {

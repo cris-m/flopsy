@@ -1,0 +1,29 @@
+{
+  "name": "@flopsy/team",
+  "version": "1.0.0",
+  "description": "FlopsyBot team library — agent factory, handler, toolsets, prompts, and the harness learning layer",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest",
+    "test:ui": "vitest --ui"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@vitest/ui": "^1.0.0",
+    "typescript": "^5.9.3",
+    "vitest": "^1.0.0"
+  },
+  "dependencies": {
+    "@flopsy/cli": "*",
+    "@flopsy/gateway": "*",
+    "@flopsy/shared": "*",
+    "@modelcontextprotocol/sdk": "^1.27.0",
+    "better-sqlite3": "^11.3.0",
+    "flopsygraph": "*",
+    "pino": "^10.3.1",
+    "zod": "^3.25.76"
+  }
+}

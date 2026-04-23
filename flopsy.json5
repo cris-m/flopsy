@@ -1,368 +1,795 @@
 {
-    // FlopsyBot Configuration
-    // Env vars: ${VAR_NAME} resolved at load time from .env or system env
-    // All relative paths resolve against workspace root (~/.flopsy)
-
-    // Workspace root — where all data files live
-    // Override: FLOPSY_HOME env var, FLOPSY_PROFILE env var, or set here
-    // Default: ~/.flopsy
-    workspace: {
-        // root: '/custom/path/to/flopsy',
+    "workspace": {},
+    "gateway": {
+        "host": "127.0.0.1",
+        "port": 18789,
+        "token": "${GATEWAY_TOKEN}",
+        "rateLimit": {
+            "windowMs": 60000,
+            "maxRequests": 100,
+            "maxConnectionsPerIp": 5
+        },
+        "deduplication": {
+            "ttlMs": 30000,
+            "maxEntries": 10000
+        }
     },
-
-    gateway: {
-        host: '127.0.0.1',
-        port: 18789,
-        token: '${GATEWAY_TOKEN}',
-        rateLimit: {
-            windowMs: 60000,
-            maxRequests: 100,
-            maxConnectionsPerIp: 5,
-        },
-        deduplication: {
-            ttlMs: 30000,
-            maxEntries: 10000,
-        },
+    "logging": {
+        "level": "debug",
+        "pretty": true,
+        "file": "logs/flopsy.log",
+        "components": {}
     },
-
-    logging: {
-        level: 'debug',
-        pretty: true,
-        // file: '.flopsy/logs/flopsy.log',
-        components: {
-            // gateway: 'debug',
-            // agent: 'warn',
-        },
-    },
-
-    timezone: 'UTC',
-
-    webhook: {
-        enabled: false,
-        port: 18790,
-        host: '127.0.0.1',
-        secret: '${WEBHOOK_SECRET}',
-        allowedIps: [],
-    },
-
-    channels: {
-
-        // Auth: QR scan (WhatsApp Linked Devices)
-        // Session stored at sessionPath, auto-reconnects on restart
-        whatsapp: {
-            enabled: false,
-            sessionPath: 'sessions/whatsapp',    // relative to workspace (~/.flopsy)
-            dm: {
-                policy: 'disabled',
-                allowFrom: [],
-                blockedFrom: [],
-            },
-            group: {
-                policy: 'disabled',
-                activation: 'mention',
-                allowedGroups: [],
-            },
-            selfChatMode: false,
-            sendReadReceipts: true,
-            autoTyping: true,
-            contextMessages: 50,
-            maxChunkSize: 4000,
-            media: {
-                inboundMax: 10485760,
-                outboundMax: 10485760,
-            },
-            ackReaction: {
-                emoji: '👀',
-                direct: true,
-                group: 'mentions',
-            },
-        },
-
-        // Auth: bot token from @BotFather
-        telegram: {
-            enabled: true,
-            token: '${TELEGRAM_BOT_TOKEN}',
-            botUsername: '',
-            dm: {
-                policy: 'open',
-                allowFrom: [],
-                blockedFrom: [],
-            },
-            group: {
-                policy: 'disabled',
-                activation: 'mention',
-                allowedGroups: [],
-            },
-            ackReaction: {
-                emoji: '👀',
-                direct: true,
-                group: 'mentions',
-            },
-        },
-
-        // Auth: bot token from Discord Developer Portal
-        discord: {
-            enabled: true,
-            token: '${DISCORD_BOT_TOKEN}',
-            botUsername: '',
-            dm: {
-                policy: 'open',
-                allowFrom: [],
-                blockedFrom: [],
-            },
-            guild: {
-                policy: 'disabled',
-                activation: 'mention',
-                allowedGuilds: [],
-                allowedChannels: [],
-            },
-            ackReaction: {
-                emoji: '👀',
-                direct: true,
-                group: 'mentions',
-            },
-            presence: {
-                status: 'online',
-                activity: 'Listening to messages',
-                activityType: 'listening',
-            },
-            slashCommands: [
-                { name: 'ask', description: 'Ask FlopsyBot a question' },
-            ],
-        },
-
-        // Auth: channel access token + secret from LINE Developers Console
-        line: {
-            enabled: true,
-            channelAccessToken: '${LINE_CHANNEL_ACCESS_TOKEN}',
-            channelSecret: '${LINE_CHANNEL_SECRET}',
-            botName: '',
-            webhookPath: '/webhook/line',
-            dm: {
-                policy: 'open',
-                allowFrom: [],
-                blockedFrom: [],
-            },
-            group: {
-                policy: 'disabled',
-                activation: 'mention',
-                allowedGroups: [],
-            },
-        },
-
-        // Auth: QR scan (Signal Linked Devices)
-        // Session stored at sessionPath, auto-reconnects on restart
-        signal: {
-            enabled: false,
-            account: '',
-            cliPath: 'signal-cli',
-            deviceName: 'FlopsyBot',
-            sessionPath: 'sessions/signal',       // relative to workspace (~/.flopsy)
-            dm: {
-                policy: 'disabled',
-                allowFrom: [],
-                blockedFrom: [],
-            },
-            group: {
-                policy: 'disabled',
-                activation: 'mention',
-                allowedGroups: [],
-            },
-            ackReaction: {
-                emoji: '👀',
-                direct: false,
-                group: 'never',
-            },
-        },
-
-        // Auth: none (uses macOS Messages.app directly)
-        imessage: {
-            enabled: false,
-            cliPath: 'imsg',
-            selfChatMode: false,
-            dm: {
-                policy: 'disabled',
-                allowFrom: [],
-                blockedFrom: [],
-            },
-        },
-
-        // Auth: bot token + app token (Socket Mode) from Slack API
-        slack: {
-            enabled: false,
-            botToken: '${SLACK_BOT_TOKEN}',
-            appToken: '${SLACK_APP_TOKEN}',
-            signingSecret: '${SLACK_SIGNING_SECRET}',
-            dm: {
-                policy: 'open',
-                allowFrom: [],
-                blockedFrom: [],
-            },
-            group: {
-                policy: 'disabled',
-                activation: 'mention',
-                allowedGroups: [],
-            },
-        },
-
-        // Auth: service account key + verification token from Google Cloud Console
-        googlechat: {
-            enabled: false,
-            serviceAccountKeyPath: 'credentials/google-chat-sa.json',  // relative to workspace
-            verificationToken: '${GOOGLE_CHAT_VERIFICATION_TOKEN}',
-            webhookPath: '/webhook/googlechat',
-            dm: {
-                policy: 'open',
-                allowFrom: [],
-                blockedFrom: [],
-            },
-            group: {
-                policy: 'disabled',
-                activation: 'mention',
-                allowedGroups: [],
-            },
-        },
-    },
-
-    // ── Proactive Engine ────────────────────────────────────────
-    proactive: {
-        enabled: true,
-        // Paths are relative to workspace root (. or FLOPSY_HOME)
-        statePath: 'state/proactive.json',
-        retryQueuePath: 'state/retry-queue.json',
-
-        // Default delivery target — used by heartbeats and scheduler jobs
-        // delivery: {
-        //     channelName: 'telegram',
-        //     peer: { id: '${DEFAULT_PEER_ID}', type: 'user' },
-        // },
-
-        heartbeats: {
-            enabled: true,
-            heartbeats: [
-                {
-                    name: 'startup-ping',
-                    enabled: true,
-                    interval: '1h',
-                    prompt: 'Log a startup diagnostics ping.',
-                    deliveryMode: 'silent',  // runs in background, never delivered
-                    oneshot: true,           // fires once then disables itself
+    "timezone": "UTC",
+    "models": {},
+    "mcp": {
+        "enabled": true,
+        "servers": {
+            "obsidian": {
+                "enabled": true,
+                "transport": "stdio",
+                "command": "npx",
+                "args": [
+                    "tsx",
+                    "${MCP_ROOT}/obsidian.ts"
+                ],
+                "env": {
+                    "OBSIDIAN_VAULT_PATH": "/Users/munzihirwa/Documents/Obsidian Vault"
                 },
-                // deliveryMode: 'always' | 'conditional' | 'silent'
-                //   always      → response always sent to user
-                //   conditional → agent decides: promote (send) or suppress (skip)
-                //   silent      → runs in background, never delivered
-
-                // {
-                //     name: 'email-check',
-                //     enabled: true,
-                //     interval: '30m',
-                //     prompt: 'Check for new important emails. Only report urgent ones.',
-                //     deliveryMode: 'conditional',
-                //     activeHours: { start: 8, end: 22 },
-                // },
-                // {
-                //     name: 'daily-briefing',
-                //     enabled: true,
-                //     interval: '24h',
-                //     prompt: 'Generate today\'s briefing: weather, calendar, top news.',
-                //     deliveryMode: 'always',
-                //     activeHours: { start: 7, end: 9 },
-                // },
-                // {
-                //     name: 'memory-consolidation',
-                //     enabled: true,
-                //     interval: '24h',
-                //     prompt: 'Review today\'s conversations and consolidate memories.',
-                //     deliveryMode: 'silent',
-                // },
-                // {
-                //     name: 'startup-check',
-                //     enabled: true,
-                //     interval: '1h',
-                //     prompt: 'Run startup diagnostics and report issues.',
-                //     deliveryMode: 'conditional',
-                //     oneshot: true,
-                // },
-            ],
-        },
-
-        scheduler: {
-            enabled: false,
-            jobs: [
-                // schedule kinds:
-                //   { kind: 'at', atMs: 1743613200000 }            → one-shot
-                //   { kind: 'every', everyMs: 300000 }              → every 5 min
-                //   { kind: 'cron', expr: '0 18 * * 5', tz: '...'} → cron expression
-
-                // {
-                //     id: 'remind-call-mom',
-                //     name: 'Call mom reminder',
-                //     enabled: true,
-                //     schedule: { kind: 'at', atMs: 1743613200000 },
-                //     payload: {
-                //         message: 'Remind the user to call mom now.',
-                //         deliveryMode: 'always',
-                //     },
-                // },
-                // {
-                //     id: 'github-pr-check',
-                //     name: 'GitHub PR monitor',
-                //     enabled: true,
-                //     schedule: { kind: 'every', everyMs: 300000 },
-                //     payload: {
-                //         message: 'Check GitHub PRs for new comments or reviews.',
-                //         deliveryMode: 'conditional',
-                //     },
-                // },
-                // {
-                //     id: 'weekly-summary',
-                //     name: 'Weekly work summary',
-                //     enabled: true,
-                //     schedule: { kind: 'cron', expr: '0 18 * * 5', tz: 'Africa/Lubumbashi' },
-                //     payload: {
-                //         message: 'Generate a summary of what I worked on this week.',
-                //         deliveryMode: 'always',
-                //     },
-                // },
-            ],
-        },
-
-        webhooks: [
-            // {
-            //     name: 'github',
-            //     path: '/webhook/github',
-            //     targetChannel: 'discord',
-            //     secret: '${GITHUB_WEBHOOK_SECRET}',
-            //     eventTypeHeader: 'x-github-event',
-            //     signature: {
-            //         header: 'x-hub-signature-256',
-            //         algorithm: 'sha256',
-            //         format: 'hex',
-            //         prefix: 'sha256=',
-            //     },
-            // },
-            // {
-            //     name: 'stripe',
-            //     path: '/webhook/stripe',
-            //     targetChannel: 'telegram',
-            //     secret: '${STRIPE_WEBHOOK_SECRET}',
-            //     eventTypeHeader: 'stripe-event',
-            //     signature: {
-            //         header: 'stripe-signature',
-            //         algorithm: 'sha256',
-            //         format: 'hex',
-            //     },
-            // },
-        ],
-
-        healthMonitor: {
-            enabled: true,
-            checkIntervalMs: 300000,
-            staleEventThresholdMs: 600000,
-            connectGraceMs: 60000,
-            maxRestartsPerHour: 10,
-            cooldownCycles: 2,
-        },
+                "assignTo": [
+                    "gimli",
+                    "legolas"
+                ],
+                "description": "Read/search/write an Obsidian vault"
+            },
+            "home-assistant": {
+                "enabled": true,
+                "transport": "stdio",
+                "command": "npx",
+                "args": [
+                    "tsx",
+                    "${MCP_ROOT}/home-assistant.ts"
+                ],
+                "env": {
+                    "HOME_ASSISTANT_URL": "${HOME_ASSISTANT_URL}",
+                    "HOME_ASSISTANT_TOKEN": "${HOME_ASSISTANT_TOKEN}"
+                },
+                "requires": [
+                    "HOME_ASSISTANT_URL",
+                    "HOME_ASSISTANT_TOKEN"
+                ],
+                "assignTo": [
+                    "sam"
+                ],
+                "description": "Smart home control: lights, climate, automations"
+            },
+            "virustotal": {
+                "enabled": true,
+                "transport": "stdio",
+                "command": "npx",
+                "args": [
+                    "tsx",
+                    "${MCP_ROOT}/virustotal.ts"
+                ],
+                "env": {
+                    "VIRUSTOTAL_API_KEY": "${VIRUSTOTAL_API_KEY}"
+                },
+                "requires": [
+                    "VIRUSTOTAL_API_KEY"
+                ],
+                "assignTo": [
+                    "aragorn"
+                ],
+                "description": "VirusTotal file, URL, IP, and domain reputation"
+            },
+            "shodan": {
+                "enabled": true,
+                "transport": "stdio",
+                "command": "npx",
+                "args": [
+                    "tsx",
+                    "${MCP_ROOT}/shodan.ts"
+                ],
+                "env": {
+                    "SHODAN_API_KEY": "${SHODAN_API_KEY}"
+                },
+                "requires": [
+                    "SHODAN_API_KEY"
+                ],
+                "assignTo": [
+                    "aragorn"
+                ],
+                "description": "Shodan network intelligence: IP lookup, device + vuln search"
+            },
+            "browser": {
+                "enabled": true,
+                "transport": "stdio",
+                "command": "npx",
+                "args": [
+                    "-y",
+                    "@playwright/mcp@latest",
+                    "--headless"
+                ],
+                "assignTo": [
+                    "gandalf",
+                    "legolas"
+                ],
+                "description": "Playwright-based browser automation. Set `enabled: true` after running `npx playwright install chromium`."
+            },
+            "apple-notes": {
+                "enabled": true,
+                "transport": "stdio",
+                "command": "npx",
+                "args": [
+                    "tsx",
+                    "${MCP_ROOT}/apple-notes.ts"
+                ],
+                "platform": "darwin",
+                "assignTo": [
+                    "gimli"
+                ],
+                "description": "Read/write Apple Notes via JXA (macOS only — needs Notes.app access permission)"
+            },
+            "apple-reminders": {
+                "enabled": true,
+                "transport": "stdio",
+                "command": "npx",
+                "args": [
+                    "tsx",
+                    "${MCP_ROOT}/apple-reminders.ts"
+                ],
+                "platform": "darwin",
+                "assignTo": [
+                    "gimli"
+                ],
+                "description": "Apple Reminders list + item CRUD via JXA (macOS only)"
+            },
+            "spotify": {
+                "enabled": true,
+                "transport": "stdio",
+                "command": "npx",
+                "args": [
+                    "tsx",
+                    "${MCP_ROOT}/spotify.ts"
+                ],
+                "requires": [
+                    "SPOTIFY_CLIENT_ID"
+                ],
+                "requiresAuth": [
+                    "spotify"
+                ],
+                "env": {
+                    "SPOTIFY_CLIENT_ID": "${SPOTIFY_CLIENT_ID}"
+                },
+                // OAuth redirect URI for `flopsy auth spotify`. Must match
+                // exactly what you register in the Spotify developer dashboard.
+                "redirectBase": "http://127.0.0.1:8888/spotify",
+                "assignTo": [
+                    "sam"
+                ],
+                "description": "Spotify Web API: search, playback, devices (transfer-to), queue, playlists, library, top items. One-time setup: 1) create app at developer.spotify.com, 2) register the redirectBase URL as a Redirect URI, 3) paste Client ID into .env, 4) run `flopsy auth spotify`."
+            },
+            "twitter": {
+                "enabled": true,
+                "transport": "stdio",
+                "command": "npx",
+                "args": [
+                    "tsx",
+                    "${MCP_ROOT}/twitter.ts"
+                ],
+                "assignTo": [
+                    "aragorn"
+                ],
+                "description": "X/Twitter via `@steipete/bird` (cookie auth, fragile — breaks when X changes its HTML). Enable when you need it."
+            },
+            "gmail": {
+                "enabled": true,
+                "transport": "stdio",
+                "command": "npx",
+                "args": [
+                    "tsx",
+                    "${MCP_ROOT}/gmail.ts"
+                ],
+                "requiresAuth": [
+                    "google"
+                ],
+                "requires": [
+                    "GOOGLE_CLIENT_ID",
+                    "GOOGLE_CLIENT_SECRET"
+                ],
+                "assignTo": [
+                    "legolas"
+                ],
+                "description": "Gmail read/search/send/draft. Needs GOOGLE_CLIENT_ID/SECRET + `flopsy auth google`, then enable."
+            },
+            "calendar": {
+                "enabled": true,
+                "transport": "stdio",
+                "command": "npx",
+                "args": [
+                    "tsx",
+                    "${MCP_ROOT}/calendar.ts"
+                ],
+                "requiresAuth": [
+                    "google"
+                ],
+                "requires": [
+                    "GOOGLE_CLIENT_ID",
+                    "GOOGLE_CLIENT_SECRET"
+                ],
+                "assignTo": [
+                    "legolas"
+                ],
+                "description": "Google Calendar read/write events, find free time. Same prereqs as gmail."
+            },
+            "drive": {
+                "enabled": true,
+                "transport": "stdio",
+                "command": "npx",
+                "args": [
+                    "tsx",
+                    "${MCP_ROOT}/drive.ts"
+                ],
+                "requiresAuth": [
+                    "google"
+                ],
+                "requires": [
+                    "GOOGLE_CLIENT_ID",
+                    "GOOGLE_CLIENT_SECRET"
+                ],
+                "assignTo": [
+                    "legolas"
+                ],
+                "description": "Google Drive file search + read. Same prereqs as gmail."
+            },
+            "youtube": {
+                "enabled": true,
+                "transport": "stdio",
+                "command": "npx",
+                "args": [
+                    "tsx",
+                    "${MCP_ROOT}/youtube.ts"
+                ],
+                "requiresAuth": [
+                    "google"
+                ],
+                "requires": [
+                    "GOOGLE_CLIENT_ID",
+                    "GOOGLE_CLIENT_SECRET"
+                ],
+                "assignTo": [
+                    "legolas"
+                ],
+                "description": "YouTube search, video details, playlists, subscriptions. Uses YouTube Data API v3. Same Google OAuth prereqs as gmail."
+            },
+            "notion": {
+                "enabled": true,
+                "transport": "stdio",
+                "command": "npx",
+                "args": [
+                    "-y",
+                    "@notionhq/notion-mcp-server"
+                ],
+                "env": {
+                    "OPENAPI_MCP_HEADERS": "{\"Authorization\":\"Bearer ${NOTION_API_KEY}\",\"Notion-Version\":\"2022-06-28\"}"
+                },
+                "requires": [
+                    "NOTION_API_KEY"
+                ],
+                "assignTo": [
+                    "gimli"
+                ],
+                "description": "Notion workspace management via the official @notionhq/notion-mcp-server"
+            },
+            "todoist": {
+                "enabled": true,
+                "transport": "stdio",
+                "command": "npx",
+                "args": [
+                    "-y",
+                    "@hoffination/mcp-todoist"
+                ],
+                "env": {
+                    "TODOIST_API_TOKEN": "${TODOIST_API_KEY}"
+                },
+                "requires": [
+                    "TODOIST_API_KEY"
+                ],
+                "assignTo": [
+                    "gimli"
+                ],
+                "description": "Todoist task + project management via @hoffination/mcp-todoist"
+            }
+        }
     },
+    "memory": {
+        "enabled": true,
+        "embedder": {
+            "provider": "ollama",
+            "model": "nomic-embed-text:v1.5"
+        }
+    },
+    "agents": [
+        {
+            "name": "gandalf",
+            "enabled": true,
+            "type": "main",
+            "role": "main",
+            "workers": [
+                "legolas",
+                "saruman",
+                "gimli",
+                "aragorn",
+                "sam"
+            ],
+            "domain": "general",
+            "toolsets": [
+                "research",
+                "utility",
+                "web",
+                "finance"
+            ],
+            // "model": "nvidia:nvidia/nemotron-3-super-120b-a12b",
+            "model": "openai:gpt-4o",
+            "model_config": {
+                "temperature": 0,
+                "maxTokens": 4096
+            },
+            "fallback_models": [
+                {
+                    "provider": "nvidia",
+                    "name": "meta/llama-3.3-70b-instruct"
+                },
+                {
+                    "provider": "ollama",
+                    "name": "gemma4:e4b"
+                }
+            ],
+            "cost_tier": "medium",
+            "routing": {
+                "enabled": true,
+                "tiers": {
+                    "fast": {
+                        "provider": "ollama",
+                        "name": "gemma4:e4b"
+                    },
+                    "balanced": {
+                        "provider": "ollama",
+                        "name": "gemma4:e4b"
+                    },
+                    "powerful": {
+                        "provider": "ollama",
+                        "name": "qwen3-coder:480b-cloud"
+                    }
+                }
+            }
+        },
+        {
+            "name": "legolas",
+            "enabled": true,
+            "type": "research",
+            "role": "worker",
+            "domain": "research",
+            "toolsets": [
+                "research",
+                "web",
+                "news"
+            ],
+            "model": "nvidia:qwen/qwen2.5-72b-instruct",
+            "model_config": {
+                "temperature": 0.5
+            },
+            "fallback_models": [
+                {
+                    "provider": "nvidia",
+                    "name": "meta/llama-3.3-70b-instruct"
+                },
+                {
+                    "provider": "ollama",
+                    "name": "gemma4:e4b"
+                }
+            ],
+            "cost_tier": "medium",
+            "routing": {
+                "enabled": true,
+                "tiers": {
+                    "fast": {
+                        "provider": "ollama",
+                        "name": "gemma4:e4b"
+                    },
+                    "balanced": {
+                        "provider": "ollama",
+                        "name": "gemma4:e4b"
+                    },
+                    "powerful": {
+                        "provider": "ollama",
+                        "name": "deepseek-v3.1:671b-cloud"
+                    }
+                }
+            }
+        },
+        {
+            "name": "saruman",
+            "enabled": true,
+            "type": "deep-research",
+            "role": "worker",
+            "graph": "deep-research",
+            "domain": "deep-research",
+            "toolsets": [],
+            "model": "nvidia:meta/llama-3.3-70b-instruct",
+            "model_config": {
+                "temperature": 0.3,
+                "maxTokens": 8192
+            },
+            "fallback_models": [
+                {
+                    "provider": "nvidia",
+                    "name": "qwen/qwen2.5-72b-instruct"
+                },
+                {
+                    "provider": "ollama",
+                    "name": "gemma4:e4b"
+                }
+            ],
+            "cost_tier": "high"
+        },
+        {
+            "name": "gimli",
+            "enabled": true,
+            "type": "analysis",
+            "role": "worker",
+            "domain": "analysis",
+            "toolsets": [
+                "utility",
+                "filesystem"
+            ],
+            "model": "nvidia:meta/llama-3.1-8b-instruct",
+            "model_config": {
+                "temperature": 0.3,
+                "maxTokens": 2048
+            },
+            "fallback_models": [
+                {
+                    "provider": "nvidia",
+                    "name": "meta/llama-3.3-70b-instruct"
+                },
+                {
+                    "provider": "ollama",
+                    "name": "gemma4:e4b"
+                }
+            ],
+            "cost_tier": "low",
+            "routing": {
+                "enabled": true,
+                "tiers": {
+                    "fast": {
+                        "provider": "ollama",
+                        "name": "gemma4:e4b"
+                    },
+                    "balanced": {
+                        "provider": "ollama",
+                        "name": "gemma4:e4b"
+                    },
+                    "powerful": {
+                        "provider": "ollama",
+                        "name": "gpt-oss:120b-cloud"
+                    }
+                }
+            },
+            "approvals": {
+                "tools": [
+                    "write_file",
+                    "edit_file"
+                ],
+                "actions": [
+                    "approve",
+                    "skip"
+                ]
+            }
+        },
+        {
+            "name": "aragorn",
+            "enabled": true,
+            "type": "security",
+            "role": "worker",
+            "domain": "security",
+            "toolsets": [
+                "web",
+                "research"
+            ],
+            "mcpServers": [
+                "virustotal",
+                "shodan"
+            ],
+            "model": "nvidia:meta/llama-3.3-70b-instruct",
+            "model_config": {
+                "temperature": 0.2,
+                "maxTokens": 4096
+            },
+            "fallback_models": [
+                {
+                    "provider": "nvidia",
+                    "name": "meta/llama-3.1-8b-instruct"
+                },
+                {
+                    "provider": "ollama",
+                    "name": "gemma4:e4b"
+                }
+            ],
+            "cost_tier": "medium",
+            "routing": {
+                "enabled": true,
+                "tiers": {
+                    "fast": {
+                        "provider": "ollama",
+                        "name": "gemma4:e4b"
+                    },
+                    "balanced": {
+                        "provider": "ollama",
+                        "name": "gemma4:e4b"
+                    },
+                    "powerful": {
+                        "provider": "ollama",
+                        "name": "gpt-oss:120b-cloud"
+                    }
+                }
+            },
+            "approvals": {
+                "tools": [],
+                "actions": []
+            }
+        },
+        {
+            "name": "sam",
+            "enabled": true,
+            "type": "media",
+            "role": "worker",
+            "domain": "media-and-home",
+            "toolsets": [
+                "utility"
+            ],
+            "mcpServers": [
+                "spotify",
+                "home-assistant"
+            ],
+            "model": "nvidia:meta/llama-3.1-8b-instruct",
+            "model_config": {
+                "temperature": 0.3,
+                "maxTokens": 4096
+            },
+            "fallback_models": [
+                {
+                    "provider": "nvidia",
+                    "name": "meta/llama-3.3-70b-instruct"
+                },
+                {
+                    "provider": "ollama",
+                    "name": "gemma4:e4b"
+                }
+            ],
+            "cost_tier": "medium",
+            "routing": {
+                "enabled": true,
+                "tiers": {
+                    "fast": {
+                        "provider": "ollama",
+                        "name": "gemma4:e4b"
+                    },
+                    "balanced": {
+                        "provider": "ollama",
+                        "name": "gemma4:e4b"
+                    },
+                    "powerful": {
+                        "provider": "ollama",
+                        "name": "gpt-oss:120b-cloud"
+                    }
+                }
+            },
+            "approvals": {
+                "tools": [],
+                "actions": []
+            }
+        }
+    ],
+    "webhook": {
+        "enabled": false,
+        "port": 18790,
+        "host": "127.0.0.1",
+        "secret": "${WEBHOOK_SECRET}",
+        "allowedIps": []
+    },
+    "channels": {
+        "whatsapp": {
+            "enabled": false,
+            "sessionPath": "sessions/whatsapp",
+            "dm": {
+                "policy": "disabled",
+                "allowFrom": [],
+                "blockedFrom": []
+            },
+            "group": {
+                "policy": "disabled",
+                "activation": "mention",
+                "allowedGroups": []
+            },
+            "selfChatMode": false,
+            "sendReadReceipts": true,
+            "autoTyping": true,
+            "contextMessages": 100,
+            "maxChunkSize": 4000,
+            "media": {
+                "inboundMax": 10485760,
+                "outboundMax": 10485760
+            },
+            "ackReaction": {
+                "emoji": "👀",
+                "direct": true,
+                "group": "mentions"
+            }
+        },
+        "telegram": {
+            "enabled": true,
+            "token": "${TELEGRAM_BOT_TOKEN}",
+            "botUsername": "",
+            "dm": {
+                "policy": "open",
+                "allowFrom": [],
+                "blockedFrom": []
+            },
+            "group": {
+                "policy": "disabled",
+                "activation": "mention",
+                "allowedGroups": []
+            },
+            "ackReaction": {
+                "emoji": "👀",
+                "direct": true,
+                "group": "mentions"
+            }
+        },
+        "discord": {
+            "enabled": true,
+            "token": "${DISCORD_BOT_TOKEN}",
+            "botUsername": "",
+            "dm": {
+                "policy": "open",
+                "allowFrom": [],
+                "blockedFrom": []
+            },
+            "guild": {
+                "policy": "disabled",
+                "activation": "mention",
+                "allowedGuilds": [],
+                "allowedChannels": []
+            },
+            "ackReaction": {
+                "emoji": "👀",
+                "direct": true,
+                "group": "mentions"
+            },
+            "presence": {
+                "status": "online",
+                "activity": "Listening to messages",
+                "activityType": "listening"
+            },
+            "slashCommands": [
+                {
+                    "name": "ask",
+                    "description": "Ask FlopsyBot a question"
+                }
+            ]
+        },
+        "line": {
+            "enabled": true,
+            "channelAccessToken": "${LINE_CHANNEL_ACCESS_TOKEN}",
+            "channelSecret": "${LINE_CHANNEL_SECRET}",
+            "botName": "",
+            "webhookPath": "/webhook/line",
+            "dm": {
+                "policy": "open",
+                "allowFrom": [],
+                "blockedFrom": []
+            },
+            "group": {
+                "policy": "disabled",
+                "activation": "mention",
+                "allowedGroups": []
+            }
+        },
+        "signal": {
+            "enabled": false,
+            "account": "",
+            "cliPath": "signal-cli",
+            "deviceName": "FlopsyBot",
+            "sessionPath": "sessions/signal",
+            "dm": {
+                "policy": "disabled",
+                "allowFrom": [],
+                "blockedFrom": []
+            },
+            "group": {
+                "policy": "disabled",
+                "activation": "mention",
+                "allowedGroups": []
+            },
+            "ackReaction": {
+                "emoji": "👀",
+                "direct": false,
+                "group": "never"
+            }
+        },
+        "imessage": {
+            "enabled": false,
+            "cliPath": "imsg",
+            "selfChatMode": false,
+            "dm": {
+                "policy": "disabled",
+                "allowFrom": [],
+                "blockedFrom": []
+            }
+        },
+        "slack": {
+            "enabled": false,
+            "botToken": "${SLACK_BOT_TOKEN}",
+            "appToken": "${SLACK_APP_TOKEN}",
+            "signingSecret": "${SLACK_SIGNING_SECRET}",
+            "dm": {
+                "policy": "open",
+                "allowFrom": [],
+                "blockedFrom": []
+            },
+            "group": {
+                "policy": "disabled",
+                "activation": "mention",
+                "allowedGroups": []
+            }
+        },
+        "googlechat": {
+            "enabled": false,
+            "serviceAccountKeyPath": "credentials/google-chat-sa.json",
+            "verificationToken": "${GOOGLE_CHAT_VERIFICATION_TOKEN}",
+            "webhookPath": "/webhook/googlechat",
+            "dm": {
+                "policy": "open",
+                "allowFrom": [],
+                "blockedFrom": []
+            },
+            "group": {
+                "policy": "disabled",
+                "activation": "mention",
+                "allowedGroups": []
+            }
+        }
+    },
+    "proactive": {
+        "enabled": true,
+        "statePath": "state/proactive.json",
+        "retryQueuePath": "state/retry-queue.json",
+        "heartbeats": {
+            "enabled": true,
+            "heartbeats": [
+                {
+                    "name": "startup-ping",
+                    "enabled": true,
+                    "interval": "1h",
+                    "prompt": "Log a startup diagnostics ping.",
+                    "deliveryMode": "silent",
+                    "oneshot": true
+                }
+            ]
+        },
+        "scheduler": {
+            "enabled": false,
+            "jobs": []
+        },
+        "webhooks": [],
+        "healthMonitor": {
+            "enabled": true,
+            "checkIntervalMs": 300000,
+            "staleEventThresholdMs": 600000,
+            "connectGraceMs": 60000,
+            "maxRestartsPerHour": 10,
+            "cooldownCycles": 2
+        }
+    }
 }

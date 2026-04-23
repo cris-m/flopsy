@@ -7,6 +7,9 @@ import { MessageRouter } from '@gateway/core/message-router';
 import { WebhookRouter, type ExternalWebhookConfig } from '@gateway/core/webhook-router';
 import type { AgentHandler } from '@gateway/types/agent';
 import { ProactiveEngine } from './proactive';
+import { MgmtServer } from './mgmt/server';
+import { ConfigReloader, type ReloadRule, type ReloadHandlerContext } from './config-reload';
+import { getConfigPath } from '@flopsy/shared';
 import { WhatsAppChannel } from '@gateway/channels/whatsapp';
 import { TelegramChannel } from '@gateway/channels/telegram';
 import { DiscordChannel } from '@gateway/channels/discord';
@@ -21,7 +24,9 @@ export class FlopsyGateway extends BaseGateway {
     private webhookRouter: WebhookRouter | null = null;
     private router: MessageRouter | null = null;
     private proactiveEngine: ProactiveEngine | null = null;
-    private readonly cfg: FlopsyConfig;
+    private mgmtServer: MgmtServer | null = null;
+    private configReloader: ConfigReloader | null = null;
+    private cfg: FlopsyConfig;
 
     constructor(config?: FlopsyConfig) {
         const cfg = config ?? loadConfig();
@@ -107,6 +112,9 @@ export class FlopsyGateway extends BaseGateway {
         this.router = new MessageRouter({
             agentHandler: handler,
             coalesceDelayMs: this.cfg.gateway.coalesceDelayMs,
+            // The router stamps in its own `activeThreads` count; here we
+            // just hand it everything the gateway uniquely knows.
+            gatewaySnapshotFn: () => this.getStatusSnapshot(),
         });
 
         for (const channel of this.channels.values()) {
@@ -123,6 +131,42 @@ export class FlopsyGateway extends BaseGateway {
         if (this.webhookServer && this.router) {
             this.webhookRouter.register(this.webhookServer, this.router);
         }
+    }
+
+    /**
+     * Extends the base snapshot with webhook-server state and proactive-engine
+     * counts. Counts come from config (heartbeats/cron defined but disabled
+     * are excluded); the `running` flag reflects the live engine state. The
+     * fields stay optional so consumers (and the `/status` renderer) can
+     * skip sections that aren't wired.
+     */
+    override getStatusSnapshot() {
+        const base = super.getStatusSnapshot();
+
+        const webhook = this.cfg.webhook.enabled
+            ? {
+                  enabled: true,
+                  port: this.webhookServer?.isRunning ? this.webhookServer.port : this.cfg.webhook.port,
+                  routeCount: this.webhookServer?.routeCount ?? 0,
+              }
+            : { enabled: false, routeCount: 0 };
+
+        const p = this.cfg.proactive;
+        const proactive = p.enabled
+            ? {
+                  running: this.proactiveEngine?.isRunning() ?? false,
+                  heartbeats: p.heartbeats.enabled
+                      ? p.heartbeats.heartbeats.filter((h) => h.enabled).length
+                      : 0,
+                  cronJobs: p.scheduler.enabled
+                      ? p.scheduler.jobs.filter((j) => j.enabled).length
+                      : 0,
+                  inboundWebhooks: p.webhooks.length,
+                  lastHeartbeatAt: this.proactiveEngine?.getLastHeartbeatAt(),
+              }
+            : { running: false, heartbeats: 0, cronJobs: 0, inboundWebhooks: 0 };
+
+        return { ...base, webhook, proactive };
     }
 
     private registerChannels(cfg: FlopsyConfig): void {
@@ -332,6 +376,32 @@ export class FlopsyGateway extends BaseGateway {
             this.log.debug('webhook server disabled');
         }
 
+        // Management HTTP server — tiny read-only endpoint so the CLI
+        // can query live state without shelling out to psutil. Defaults
+        // to gateway.port + 1 (e.g. 18790) on 127.0.0.1 only. Disable
+        // by setting gateway.mgmt.enabled=false.
+        const mgmtEnabled = this.cfg.gateway.mgmt?.enabled !== false;
+        if (mgmtEnabled) {
+            const mgmtPort =
+                this.cfg.gateway.mgmt?.port ?? this.cfg.gateway.port + 1;
+            const mgmtHost = this.cfg.gateway.mgmt?.host ?? '127.0.0.1';
+            this.mgmtServer = new MgmtServer({
+                host: mgmtHost,
+                port: mgmtPort,
+                token: process.env['FLOPSY_MGMT_TOKEN'],
+                snapshotFn: () => this.getStatusSnapshot(),
+            });
+            try {
+                await this.mgmtServer.start();
+            } catch (err) {
+                this.log.warn(
+                    { err: err instanceof Error ? err.message : String(err) },
+                    'mgmt server failed to start — CLI live queries will not work',
+                );
+                this.mgmtServer = null;
+            }
+        }
+
         if (this.cfg.proactive.enabled) {
             this.log.info('proactive engine starting');
 
@@ -397,9 +467,109 @@ export class FlopsyGateway extends BaseGateway {
         } else {
             this.log.debug('health monitor disabled');
         }
+
+        this.startConfigReloader();
+    }
+
+    /**
+     * Start the flopsy.json5 file watcher. Changes that map to a `hot`
+     * rule are applied in-process; changes that map to `restart` are
+     * logged with a clear warning so the user runs `flopsy gateway
+     * restart` when they're ready. Disabled entirely by setting
+     * `gateway.reload.enabled: false` in flopsy.json5.
+     */
+    private startConfigReloader(): void {
+        const reloadCfg = (this.cfg.gateway as { reload?: { enabled?: boolean } }).reload;
+        if (reloadCfg?.enabled === false) {
+            this.log.info('config-reload disabled via gateway.reload.enabled=false');
+            return;
+        }
+        const configPath = getConfigPath();
+        if (!configPath) {
+            this.log.warn('config-reload: no config path resolvable, skipping watcher');
+            return;
+        }
+
+        const rules = this.buildReloadRules();
+        this.configReloader = new ConfigReloader(this.cfg, {
+            configPath,
+            rules,
+            onApplied: (next) => {
+                this.cfg = next;
+            },
+        });
+        this.configReloader.start();
+    }
+
+    /**
+     * Rule table — each entry declares which config path(s) it covers
+     * and whether changes hot-apply (in-process) or require restart.
+     *
+     * Initial set covers the highest-value operational cases:
+     *   - `channels.<name>.enabled` — channel on/off toggles
+     *
+     * Everything else falls into the explicit `restart` bucket so the
+     * user gets a warning. Per-subsystem hot handlers (MCP, proactive,
+     * agent model switches) come in follow-up turns.
+     */
+    private buildReloadRules(): readonly ReloadRule[] {
+        return [
+            {
+                pattern: 'channels.*.enabled',
+                mode: 'hot',
+                reason: 'channel on/off toggle',
+                handler: (ctx) => this.handleChannelToggle(ctx),
+            },
+            // Restart-required buckets — hot handlers for these land
+            // in follow-up turns. Until then, we log and let the user
+            // decide when to restart.
+            { pattern: 'channels.**', mode: 'restart', reason: 'channel config beyond on/off needs rebuild' },
+            { pattern: 'mcp.servers.**', mode: 'restart', reason: 'MCP subprocesses need respawn' },
+            { pattern: 'agents.**', mode: 'restart', reason: 'agents are built once at boot' },
+            { pattern: 'memory.**', mode: 'restart', reason: 'memory store + embedder init on boot' },
+            { pattern: 'proactive.**', mode: 'restart', reason: 'heartbeat/cron/webhook rewire on boot' },
+            { pattern: 'webhook.**', mode: 'restart', reason: 'webhook receiver binds on boot' },
+            { pattern: 'gateway.**', mode: 'restart', reason: 'gateway host/port/token are boot-only' },
+        ];
+    }
+
+    /**
+     * Hot handler: flip a channel's `enabled` flag. When transitioning
+     * false→true we spawn + register the adapter; true→false we stop +
+     * unregister. Doesn't touch other channels — uptime-preserving.
+     */
+    private async handleChannelToggle(ctx: ReloadHandlerContext): Promise<void> {
+        const match = ctx.changedPath.match(/^channels\.([^.]+)\.enabled$/);
+        if (!match) return;
+        const name = match[1];
+        const newEnabled = ctx.newValue === true;
+        const existing = this.channels.get(name);
+
+        if (newEnabled && !existing) {
+            // Registration happens via the constructor's registerChannels
+            // path — re-running that for one channel is non-trivial
+            // today. For now we log + fall back to "restart required".
+            this.log.warn(
+                { channel: name },
+                'channel enable: live spawn not yet implemented — run `flopsy gateway restart`',
+            );
+            return;
+        }
+        if (!newEnabled && existing) {
+            this.log.info({ channel: name }, 'channel disable: disconnecting adapter');
+            try {
+                await existing.disconnect();
+            } catch (err) {
+                this.log.warn({ err, channel: name }, 'channel disconnect failed');
+            }
+        }
     }
 
     protected async onStop(): Promise<void> {
+        if (this.configReloader) {
+            this.configReloader.stop();
+            this.configReloader = null;
+        }
         if (this.proactiveEngine) {
             this.log.info('stopping proactive engine');
             await this.proactiveEngine.stop();
@@ -416,6 +586,12 @@ export class FlopsyGateway extends BaseGateway {
             this.log.debug('stopping webhook server');
             await this.webhookServer.stop();
             this.webhookServer = null;
+        }
+
+        if (this.mgmtServer) {
+            this.log.debug('stopping mgmt server');
+            await this.mgmtServer.stop();
+            this.mgmtServer = null;
         }
     }
 

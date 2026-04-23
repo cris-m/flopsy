@@ -7,7 +7,7 @@ export { ChannelRouter } from './delivery/router';
 export { JobExecutor } from './pipeline/executor';
 export { HeartbeatTrigger } from './triggers/heartbeat';
 export { CronTrigger } from './triggers/cron';
-export { WebhookTrigger } from './triggers/webhook';
+export { WebhookTrigger, type WebhookTriggerConfig } from './triggers/webhook';
 export { ChannelHealthMonitor } from './health/monitor';
 export type {
     CronSchedule,

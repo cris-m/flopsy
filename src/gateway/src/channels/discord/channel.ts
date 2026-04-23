@@ -3,11 +3,95 @@ import type {
     OutboundMessage,
     ReactionOptions,
     Message,
+    Media,
     StreamingCapability,
+    InteractiveReply,
+    InteractionCallback,
+    InteractiveCapability,
+    ButtonStyle as OurButtonStyle,
 } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
 import { isSafeMediaUrl } from '@gateway/core/security';
 import type { DiscordChannelConfig } from './types';
+
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
+async function downloadAsBase64(url: string): Promise<{ data: string; mimeType: string } | null> {
+    try {
+        const res = await fetch(url);
+        if (!res.ok) return null;
+        const buffer = await res.arrayBuffer();
+        if (buffer.byteLength > MAX_IMAGE_BYTES) return null;
+        const ct = res.headers.get('content-type') ?? 'image/jpeg';
+        return { data: Buffer.from(buffer).toString('base64'), mimeType: ct.split(';')[0]!.trim() };
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Map our abstract button style to Discord's ButtonStyle enum values.
+ * Imported lazily inside send() because discord.js is dynamic.
+ */
+function mapDiscordButtonStyle(style: OurButtonStyle | undefined): number {
+    // Discord's ButtonStyle: Primary=1, Secondary=2, Success=3, Danger=4.
+    // Returning the numeric value avoids a build-time dependency on the enum.
+    switch (style) {
+        case 'success': return 3;
+        case 'danger':  return 4;
+        case 'secondary': return 2;
+        case 'primary':
+        default:        return 1;
+    }
+}
+
+/**
+ * Build Discord action-row components from our InteractiveReply. Discord
+ * caps a row at 5 buttons and a message at 5 rows; we chunk generously
+ * and drop any button whose `value` exceeds 100 chars (Discord's
+ * custom_id limit). Returns undefined when nothing interactive was
+ * specified — caller sends a plain text message.
+ */
+function buildDiscordComponents(
+    interactive: InteractiveReply,
+): Array<{ type: 1; components: Array<{ type: 2; style: number; label: string; custom_id: string }> }> | undefined {
+    const rows: Array<{ type: 1; components: Array<{ type: 2; style: number; label: string; custom_id: string }> }> = [];
+    const ROW_SIZE = 5;
+
+    for (const block of interactive.blocks) {
+        if (block.type === 'buttons') {
+            for (let i = 0; i < block.buttons.length; i += ROW_SIZE) {
+                const row = block.buttons
+                    .slice(i, i + ROW_SIZE)
+                    .filter((b) => b.value.length <= 100)
+                    .map((b) => ({
+                        type: 2 as const,
+                        style: mapDiscordButtonStyle(b.style),
+                        label: b.label.slice(0, 80),
+                        custom_id: b.value,
+                    }));
+                if (row.length > 0) rows.push({ type: 1, components: row });
+            }
+        } else if (block.type === 'select') {
+            // Render select options as a row of buttons — no native dropdown
+            // for now (StringSelectMenuBuilder could be a later add).
+            for (let i = 0; i < block.options.length; i += ROW_SIZE) {
+                const row = block.options
+                    .slice(i, i + ROW_SIZE)
+                    .filter((o) => o.value.length <= 100)
+                    .map((o) => ({
+                        type: 2 as const,
+                        style: 2, // secondary for menu-like selects
+                        label: o.label.slice(0, 80),
+                        custom_id: o.value,
+                    }));
+                if (row.length > 0) rows.push({ type: 1, components: row });
+            }
+        }
+    }
+
+    return rows.length > 0 ? rows.slice(0, 5) : undefined;
+}
 
 const INTERACTION_TTL_MS = 14 * 60_000;
 const INTERACTION_SWEEP_MS = 60_000;
@@ -18,6 +102,18 @@ export class DiscordChannel extends BaseChannel {
     readonly name = 'discord';
     readonly authType = 'token';
     readonly streaming: StreamingCapability = { editBased: true, minEditIntervalMs: 500 };
+    // Discord renders all of: action-row buttons, select menus, native polls,
+    // rich components (cards/embeds). See runtime block wiring in
+    // src/team/src/factory.ts — the agent reads this to pick tools.
+    readonly capabilities: readonly InteractiveCapability[] = [
+        'buttons',
+        'select',
+        'polls',
+        'components',
+        'reactions',
+        'typing',
+        'edit-message',
+    ];
 
     private client: import('discord.js').Client | null = null;
     private readonly channelConfig: DiscordChannelConfig;
@@ -46,6 +142,10 @@ export class DiscordChannel extends BaseChannel {
                     GatewayIntentBits.DirectMessages,
                     GatewayIntentBits.MessageContent,
                     GatewayIntentBits.GuildMessageReactions,
+                    // Poll vote events — required for MessagePollVoteAdd to
+                    // fire. Without these the agent is blind to poll results.
+                    GatewayIntentBits.GuildMessagePolls,
+                    GatewayIntentBits.DirectMessagePolls,
                 ],
                 partials: [Partials.Channel, Partials.Message],
             });
@@ -72,6 +172,31 @@ export class DiscordChannel extends BaseChannel {
                 if (!isDM && !this.isGuildAllowed(msg.guildId, msg.channelId)) return;
                 if (!this.isAllowed(peerId, peerType)) return;
 
+                if (!msg.content && msg.attachments.size === 0) return;
+
+                const media: Media[] = [];
+                for (const att of msg.attachments.values()) {
+                    const ct = att.contentType ?? '';
+                    if (ct.startsWith('image/') && att.size <= MAX_IMAGE_BYTES) {
+                        const dl = await downloadAsBase64(att.url);
+                        media.push(dl
+                            ? { type: 'image', data: dl.data, mimeType: dl.mimeType, fileName: att.name }
+                            : { type: 'image', url: att.url, mimeType: ct, fileName: att.name },
+                        );
+                    } else if (ct.startsWith('video/')) {
+                        media.push({ type: 'video', url: att.url, mimeType: ct, fileName: att.name, fileSize: att.size });
+                    } else {
+                        media.push({ type: 'document', url: att.url, mimeType: ct || undefined, fileName: att.name, fileSize: att.size });
+                    }
+                }
+
+                let body = msg.content;
+                let synthetic = false;
+                if (!body && media.length > 0) {
+                    body = media[0]!.type === 'image' ? '[Image]' : `[${media[0]!.fileName ?? 'File'}]`;
+                    synthetic = true;
+                }
+
                 const normalized: Message = {
                     id: msg.id,
                     channelName: this.name,
@@ -81,15 +206,101 @@ export class DiscordChannel extends BaseChannel {
                         name: isDM ? msg.author.username : (msg.channel as { name?: string }).name,
                     },
                     sender: { id: senderId, name: msg.author.username },
-                    body: msg.content,
+                    body,
+                    synthetic: synthetic || undefined,
                     timestamp: msg.createdAt.toISOString(),
                     replyTo: msg.reference?.messageId ? { id: msg.reference.messageId } : undefined,
+                    media: media.length > 0 ? media : undefined,
                 };
 
                 await this.emit('onMessage', normalized);
             });
 
+            // Poll votes round-trip as synthesized user messages
+            // `Voted "Option" in a poll.` — same pattern as button clicks.
+            // Lets the agent read vote signals through the normal message
+            // pipeline. Fires once per user, not per tally change.
+            this.client.on(Events.MessagePollVoteAdd, async (pollAnswer, userId) => {
+                try {
+                    const answerText =
+                        (pollAnswer as { text?: string }).text ??
+                        `option ${(pollAnswer as { id?: number }).id ?? '?'}`;
+                    const pollMsg = (pollAnswer as { poll?: { channelId?: string; messageId?: string } }).poll;
+                    const channelId = pollMsg?.channelId;
+                    if (!channelId) return;
+
+                    // Try to resolve voter username — best effort.
+                    let voterName: string | undefined;
+                    try {
+                        const user = await this.client!.users.fetch(userId);
+                        voterName = user.username;
+                    } catch {
+                        /* fall through without name */
+                    }
+
+                    const fetched = await this.client!.channels.fetch(channelId).catch(() => null);
+                    const isDM =
+                        !fetched ||
+                        ('type' in fetched && fetched.type === ChannelType.DM);
+                    const peerId = isDM ? userId : channelId;
+                    const peerType = (isDM ? 'user' : 'group') as 'user' | 'group';
+
+                    const msg: Message = {
+                        id: `poll:${channelId}:${pollMsg?.messageId ?? 'x'}:${userId}:${Date.now()}`,
+                        channelName: this.name,
+                        peer: { id: peerId, type: peerType, ...(voterName && { name: voterName }) },
+                        ...(!isDM && voterName && {
+                            sender: { id: userId, name: voterName },
+                        }),
+                        body: `Voted "${answerText}" in a poll.`,
+                        timestamp: new Date().toISOString(),
+                    };
+                    await this.emit('onMessage', msg);
+                } catch (err) {
+                    this.log.warn({ err, op: 'pollVoteAdd' }, 'poll vote handler failed');
+                }
+            });
+
             this.client.on(Events.InteractionCreate, async (interaction) => {
+                // Button taps arrive here as MessageComponent interactions
+                // with a `custom_id` equal to the button's value we set at
+                // send time. We ack immediately (avoids the "This
+                // interaction failed" toast after 3 seconds), then emit
+                // onInteraction so ChannelWorker can synthesize a user
+                // message from the custom_id.
+                if (interaction.isButton()) {
+                    const isDM = !interaction.guildId;
+                    const peerId = isDM ? interaction.user.id : interaction.channelId ?? interaction.user.id;
+                    const peerType = isDM ? ('user' as const) : ('group' as const);
+
+                    if (!isDM && !this.isGuildAllowed(interaction.guildId, interaction.channelId!)) {
+                        await interaction.reply({ content: 'Not available here.', ephemeral: true }).catch(() => {});
+                        return;
+                    }
+                    if (!this.isAllowed(peerId, peerType)) {
+                        await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {});
+                        return;
+                    }
+
+                    // Silent deferUpdate acknowledges without posting
+                    // anything visible — the subsequent reply from the
+                    // agent carries the user-facing response.
+                    await interaction.deferUpdate().catch(() => {});
+
+                    const callback: InteractionCallback = {
+                        type: 'button_click',
+                        value: interaction.customId,
+                        messageId: interaction.message.id,
+                        peer: { id: peerId, type: peerType },
+                        sender: {
+                            id: interaction.user.id,
+                            name: interaction.user.username,
+                        },
+                    };
+                    await this.emit('onInteraction', callback);
+                    return;
+                }
+
                 if (!interaction.isChatInputCommand()) return;
 
                 const senderId = interaction.user.id;
@@ -164,6 +375,11 @@ export class DiscordChannel extends BaseChannel {
         if (!this.client) throw new Error('Discord not connected');
 
         const files = this.buildFileAttachments(message);
+        // discord.js accepts raw JSON components via the `components` field
+        // when its types are loose; we build our own and cast to satisfy TS.
+        const components = message.interactive
+            ? buildDiscordComponents(message.interactive)
+            : undefined;
 
         if (message.replyTo) {
             const pending = this.pendingInteractions.get(message.replyTo);
@@ -174,6 +390,7 @@ export class DiscordChannel extends BaseChannel {
                 const reply = await interaction.editReply({
                     content: (message.body ?? '').slice(0, MAX_DISCORD_LENGTH),
                     ...(files.length && { files }),
+                    ...(components && { components: components as unknown as never }),
                 });
                 return reply.id;
             }
@@ -185,14 +402,59 @@ export class DiscordChannel extends BaseChannel {
             const sent = await channel.send({
                 content: message.body ? message.body.slice(0, MAX_DISCORD_LENGTH) : undefined,
                 files,
+                ...(components && { components: components as unknown as never }),
             });
             return sent.id;
         }
 
+        // Reply-threading is only useful in group/guild channels where
+        // multiple speakers make attribution ambiguous. In DMs it just adds
+        // visual clutter ("Bot replied to your message: ...") in a two-party
+        // conversation, so skip it there.
+        const isDM = message.peer.type === 'user';
         const sent = await channel.send({
             content: (message.body ?? '').slice(0, MAX_DISCORD_LENGTH),
-            ...(message.replyTo && { reply: { messageReference: message.replyTo } }),
+            ...(!isDM && message.replyTo && { reply: { messageReference: message.replyTo } }),
+            ...(components && { components: components as unknown as never }),
         });
+        return sent.id;
+    }
+
+    /**
+     * Native Discord poll. discord.js's `PollData` shape (camelCase,
+     * flat answers) — NOT the raw Discord API schema (snake_case +
+     * `poll_media` wrapper). Limits:
+     *   - question ≤ 300 chars, 2-10 options each ≤ 55 chars
+     *   - duration in HOURS, range 1-768 (32 days)
+     *   - layoutType 1 is the only shipped layout; discord.js currently
+     *     requires it explicitly for the payload to serialize.
+     *   - allowMultiselect (camelCase) controls multi-vote
+     */
+    async sendPoll(args: {
+        peer: Peer;
+        question: string;
+        options: readonly string[];
+        anonymous?: boolean;
+        allowMultiple?: boolean;
+        durationHours?: number;
+    }): Promise<string> {
+        if (!this.client) throw new Error('Discord not connected');
+        const channel = await this.resolveTextChannel(args.peer);
+        const durationHours = Math.min(
+            768,
+            Math.max(1, Math.round(args.durationHours ?? 24)),
+        );
+        const sent = await channel.send({
+            poll: {
+                question: { text: args.question.slice(0, 300) },
+                answers: args.options.slice(0, 10).map((o) => ({
+                    text: o.slice(0, 55),
+                })),
+                duration: durationHours,
+                allowMultiselect: args.allowMultiple ?? false,
+                layoutType: 1,
+            },
+        } as unknown as never);
         return sent.id;
     }
 

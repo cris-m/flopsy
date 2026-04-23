@@ -1,14 +1,11 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
+    "composite": true,
+    "declaration": true,
+    "declarationMap": true,
     "outDir": "./dist",
-    "rootDir": "./src",
-    "paths": {
-      "@gateway/*": ["./src/*"],
-      "@gateway/types": ["./src/types/index.ts"],
-      "@gateway/core/*": ["./src/core/*"],
-      "@gateway/channels/*": ["./src/channels/*"]
-    }
+    "rootDir": "./src"
   },
   "include": ["src"],
   "references": [{ "path": "../shared" }]

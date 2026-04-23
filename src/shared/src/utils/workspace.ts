@@ -9,14 +9,24 @@ import { existsSync, mkdirSync } from 'fs';
  * 1. `FLOPSY_HOME` env var (explicit override)
  * 2. `FLOPSY_PROFILE` env var → `~/.flopsy-{profile}`
  * 3. Default → `~/.flopsy`
+ *
+ * `anchorDir` controls how a RELATIVE FLOPSY_HOME is interpreted:
+ *   - absent → `resolve(override)` uses process.cwd() (legacy behaviour).
+ *   - present → relative paths anchor to `anchorDir` (usually the dir
+ *     containing flopsy.json5). Gateway's main.ts and CLI's config-reader
+ *     both pass the config dir so running from any subdirectory yields
+ *     the same workspace.
  */
-export function resolveFlopsyHome(env: NodeJS.ProcessEnv = process.env): string {
+export function resolveFlopsyHome(
+    env: NodeJS.ProcessEnv = process.env,
+    anchorDir?: string,
+): string {
     const override = env.FLOPSY_HOME?.trim();
     if (override) {
         if (override.startsWith('~')) {
             return resolve(override.replace(/^~(?=$|[\\/])/, homedir()));
         }
-        return resolve(override);
+        return anchorDir ? resolve(anchorDir, override) : resolve(override);
     }
 
     const profile = env.FLOPSY_PROFILE?.trim();
@@ -32,11 +42,27 @@ export function resolveFlopsyHome(env: NodeJS.ProcessEnv = process.env): string 
     return join(homedir(), '.flopsy');
 }
 
-/**
- * Join path segments onto the workspace root.
- */
 export function resolveWorkspacePath(...parts: string[]): string {
     return join(resolveFlopsyHome(), ...parts);
+}
+
+/**
+ * Bootstrap-time helper: if `FLOPSY_HOME` is set and RELATIVE (neither
+ * absolute nor tilde-prefixed), rewrite it in `process.env` so every
+ * downstream `resolveFlopsyHome()` / `workspace.*` call sees an
+ * absolute path. Callers pass the dir that relative paths should
+ * anchor to — usually the directory containing `flopsy.json5`.
+ *
+ * Returns the resolved absolute home (whatever `resolveFlopsyHome`
+ * would now return). Safe to call more than once; idempotent.
+ */
+export function primeFlopsyHome(anchorDir: string): string {
+    const override = process.env.FLOPSY_HOME?.trim();
+    if (override && !override.startsWith('~')) {
+        const abs = resolve(anchorDir, override);
+        if (abs !== override) process.env.FLOPSY_HOME = abs;
+    }
+    return resolveFlopsyHome();
 }
 
 /**

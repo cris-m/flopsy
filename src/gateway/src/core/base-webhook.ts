@@ -34,6 +34,17 @@ export class WebhookServer {
         this.routes.set(pathPrefix, handler);
     }
 
+    /** User-safe snapshot accessors for `/status`. Never exposes the route paths themselves. */
+    get isRunning(): boolean {
+        return this.server !== null;
+    }
+    get port(): number | undefined {
+        return this.config?.port;
+    }
+    get routeCount(): number {
+        return this.routes.size;
+    }
+
     async start(config: WebhookConfig): Promise<void> {
         this.config = config;
         const host = config.host ?? '127.0.0.1';
@@ -188,32 +199,32 @@ export class WebhookServer {
             'webhook-timestamp',
 
             // ─── Source Control ────────────────────────────────────────────
-            'x-gitlab-token',            // GitLab
+            'x-gitlab-token', // GitLab
 
             // ─── CI/CD ─────────────────────────────────────────────────────
-            'circleci-signature',        // CircleCI
-            'signature',                 // Travis CI (bare — no x- prefix)
+            'circleci-signature', // CircleCI
+            'signature', // Travis CI (bare — no x- prefix)
 
             // ─── Payments ──────────────────────────────────────────────────
             'stripe-signature',
             'paddle-signature',
             'x-razorpay-signature',
             'paypal-transmission-sig',
-            'paypal-cert-url',           // PayPal asymmetric cert retrieval
+            'paypal-cert-url', // PayPal asymmetric cert retrieval
             'x-square-hmacsha256-signature',
             'x-lemon-squeezy-signature',
 
             // ─── E-commerce ────────────────────────────────────────────────
             'x-shopify-hmac-sha256',
-            'x-wc-webhook-signature',    // WooCommerce
+            'x-wc-webhook-signature', // WooCommerce
 
             // ─── Messaging / Comms ─────────────────────────────────────────
             'x-slack-signature',
             'x-twilio-signature',
             'x-twilio-email-event-webhook-signature', // SendGrid (ECDSA)
             'x-twilio-email-event-webhook-timestamp', // SendGrid timestamp
-            'x-zm-signature',            // Zoom
-            'x-zoom-signature',          // Zoom (alternate)
+            'x-zm-signature', // Zoom
+            'x-zoom-signature', // Zoom (alternate)
             'x-line-signature',
 
             // ─── Email Deliverability ──────────────────────────────────────
@@ -228,7 +239,7 @@ export class WebhookServer {
 
             // ─── Project Management / Productivity ────────────────────────
             'x-linear-signature',
-            'x-hook-signature',          // Asana
+            'x-hook-signature', // Asana
             'x-pagerduty-signature',
 
             // ─── CRM / Marketing ───────────────────────────────────────────
@@ -262,8 +273,8 @@ export class WebhookServer {
             'mux-signature',
 
             // ─── Gaming / Social ───────────────────────────────────────────
-            'x-signature-ed25519',       // Discord (Ed25519 asymmetric)
-            'x-signature-timestamp',     // Discord (paired with above)
+            'x-signature-ed25519', // Discord (Ed25519 asymmetric)
+            'x-signature-timestamp', // Discord (paired with above)
 
             // ─── DevOps / Cloud ────────────────────────────────────────────
             'x-vercel-signature',

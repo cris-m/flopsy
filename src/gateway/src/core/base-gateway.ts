@@ -1,8 +1,16 @@
 import { randomUUID } from 'crypto';
+import { execFileSync } from 'child_process';
 import { createLogger } from '@flopsy/shared';
 import { WebSocketServer, WebSocket } from 'ws';
 import type { IncomingMessage } from 'http';
-import type { Gateway, GatewayConfig, Channel, Message } from '@gateway/types';
+import type {
+    Gateway,
+    GatewayConfig,
+    Channel,
+    ChannelStatus,
+    Message,
+    InteractionCallback,
+} from '@gateway/types';
 import {
     sanitizeInbound,
     sanitize,
@@ -17,6 +25,28 @@ const DEFAULT_DEDUP_TTL_MS = 30_000;
 const DEFAULT_MAX_DEDUP_ENTRIES = 10_000;
 const DEDUP_SWEEP_INTERVAL_MS = 60_000;
 const MAX_PAYLOAD = 1 * 1024 * 1024;
+
+/**
+ * Resolve the build identity at module-load time. Prefers git short-sha
+ * (`1a2b3c4`) so the user can tell which build answered their message;
+ * falls back to `dev` when git isn't available (CI builds, npm-installed
+ * package, etc). Uses execFileSync (no shell) with a fixed argv and a
+ * 500ms timeout — cached in module scope so every snapshot read is free.
+ */
+const BUILD_VERSION: string = (() => {
+    try {
+        const sha = execFileSync('git', ['rev-parse', '--short', 'HEAD'], {
+            stdio: ['ignore', 'pipe', 'ignore'],
+            timeout: 500,
+        })
+            .toString()
+            .trim();
+        if (sha.length > 0) return sha;
+    } catch {
+        // git missing, not a repo, or subprocess denied — fall through.
+    }
+    return 'dev';
+})();
 
 export type EventType =
     | 'message.inbound'
@@ -50,6 +80,7 @@ export abstract class BaseGateway implements Gateway {
     private readonly _channels = new Map<string, Channel>();
     private readonly dedup = new Map<string, number>();
     private dedupSweep: ReturnType<typeof setInterval> | null = null;
+    private readonly startedAt = Date.now();
     private readonly handlers = new Map<
         string,
         (client: WsClient, params?: Record<string, unknown>) => Promise<unknown>
@@ -72,10 +103,37 @@ export abstract class BaseGateway implements Gateway {
         return this._channels;
     }
 
+    /**
+     * Build a user-safe snapshot for the `/status` slash command. Deliberately
+     * excludes tokens, peer ids, webhook URLs, and anything else that might
+     * leak across users. Subclasses can override to add more context
+     * (webhook / proactive engine state) — they should spread the baseline
+     * and then add their extras.
+     */
+    getStatusSnapshot(): {
+        uptimeMs: number;
+        channels: Array<{ name: string; status: ChannelStatus; enabled: boolean }>;
+        port?: number;
+        version?: string;
+    } {
+        const channels = [...this._channels.values()].map((ch) => ({
+            name: ch.name,
+            status: ch.status,
+            enabled: ch.enabled,
+        }));
+        return {
+            uptimeMs: Date.now() - this.startedAt,
+            channels,
+            port: this.config.port,
+            version: BUILD_VERSION,
+        };
+    }
+
     private readonly channelHandlers = new Map<
         string,
         {
             onMessage: (msg: Message) => Promise<void>;
+            onInteraction: (callback: InteractionCallback) => Promise<void>;
             onStatusChange: (status: string) => void;
             onError: (err: Error) => void;
             onQR: (qr: string) => void;
@@ -90,6 +148,31 @@ export abstract class BaseGateway implements Gateway {
 
         const handlers = {
             onMessage: (msg: Message) => this.handleInbound(msg),
+            // Button taps / select choices become synthesized user messages
+            // with body = callback.value. This lets the rest of the stack
+            // (router, worker, interceptors) treat a tap identically to
+            // the user typing "go" / "edit" / "no" — no separate interaction
+            // pipeline needed. The id is derived so dedup still works.
+            onInteraction: async (cb: InteractionCallback) => {
+                const synthesized: Message = {
+                    id: `interact:${channel.name}:${cb.messageId}:${cb.value}:${Date.now()}`,
+                    channelName: channel.name,
+                    peer: cb.peer,
+                    sender: cb.sender,
+                    body: cb.value,
+                    timestamp: new Date().toISOString(),
+                };
+                this.log.info(
+                    {
+                        channel: channel.name,
+                        peer: cb.peer.id,
+                        value: cb.value,
+                        originalMessageId: cb.messageId,
+                    },
+                    'interaction synthesized as inbound message',
+                );
+                await this.handleInbound(synthesized);
+            },
             onStatusChange: (status: string) =>
                 this.broadcast('channel.status', { channel: channel.name, status }),
             onError: (err: Error) => {
@@ -101,6 +184,7 @@ export abstract class BaseGateway implements Gateway {
         this.channelHandlers.set(channel.name, handlers);
 
         channel.on('onMessage', handlers.onMessage);
+        channel.on('onInteraction', handlers.onInteraction);
         channel.on('onStatusChange', handlers.onStatusChange);
         channel.on('onError', handlers.onError);
         channel.on('onQR', handlers.onQR);
@@ -115,6 +199,7 @@ export abstract class BaseGateway implements Gateway {
         const handlers = this.channelHandlers.get(name);
         if (handlers) {
             channel.off('onMessage', handlers.onMessage);
+            channel.off('onInteraction', handlers.onInteraction);
             channel.off('onStatusChange', handlers.onStatusChange);
             channel.off('onError', handlers.onError);
             channel.off('onQR', handlers.onQR);
@@ -151,18 +236,39 @@ export abstract class BaseGateway implements Gateway {
         this.wss.on('connection', (ws, req) => this.handleConnection(ws, req));
         this.wss.on('error', (err) => this.log.error({ err }, 'websocket server error'));
 
+        // Track connect results directly. Can't derive from `channel.status`
+        // at summary time because several channels set their status async
+        // (via onStatusChange) after `connect()` returns — status would
+        // still say 'connecting' here and discord/telegram would look
+        // falsely failed in the summary.
+        const connected: string[] = [];
+        const failed: string[] = [];
         for (const channel of this._channels.values()) {
             if (!channel.enabled) continue;
             try {
                 await channel.connect();
-                this.log.debug({ channel: channel.name }, 'channel connected');
+                // User-observable state change — a channel going live is
+                // the kind of thing an operator wants to see without
+                // enabling DEBUG logs.
+                this.log.info({ channel: channel.name }, 'channel connected');
+                connected.push(channel.name);
             } catch (err) {
                 this.log.error({ channel: channel.name, err }, 'channel failed to connect');
+                failed.push(channel.name);
             }
         }
 
         await this.onStart();
-        this.log.info({ port, host }, 'gateway started');
+        this.log.info(
+            {
+                port,
+                host,
+                channelsConnected: connected,
+                channelsFailed: failed.length > 0 ? failed : undefined,
+                version: BUILD_VERSION,
+            },
+            'gateway started',
+        );
     }
 
     async stop(): Promise<void> {

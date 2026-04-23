@@ -8,10 +8,14 @@ export type {
     BackgroundTask,
     ChannelEvent,
     IEventQueue,
+    InboundMedia,
     ITaskStore,
     InvokeRole,
     StreamingCallbacks,
     TaskStatus,
+    TaskStatusSummary,
+    TeamMemberStatus,
+    ThreadStatusSnapshot,
 } from './agent';
 
 export type {
@@ -33,6 +37,7 @@ export type {
     AuthType,
     Channel,
     ChannelWorkerConfig,
+    GatewayStatusSnapshot,
     BaseChannelConfig,
     StreamingCapability,
     WebhookChannel,

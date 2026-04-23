@@ -64,11 +64,16 @@ export class JobExecutor {
                 response = result.response;
             } catch (err) {
                 const error = err instanceof Error ? err.message : String(err);
-                log.error({ jobId: job.id, err }, 'Agent call failed');
+                log.error({ jobId: job.id, threadId, err }, 'Agent call failed');
                 return this.finalizeError(job, jobState, startedAt, error);
             } finally {
                 if (!job.threadId) {
-                    await this.threadCleaner(threadId).catch(() => {});
+                    await this.threadCleaner(threadId).catch((cleanupErr: unknown) => {
+                        log.warn(
+                            { err: cleanupErr, jobId: job.id, threadId, op: 'threadCleaner' },
+                            'ephemeral thread cleanup failed — potential memory leak',
+                        );
+                    });
                 }
             }
 
@@ -101,7 +106,12 @@ export class JobExecutor {
             return this.finalizeError(job, jobState, startedAt, error);
         } finally {
             if (!job.threadId) {
-                await this.threadCleaner(threadId).catch(() => {});
+                await this.threadCleaner(threadId).catch((cleanupErr: unknown) => {
+                    log.warn(
+                        { err: cleanupErr, jobId: job.id, threadId, op: 'threadCleaner:silent' },
+                        'silent-mode ephemeral thread cleanup failed',
+                    );
+                });
             }
         }
     }
