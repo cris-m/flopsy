@@ -95,6 +95,14 @@ export interface CreateTeamMemberOptions {
      * namespace (gandalf only).
      */
     readonly memoryNamespace?: string;
+    /**
+     * Per-model-call timeout in ms. When a single LLM call stalls beyond this,
+     * the graph throws ProviderError(statusCode=0) which triggers model-fallback
+     * to switch to the next candidate — before the outer turn wall-clock hits.
+     * Defaults to flopsygraph's built-in 90_000 (90s). Set to e.g. 45_000 when
+     * the primary model is slow and you want fallback to fire promptly.
+     */
+    readonly modelCallTimeoutMs?: number;
 }
 
 export interface TeamRosterEntry {
@@ -403,6 +411,9 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
         // cosine matches instead of empty results.
         ...(opts.memoryStore ? { memoryStore: opts.memoryStore } : {}),
         memoryNamespace: opts.memoryNamespace ?? `memories:${def.name}`,
+        ...(opts.modelCallTimeoutMs !== undefined
+            ? { modelCallTimeoutMs: opts.modelCallTimeoutMs }
+            : {}),
     }) as unknown as WorkerGraph;
 
     log.info(

@@ -742,6 +742,10 @@ export class TeamHandler implements AgentHandler {
             // each get an isolated `memories:<name>` namespace (set by
             // factory default) to prevent cross-worker key collisions.
             memoryNamespace: 'memories',
+            // Per-model-call timeout: if the primary model stalls beyond this,
+            // flopsygraph throws ProviderError(0) which triggers model-fallback
+            // to switch to the next candidate — well before the 10-min turn wall.
+            modelCallTimeoutMs: 45_000,
         });
 
         const registry = new TaskRegistry();
@@ -851,6 +855,7 @@ export class TeamHandler implements AgentHandler {
                     // see only __search_tools__/__load_tool__ until they
                     // explicitly activate an MCP tool.
                     extraDynamicTools: workerMcpTools,
+                    modelCallTimeoutMs: 60_000,
                 });
 
                 try {

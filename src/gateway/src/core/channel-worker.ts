@@ -22,7 +22,7 @@ const MAX_PENDING = 100;
 // Ollama models with a large system prompt can chew through 2-3 min easily
 // when thinking about which of 13 tools to call; 5 min gives headroom without
 // letting a truly stuck turn hold a channel forever.
-const AGENT_TIMEOUT_MS = 300_000; // 5 min
+const AGENT_TIMEOUT_MS = 600_000; // 10 min
 // Retrigger turn (processing a <task-notification> into a user reply). Bigger
 // because the input can be a 10 KB research result the agent has to distill.
 const BACKGROUND_TURN_TIMEOUT_MS = 900_000; // 15 min
@@ -417,7 +417,7 @@ export class ChannelWorker {
 
         const { promise: timeoutPromise, cleanup: timeoutCleanup } = rejectAfterTimeout(
             timeoutMs,
-            abort.signal,
+            abort,
         );
 
         try {
@@ -753,12 +753,16 @@ function sleep(ms: number): Promise<void> {
 
 function rejectAfterTimeout(
     ms: number,
-    signal: AbortSignal,
+    abort: AbortController,
 ): { promise: Promise<never>; cleanup: () => void } {
     let timer: ReturnType<typeof setTimeout>;
     const promise = new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error('Agent invocation timed out')), ms);
-        signal.addEventListener('abort', () => clearTimeout(timer), { once: true });
+        timer = setTimeout(() => {
+            // Abort the graph so it stops executing (not just orphaned).
+            abort.abort(new Error('Agent invocation timed out'));
+            reject(new Error('Agent invocation timed out'));
+        }, ms);
+        abort.signal.addEventListener('abort', () => clearTimeout(timer), { once: true });
     });
     const cleanup = (): void => {
         clearTimeout(timer!);
