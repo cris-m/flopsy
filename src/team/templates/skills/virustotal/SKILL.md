@@ -1,5 +1,6 @@
 ---
 name: virustotal
+compatibility: Designed for FlopsyBot agent
 description: Investigate files, URLs, IPs, and domains for malware and threats using VirusTotal. Use when the user asks about suspicious files, phishing URLs, IP reputation, or domain safety.
 ---
 

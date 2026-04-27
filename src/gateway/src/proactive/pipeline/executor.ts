@@ -1,9 +1,10 @@
+import { z } from 'zod';
 import { createLogger } from '@flopsy/shared';
+import { structuredLLM, type BaseChatModel } from 'flopsygraph';
 import type { ChannelRouter } from '../delivery/router';
 import type { StateStore } from '../state/store';
 import { getDefaultJobState } from '../state/store';
 import type { PresenceManager } from '../state/presence';
-import type { QueueManager } from '../state/queue';
 import type { RetryQueue } from '../state/retry-queue';
 import type {
     ExecutionJob,
@@ -13,19 +14,70 @@ import type {
     ThreadCleaner,
 } from '../types';
 import { BACKOFF_SCHEDULE_MS } from '../types';
+import type { ProactiveDedupStore } from '../state/dedup-store';
+import type { ProactiveEmbedder } from '../engine';
+import {
+    buildAntiRepetitionContext,
+    parseReportedLines,
+    stripReportedLines,
+} from './context';
+
+const reportedIdsSchema = z.object({
+    emails: z.array(z.string()).optional(),
+    meetings: z.array(z.string()).optional(),
+    tasks: z.array(z.string()).optional(),
+    news: z.array(z.string()).optional(),
+});
+
+const proactiveOutputSchema = z.object({
+    shouldDeliver: z.boolean(),
+    message: z.string(),
+    reason: z.string(),
+    topics: z.array(z.string()).optional(),
+    reportedIds: reportedIdsSchema.optional(),
+    actions: z.array(z.string()).optional(),
+});
+
+type ProactiveOutput = z.infer<typeof proactiveOutputSchema>;
+
+export interface JobExecutorOptions {
+    embedder?: ProactiveEmbedder;
+    /**
+     * Raw chat model (typed `unknown` at the engine boundary, cast to
+     * BaseChatModel here) for flopsygraph's `structuredLLM()` reformatter.
+     * When present, conditional-mode replies are funneled through provider-
+     * enforced structured output with built-in retry.
+     */
+    structuredOutputModel?: unknown;
+    similarityThreshold: number;
+    similarityWindowMs: number;
+}
 
 const log = createLogger('job-executor');
 
 export class JobExecutor {
+    private readonly embedder?: ProactiveEmbedder;
+    private readonly structuredOutputModel?: BaseChatModel;
+    private readonly similarityThreshold: number;
+    private readonly similarityWindowMs: number;
+
     constructor(
         private readonly agentCaller: AgentCaller,
         private readonly threadCleaner: ThreadCleaner,
         private readonly router: ChannelRouter,
         private readonly store: StateStore,
+        private readonly dedupStore: ProactiveDedupStore,
         private readonly presence: PresenceManager,
-        private readonly queue: QueueManager,
         private readonly retryQueue: RetryQueue,
-    ) {}
+        options: JobExecutorOptions,
+    ) {
+        if (options.embedder) this.embedder = options.embedder;
+        if (options.structuredOutputModel) {
+            this.structuredOutputModel = options.structuredOutputModel as BaseChatModel;
+        }
+        this.similarityThreshold = options.similarityThreshold;
+        this.similarityWindowMs = options.similarityWindowMs;
+    }
 
     async execute(job: ExecutionJob): Promise<ExecutionResult> {
         const startedAt = Date.now();
@@ -57,11 +109,27 @@ export class JobExecutor {
             }
 
             const threadId = job.threadId ?? `proactive:${job.id}:${Date.now()}`;
+            const contextBlock = buildAntiRepetitionContext(this.store, this.dedupStore);
+            const augmentedPrompt = contextBlock ? contextBlock + job.prompt : job.prompt;
             let response: string;
+            // `structured` is populated via one of two paths:
+            //  1. StructuredLLM second pass (preferred — provider-enforced JSON
+            //     with up to 2 retries on validation failure)
+            //  2. Post-hoc JSON extraction by agent-bridge when no
+            //     structuredOutputModel is configured (legacy fallback)
+            let structured: ProactiveOutput | undefined;
 
             try {
-                const result = await this.agentCaller(job.prompt, { threadId });
+                const passSchemaToAgent =
+                    job.deliveryMode === 'conditional' && !this.structuredOutputModel;
+                const agentOptions = passSchemaToAgent
+                    ? { threadId, responseSchema: proactiveOutputSchema }
+                    : { threadId };
+                const result = await this.agentCaller(augmentedPrompt, agentOptions);
                 response = result.response;
+                if (passSchemaToAgent) {
+                    structured = (result as { structured?: ProactiveOutput }).structured;
+                }
             } catch (err) {
                 const error = err instanceof Error ? err.message : String(err);
                 log.error({ jobId: job.id, threadId, err }, 'Agent call failed');
@@ -77,15 +145,43 @@ export class JobExecutor {
                 }
             }
 
+            // Track REPORTED: IDs from raw response regardless of mode — the
+            // agent may emit them even in `always` mode. Fire-and-forget since
+            // tracking failures must not suppress delivery.
+            this.recordReportedFromText(response, job).catch((err) =>
+                log.debug({ err, jobId: job.id }, 'REPORTED: parse failed'),
+            );
+
             if (!response?.trim()) {
                 return this.finalize(job, jobState, startedAt, 'suppressed');
             }
 
-            if (job.deliveryMode === 'conditional') {
-                return this.executeConditional(job, jobState, startedAt, response);
+            // Second-pass reformatter: when a structured-output model is
+            // configured, funnel the agent's free-form reply through
+            // flopsygraph's StructuredLLM to produce a schema-valid
+            // ProactiveOutput. This is provider-enforced + retries on
+            // validation failure, so `structured.message` becomes the
+            // canonical delivery content (no more post-hoc regex extraction).
+            if (
+                job.deliveryMode === 'conditional' &&
+                this.structuredOutputModel &&
+                !structured
+            ) {
+                structured = await this.reformatToStructured(response, job).catch((err) => {
+                    log.warn(
+                        { jobId: job.id, err: err instanceof Error ? err.message : String(err) },
+                        'StructuredLLM reformat failed — falling back to raw response',
+                    );
+                    return undefined;
+                });
             }
 
-            return this.deliverResponse(job, jobState, startedAt, response);
+            if (job.deliveryMode === 'conditional') {
+                return this.executeConditional(job, jobState, startedAt, response, structured);
+            }
+
+            const cleanResponse = stripReportedLines(response);
+            return this.deliverResponse(job, jobState, startedAt, cleanResponse);
         } finally {
             jobState.isExecuting = false;
             await this.store.setJobState(job.id, jobState);
@@ -121,7 +217,40 @@ export class JobExecutor {
         jobState: ReturnType<typeof getDefaultJobState>,
         startedAt: number,
         response: string,
+        structured?: ProactiveOutput,
     ): Promise<ExecutionResult> {
+        if (structured) {
+            const topics = structured.topics ?? [];
+            if (structured.reportedIds) {
+                this.recordReportedIds(structured.reportedIds, job.id);
+            }
+
+            if (!structured.shouldDeliver) {
+                log.debug(
+                    { jobId: job.id, reason: structured.reason, topics },
+                    'Conditional: suppressed (structured)',
+                );
+                for (const t of topics) {
+                    await this.store.addTopic(t, job.id, false);
+                }
+                if (topics.length === 0) {
+                    await this.store.addTopic(job.name, job.id, false);
+                }
+                return this.finalize(job, jobState, startedAt, 'suppressed');
+            }
+
+            for (const t of topics) {
+                await this.store.addTopic(t, job.id, true);
+            }
+            return this.deliverResponse(
+                job,
+                jobState,
+                startedAt,
+                stripReportedLines(structured.message).slice(0, 4000),
+            );
+        }
+
+        // Fallback: legacy string-parsing for agents that haven't adopted JSON output
         const decision = parseConditionalResponse(response);
 
         if (!decision || decision.status === 'suppress') {
@@ -133,7 +262,62 @@ export class JobExecutor {
 
         const raw = decision.content ?? response;
         const content = typeof raw === 'string' ? raw.slice(0, 4000) : response;
-        return this.deliverResponse(job, jobState, startedAt, content);
+        return this.deliverResponse(job, jobState, startedAt, stripReportedLines(content));
+    }
+
+    /**
+     * Run the agent's free-form reply through flopsygraph's StructuredLLM
+     * using a raw BaseChatModel + the ProactiveOutput schema. This is a
+     * cheap second-pass ("reformatter") — the model doesn't re-reason or
+     * re-fetch, it just coerces the prior text into structured JSON.
+     *
+     * Throws if the model fails to produce valid output after retries.
+     */
+    private async reformatToStructured(
+        rawResponse: string,
+        job: ExecutionJob,
+    ): Promise<ProactiveOutput> {
+        const llm = structuredLLM(this.structuredOutputModel!, proactiveOutputSchema);
+        const systemPrompt =
+            `You are a formatter. The agent reply below came from a scheduled ` +
+            `proactive job named "${job.name}". Convert it into the target JSON schema:\n\n` +
+            `  - shouldDeliver: true if this is genuinely worth sending to the user now, false if nothing useful/new.\n` +
+            `  - message: the text to send (faithful to the agent's content, trimmed of meta).\n` +
+            `  - reason: one short sentence on why you chose shouldDeliver.\n` +
+            `  - topics: 1–4 short semantic tags (e.g. ["weather","stocks"]) so future runs know what was covered.\n` +
+            `  - reportedIds: any stable IDs mentioned (emails, meetings, tasks, news URLs) so they won't be re-reported.\n\n` +
+            `Do not re-reason. Preserve facts exactly as the agent wrote them.`;
+        const result = await llm.invoke([
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: rawResponse },
+        ]);
+        if (!result.ok) {
+            throw new Error(
+                `StructuredLLM failed after ${result.attempts} attempt(s): ${result.error.message}`,
+            );
+        }
+        return result.value;
+    }
+
+    private recordReportedIds(
+        reportedIds: NonNullable<ProactiveOutput['reportedIds']>,
+        source: string,
+    ): void {
+        for (const type of ['emails', 'meetings', 'tasks', 'news'] as const) {
+            const ids = reportedIds[type];
+            if (ids && ids.length > 0) {
+                this.dedupStore.markReported(type, ids, source);
+            }
+        }
+    }
+
+    private async recordReportedFromText(text: string, job: ExecutionJob): Promise<void> {
+        const parsed = parseReportedLines(text, job.name);
+        for (const type of ['emails', 'meetings', 'tasks', 'news'] as const) {
+            if (parsed[type].length > 0) {
+                this.dedupStore.markReported(type, parsed[type], job.id);
+            }
+        }
     }
 
     private async deliverResponse(
@@ -142,18 +326,42 @@ export class JobExecutor {
         startedAt: number,
         text: string,
     ): Promise<ExecutionResult> {
-        const activity = await this.presence.getActivityWindow();
-
-        if (activity === 'away' || activity === 'idle') {
-            await this.queue.enqueue({
-                content: text,
-                source: job.id,
-                priority: job.trigger === 'webhook' ? 10 : 5,
-                delivery: job.delivery,
-            });
-            log.debug({ jobId: job.id, activity }, 'User away/idle, queued for later');
-            return this.finalize(job, jobState, startedAt, 'queued');
+        let embedding: number[] | undefined;
+        if (this.embedder) {
+            try {
+                embedding = await this.embedder.embed(text);
+            } catch (err) {
+                log.warn({ jobId: job.id, err }, 'embedder failed — skipping similarity dedup');
+            }
         }
+
+        if (embedding) {
+            const match = this.dedupStore.findSimilar(
+                embedding,
+                this.similarityThreshold,
+                this.similarityWindowMs,
+            );
+            if (match) {
+                log.info(
+                    {
+                        jobId: job.id,
+                        similarity: match.similarity.toFixed(3),
+                        matchedSource: match.source,
+                        agoMs: Date.now() - match.deliveredAt,
+                    },
+                    'Suppressed — semantically similar delivery within window',
+                );
+                return this.finalize(job, jobState, startedAt, 'suppressed');
+            }
+        }
+
+        // Fire-and-deliver. No activity-window queueing — the only gate
+        // is explicit user intent (DND / quiet hours) already checked at
+        // executor.ts:102. This matches Hermes's cron semantics and
+        // sidesteps the queue-flood risk of holding messages through an
+        // away window (user returns → 15 pings at once = worse UX than
+        // just delivering them as they happen). Transport failures are
+        // still caught below and land in the retry queue with backoff.
 
         const result = await this.router.deliver(job.delivery, text);
 
@@ -174,7 +382,7 @@ export class JobExecutor {
         }
 
         await this.store.addDelivery(text, job.id);
-        await this.store.addTopic(job.name, job.id, true);
+        this.dedupStore.recordDelivery(job.id, text, embedding);
         return this.finalize(job, jobState, startedAt, 'delivered');
     }
 
@@ -249,7 +457,6 @@ function parseConditionalResponse(text: string): ConditionalResponse | null {
             return parsed as ConditionalResponse;
         }
     } catch {
-        // Not JSON — try to extract from markdown code block
         const match = text.match(/```json\s*\n([\s\S]*?)\n```/);
         if (match?.[1]) {
             try {

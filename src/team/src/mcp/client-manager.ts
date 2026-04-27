@@ -164,20 +164,43 @@ export class McpClientManager {
         if (!entry) {
             throw new Error(`MCP server "${serverName}" not connected`);
         }
-        const timeoutMs = options?.timeoutMs ?? McpClientManager.DEFAULT_CALL_TIMEOUT_MS;
-        const raw = (await Promise.race([
-            entry.client.callTool({ name: toolName, arguments: args }),
-            new Promise<never>((_, reject) =>
-                setTimeout(
+        // Resolution order: per-call override → per-server config → global default.
+        // callTimeoutMs === 0 means "no timeout" — we just await the call.
+        const timeoutMs =
+            options?.timeoutMs ??
+            entry.server.callTimeoutMs ??
+            McpClientManager.DEFAULT_CALL_TIMEOUT_MS;
+
+        let raw: { content?: NormalisedCallToolResult['content']; isError?: boolean } | { toolResult?: unknown };
+        if (timeoutMs <= 0) {
+            raw = (await entry.client.callTool({ name: toolName, arguments: args })) as
+                | { content?: NormalisedCallToolResult['content']; isError?: boolean }
+                | { toolResult?: unknown };
+        } else {
+            // Clear the timeout on both resolve and reject paths — otherwise every
+            // successful tool call leaves a pending timer behind for `timeoutMs`,
+            // pinning the event loop and delaying graceful shutdown under load.
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const timeoutPromise = new Promise<never>((_, reject) => {
+                timer = setTimeout(
                     () => reject(new Error(
                         `MCP callTool("${serverName}.${toolName}") timed out after ${timeoutMs}ms`,
                     )),
                     timeoutMs,
-                ),
-            ),
-        ])) as
-            | { content?: NormalisedCallToolResult['content']; isError?: boolean }
-            | { toolResult?: unknown };
+                );
+                timer.unref?.();
+            });
+            try {
+                raw = (await Promise.race([
+                    entry.client.callTool({ name: toolName, arguments: args }),
+                    timeoutPromise,
+                ])) as
+                    | { content?: NormalisedCallToolResult['content']; isError?: boolean }
+                    | { toolResult?: unknown };
+            } finally {
+                if (timer) clearTimeout(timer);
+            }
+        }
         if ('content' in raw && Array.isArray(raw.content)) {
             return { content: raw.content, ...(raw.isError ? { isError: true } : {}) };
         }

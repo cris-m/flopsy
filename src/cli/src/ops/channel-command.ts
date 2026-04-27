@@ -24,7 +24,7 @@ import { readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Command } from 'commander';
 import JSON5 from 'json5';
-import { bad, detail, dim, info, ok, row, section, table } from '../ui/pretty';
+import { detail, dim, info, ok, row, section, table } from '../ui/pretty';
 import { tint } from '../ui/theme';
 import { configPath, readFlopsyConfig } from './config-reader';
 
@@ -72,19 +72,6 @@ function writeConfig(path: string, parsed: Record<string, unknown>): void {
     const tmp = `${path}.tmp`;
     writeFileSync(tmp, JSON.stringify(parsed, null, 4) + '\n');
     renameSync(tmp, path);
-}
-
-/**
- * Get a nested value by dot-path. `dm.policy` returns `obj.dm.policy`.
- * Returns undefined when any segment is missing.
- */
-function getByPath(obj: Record<string, unknown>, path: string): unknown {
-    let cur: unknown = obj;
-    for (const part of path.split('.')) {
-        if (cur === null || typeof cur !== 'object') return undefined;
-        cur = (cur as Record<string, unknown>)[part];
-    }
-    return cur;
 }
 
 /**

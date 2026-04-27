@@ -30,7 +30,7 @@ Learnings are stored in `.flopsy/learning/reflection.json` and updated after sig
 1. Identify the topic and the specific insight
 2. Write the insight as a concise, actionable statement (e.g., "Always check X before doing Y")
 3. Record the context (what task or situation prompted this)
-4. Append to the learning store via the `learning_save` tool or by updating the reflection file
+4. Append to the learning store by updating the reflection file (`.flopsy/learning/reflection.json`) with a new entry; see the tool catalog for the current writer tool if available
 
 ### Reviewing Learnings
 1. Load the current learning store

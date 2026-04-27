@@ -26,9 +26,6 @@ const log = createLogger('mcp-bridge');
 const NAME_DELIMITER = '__';
 const MAX_RESULT_CHARS = 50_000;
 
-// Servers that do heavy file I/O — give them 2 minutes instead of 30s.
-const FILE_HEAVY_SERVERS = new Set(['obsidian', 'drive', 'filesystem', 'file_server']);
-
 export interface BridgedTool extends BaseTool {
     /** Server that owns this tool — for diagnostics + assignTo routing. */
     readonly mcpServer: string;
@@ -113,12 +110,12 @@ export function bridgeMcpTool(
         schema: toolSchema,
         execute: async (args) => {
             try {
-                // File-heavy servers (obsidian, drive, filesystem) need more
-                // than the default 30s — large vaults / big files can be slow.
-                const timeoutMs = FILE_HEAVY_SERVERS.has(server) ? 120_000 : undefined;
+                // No timeout override here — the client manager reads
+                // per-server `callTimeoutMs` from config and falls back to
+                // the 30s default. Set `mcp.servers.<name>.callTimeoutMs`
+                // in flopsy.json5 for file-heavy servers (obsidian, drive).
                 const result = await manager.callTool(
                     server, tool.name, args as Record<string, unknown>,
-                    timeoutMs ? { timeoutMs } : undefined,
                 );
                 return flattenResult(result);
             } catch (err) {

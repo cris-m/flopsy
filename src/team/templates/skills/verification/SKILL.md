@@ -48,7 +48,7 @@ It is easy to convince yourself that something works because you just wrote it. 
 - [ ] Does the created item have the correct details? (retrieve and compare)
 - [ ] Are there any conflicts with existing items?
 
-## Verification Workflow
+## Workflow
 
 1. **Identify what was done**: What action or change was just completed?
 2. **Select the right checklist**: Pick from the categories above (or adapt)

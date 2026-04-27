@@ -34,6 +34,16 @@ export class WebhookServer {
         this.routes.set(pathPrefix, handler);
     }
 
+    /**
+     * Remove a previously-registered route. Returns true if a route was
+     * removed. Used by `WebhookRouter.removeRuntimeRoute` when a runtime
+     * webhook is deleted via `flopsy schedule remove` — without it, routes
+     * would leak for the lifetime of the process.
+     */
+    unregisterRoute(pathPrefix: string): boolean {
+        return this.routes.delete(pathPrefix);
+    }
+
     /** User-safe snapshot accessors for `/status`. Never exposes the route paths themselves. */
     get isRunning(): boolean {
         return this.server !== null;

@@ -16,6 +16,7 @@
     "@hapi/boom": "^10.0.1",
     "@line/bot-sdk": "^10.6.0",
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "croner": "^10.0.1",
     "discord.js": "^14.25.1",
     "grammy": "^1.41.1",
     "json5": "^2.2.3",

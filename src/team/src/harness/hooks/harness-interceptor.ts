@@ -2,20 +2,19 @@ import { randomUUID } from 'crypto';
 import { createLogger } from '@flopsy/shared';
 import { BaseInterceptor } from 'flopsygraph';
 import type {
-    Interceptor,
     InterceptorContext,
     InterceptorModelContext,
     ModelCallIntercept,
     NodeResult,
 } from 'flopsygraph';
 import type { ChatMessage } from 'flopsygraph';
-import type { HarnessContext, AgentResponse, UserFeedback, Strategy, Lesson } from '@shared/types';
+import type { HarnessContext, AgentResponse, Strategy, Lesson } from '@shared/types';
 
 import { SignalDetector } from '../learning/signal-detector';
-import { LearningStore, getSharedLearningStore } from '../storage';
-import type { SkillEffectivenessEntry, FactRow } from '../storage';
+import { getSharedLearningStore } from '../storage';
+import type { FactRow, LearningStore } from '../storage';
 import { getAgentStateTracker } from '../state/agent-state';
-import { BackgroundReviewer } from '../review';
+import { BackgroundReviewer, FactConsolidator } from '../review';
 
 const log = createLogger('harness-interceptor');
 
@@ -43,6 +42,9 @@ export interface HarnessInterceptorConfig {
      * turns and writes new SKILL.md files to the workspace skills directory.
      */
     readonly backgroundReviewer?: BackgroundReviewer;
+
+    /** When provided, runs periodic fact deduplication (at most once per 24h). */
+    readonly factConsolidator?: FactConsolidator;
 }
 
 /**
@@ -51,13 +53,15 @@ export interface HarnessInterceptorConfig {
  * Lifecycle:
  *   1. onAgentStart    — load context snapshot (strategies/lessons/skills)
  *   2. beforeModelCall — inject frozen snapshot into system prompt
- *   3. enrichState     — mid-turn pending-message injection
- *   4. onNodeEnd       — detect signals, update effectiveness
- *   5. onAgentEnd      — finish tracking (SQLite auto-commits)
+ *   3. onNodeEnd       — detect signals, update effectiveness
+ *   4. onAgentEnd      — finish tracking (SQLite auto-commits)
  *
  * Holds a single `LearningStore` handle — no adapter façade — with data
  * scoped to one `userId` per interceptor instance. One interceptor per thread
  * keeps per-tenant state isolated.
+ *
+ * Mid-turn user-message injection is handled by flopsygraph's messageQueue
+ * interceptor (wired in factory.ts), not here.
  */
 export class HarnessInterceptor extends BaseInterceptor {
     readonly name = 'harness';
@@ -70,12 +74,12 @@ export class HarnessInterceptor extends BaseInterceptor {
     private readonly domain: string | undefined;
     private readonly signalDetector: SignalDetector;
     private readonly backgroundReviewer: BackgroundReviewer | undefined;
+    private readonly factConsolidator: FactConsolidator | undefined;
     private readonly stateTracker = getAgentStateTracker();
 
     private context: HarnessContext | null = null;
     private contextBlock: string | null = null;
     private toolCallsInTurn: Array<{ name: string; failed: boolean }> = [];
-    private pendingMessages: string[] = [];
     private agentId = '';
     private threadId = '';
     private completedTurns = 0;
@@ -87,6 +91,7 @@ export class HarnessInterceptor extends BaseInterceptor {
         this.domain = config.domain;
         this.signalDetector = config.signalDetector ?? new SignalDetector();
         this.backgroundReviewer = config.backgroundReviewer;
+        this.factConsolidator = config.factConsolidator;
     }
 
     // Lifecycle hooks ---------------------------------------------------------
@@ -98,7 +103,6 @@ export class HarnessInterceptor extends BaseInterceptor {
         this.context = this.loadContext();
         this.contextBlock = renderContextBlock(this.context);
         this.toolCallsInTurn = [];
-        this.pendingMessages = [];
 
         this.stateTracker.startTracking(this.agentId, {
             userId: this.userId,
@@ -156,24 +160,6 @@ export class HarnessInterceptor extends BaseInterceptor {
         };
     }
 
-    /**
-     * Mid-turn pending-message injection. Declared as a property rather than a
-     * method so the subclass signature matches BaseInterceptor's optional-
-     * property shape (method syntax creates a bivariance clash under strict).
-     */
-    readonly enrichState = (
-        _state: Readonly<Record<string, unknown>>,
-    ): Partial<Record<string, unknown>> => {
-        if (this.pendingMessages.length === 0) return {};
-
-        const msgs = this.pendingMessages.splice(0);
-        log.info({ count: msgs.length }, 'Injecting pending messages mid-turn');
-
-        return {
-            messages: msgs.map((content) => ({ role: 'user', content })),
-        };
-    };
-
     async onNodeEnd(
         nodeName: string,
         result: NodeResult<Record<string, unknown>>,
@@ -182,7 +168,13 @@ export class HarnessInterceptor extends BaseInterceptor {
         if (!this.context) return;
         if (ctx.signal?.aborted) return;
 
-        if (nodeName === 'execute_tools') {
+        // Node names match the react-agent prebuilt graph
+        // (flopsygraph/src/prebuilt/graphs/react-agent.ts): 'agent' is the LLM
+        // call node, 'tools' is the tool-execution node. The earlier names
+        // ('llm_call'/'execute_tools') were stale and silently disabled the
+        // entire learning loop — no signals consolidated, no facts written,
+        // no skills extracted, no interest-proposal hints fired.
+        if (nodeName === 'tools') {
             const messages = (result.state?.messages as ChatMessage[] | undefined) ?? [];
             const toolMessages = messages.filter((m) => m.role === 'tool');
             for (const msg of toolMessages) {
@@ -203,9 +195,23 @@ export class HarnessInterceptor extends BaseInterceptor {
             );
         }
 
-        if (nodeName === 'llm_call' && result.next?.length === 0) {
-            await this.consolidateTurnSignals(result, ctx);
-            this.toolCallsInTurn = [];
+        // Turn-end signal: 'agent' node ran AND the resulting last message has
+        // no tool calls (i.e. the conditional edge will route to END, not back
+        // to 'tools'). The previous check `result.next?.length === 0` never
+        // matched because the agent node returns no explicit `next` —
+        // conditional edges decide routing AFTER the node returns.
+        if (nodeName === 'agent') {
+            const messages = (result.state?.messages as ChatMessage[] | undefined) ?? [];
+            const lastMsg = messages.at(-1);
+            const hasToolCalls =
+                lastMsg !== undefined &&
+                'toolCalls' in lastMsg &&
+                Array.isArray((lastMsg as { toolCalls?: unknown[] }).toolCalls) &&
+                ((lastMsg as { toolCalls?: unknown[] }).toolCalls as unknown[]).length > 0;
+            if (!hasToolCalls) {
+                await this.consolidateTurnSignals(result, ctx);
+                this.toolCallsInTurn = [];
+            }
         }
     }
 
@@ -217,27 +223,8 @@ export class HarnessInterceptor extends BaseInterceptor {
         log.debug({ agentId: this.agentId }, 'Agent finished, tracking closed');
     }
 
-    // Public control surface (used by FlopsyAgentHandler) ---------------------
-
-    queueMessage(message: string): void {
-        this.pendingMessages.push(message);
-        log.debug({ message }, 'Message queued for mid-turn injection');
-    }
-
-    getPendingMessages(): string[] {
-        return [...this.pendingMessages];
-    }
-
-    clearPending(): void {
-        this.pendingMessages = [];
-    }
-
-    getAgentId(): string {
-        return this.agentId;
-    }
-
     /**
-     * Eviction hook for `FlopsyAgentHandler.evictThread()`. SQLite autocommits,
+     * Eviction hook for `TeamHandler.evictThread()`. SQLite autocommits,
      * but we clear the per-agent elapsed-timer + state so evicted threads
      * don't leak intervals or in-memory entries.
      */
@@ -360,6 +347,14 @@ export class HarnessInterceptor extends BaseInterceptor {
         if (this.backgroundReviewer && this.threadId) {
             this.backgroundReviewer.maybeTrigger(this.userId, this.threadId, this.completedTurns);
         }
+        // Fire-and-forget — internally rate-limited to once per 24h per userId.
+        // Errors are logged inside maybeConsolidate; this catch is belt-and-braces
+        // so a synchronous throw can't leak into the hook caller.
+        if (this.factConsolidator) {
+            void this.factConsolidator.maybeConsolidate(this.userId).catch((err: unknown) => {
+                log.warn({ err, userId: this.userId }, 'fact consolidator threw');
+            });
+        }
     }
 
     /**
@@ -432,39 +427,6 @@ export class HarnessInterceptor extends BaseInterceptor {
         }
     }
 
-    /**
-     * Offer a user-feedback signal to the learning loop. Used when the gateway
-     * surfaces explicit feedback (thumbs up/down, correction text).
-     */
-    async recordExternalFeedback(response: AgentResponse, feedback: UserFeedback): Promise<void> {
-        const detected = await this.signalDetector.detect(response, feedback);
-        if (!this.context || detected.signals.length === 0) return;
-
-        const updates = this.context.activeStrategies.flatMap((strategy) =>
-            detected.signals.map((signal) => ({
-                id: strategy.id,
-                signalStrength: signal.strength,
-            })),
-        );
-        this.store.batchUpdateStrategyEffectiveness(updates);
-
-        if (detected.userCorrected && detected.correctionRule) {
-            this.store.createLesson(this.userId, {
-                rule: detected.correctionRule,
-                reason: 'User explicit correction',
-                domain: this.domain,
-                severity: 'important',
-                recordedAt: Date.now(),
-                preventionCount: 0,
-                appliesTo: 'user:all',
-                tags: [],
-            });
-        }
-    }
-}
-
-export function createHarnessInterceptor(config: HarnessInterceptorConfig): Interceptor {
-    return new HarnessInterceptor(config);
 }
 
 // ---------------------------------------------------------------------------
@@ -544,5 +506,3 @@ function renderSkillLine(sk: RenderableSkill): string {
 function escape(raw: string): string {
     return raw.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
-
-export type { SkillEffectivenessEntry };

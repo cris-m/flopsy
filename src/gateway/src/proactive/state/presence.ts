@@ -1,34 +1,8 @@
 import type { StateStore } from './store';
-import type { ActivityWindow, ExplicitStatus, UserPresence } from '../types';
-
-const ACTIVE_THRESHOLD_MS = 5 * 60_000;
-const IDLE_THRESHOLD_MS = 30 * 60_000;
+import type { ExplicitStatus } from '../types';
 
 export class PresenceManager {
     constructor(private store: StateStore) {}
-
-    async recordActivity(): Promise<{
-        previousWindow: ActivityWindow;
-        currentWindow: ActivityWindow;
-        transitioned: boolean;
-    }> {
-        return this.store.mutate((state) => {
-            const now = Date.now();
-            const previousWindow = computeActivityWindow(state.presence, now);
-            state.presence.lastMessageAt = now;
-            state.presence.activityWindow = 'active';
-            return {
-                previousWindow,
-                currentWindow: 'active' as ActivityWindow,
-                transitioned: previousWindow === 'away' || previousWindow === 'idle',
-            };
-        });
-    }
-
-    async getActivityWindow(): Promise<ActivityWindow> {
-        const presence = await this.store.getPresence();
-        return computeActivityWindow(presence, Date.now());
-    }
 
     async setExplicitStatus(
         status: ExplicitStatus,
@@ -87,17 +61,4 @@ export class PresenceManager {
         if (start <= end) return hour >= start && hour < end;
         return hour >= start || hour < end;
     }
-}
-
-function computeActivityWindow(presence: UserPresence, now: number): ActivityWindow {
-    if (presence.explicitStatus && presence.statusExpiry && presence.statusExpiry > now) {
-        if (presence.explicitStatus === 'dnd') return 'away';
-        if (presence.explicitStatus === 'busy') return 'idle';
-        if (presence.explicitStatus === 'available') return 'active';
-    }
-
-    const elapsed = now - presence.lastMessageAt;
-    if (elapsed < ACTIVE_THRESHOLD_MS) return 'active';
-    if (elapsed < IDLE_THRESHOLD_MS) return 'idle';
-    return 'away';
 }

@@ -3,8 +3,10 @@ import type {
     AgentCallbacks,
     AgentHandler,
     AgentResult,
+    AggregateTaskSummary,
     InboundMedia,
     InvokeRole,
+    TaskListFilter,
     TaskStatusSummary,
     ThreadStatusSnapshot,
 } from '@flopsy/gateway';
@@ -22,6 +24,7 @@ import { parseModelString } from './bootstrap';
 import { createTeamMember, resolveRole } from './factory';
 import type { TeamMember, TeamRosterEntry } from './factory';
 import { getSharedLearningStore } from './harness';
+import type { AwayReviewer, FactConsolidator } from './harness/review';
 import {
     McpClientManager,
     bridgeAllTools,
@@ -29,7 +32,8 @@ import {
     loadMcpServers,
     type BridgedTool,
 } from './mcp';
-import type { HarnessInterceptor, LearningStore } from './harness';
+import type { LearningStore } from './harness';
+import { SessionResolver } from './session-resolver';
 import { TaskRegistry } from './state/task-registry';
 import type {
     SubAgentFactory,
@@ -99,6 +103,20 @@ export interface TeamHandlerConfig {
      * `mcpServers` allow-list.
      */
     readonly mcp?: McpConfig;
+
+    /**
+     * Generates a 1-3 sentence "where we left off" recap when a session
+     * rotates due to idle timeout. Injected as a context prefix on the
+     * first user message of the new session. Optional — omit to skip
+     * away-recap generation entirely.
+     */
+    readonly awayReviewer?: AwayReviewer;
+
+    /**
+     * Periodically merges duplicate or conflicting user preference facts.
+     * Runs at most once per 24 hours per user. Optional — omit to disable.
+     */
+    readonly factConsolidator?: FactConsolidator;
 }
 
 interface ThreadEntry {
@@ -128,6 +146,7 @@ export class TeamHandler implements AgentHandler {
     private readonly config: TeamHandlerConfig;
     private readonly maxThreads: number;
     private readonly store: LearningStore;
+    private readonly sessionResolver!: SessionResolver;
     private readonly threads = new Map<string, ThreadEntry>();
     private readonly entryDef: AgentDefinition;
     /**
@@ -174,11 +193,22 @@ export class TeamHandler implements AgentHandler {
     private readonly mcpAssignToMap: Readonly<Record<string, readonly string[]>>;
     private readonly mcpServersCfg: McpConfig['servers'];
     private mcpReady: Promise<readonly BridgedTool[]> = Promise.resolve([]);
+    private readonly awayReviewer?: AwayReviewer;
+    private readonly factConsolidator?: FactConsolidator;
+    /** threadId → in-flight recap promise; cleared on first inject or timeout. */
+    private readonly pendingRecapPromises = new Map<string, Promise<string | null>>();
 
     constructor(config: TeamHandlerConfig) {
         this.config = config;
         this.maxThreads = config.maxThreads ?? 100;
         this.store = config.store ?? getSharedLearningStore();
+        this.awayReviewer = config.awayReviewer;
+        this.factConsolidator = config.factConsolidator;
+        // Resolves the incoming peer-routing-key (e.g. telegram:dm:5257796557)
+        // into an effective threadId carrying the active session
+        // (telegram:dm:5257796557#s-19834-4a7b9f1). Rotates on daily 4am
+        // local OR 24h idle. Heartbeat sources do NOT extend freshness.
+        this.sessionResolver = new SessionResolver(this.store);
         // One persistent checkpoint DB per process. gzip compression: graph
         // states grow quickly with tool results (web search blobs, file
         // reads), and the compress path halves storage for typical chat
@@ -188,6 +218,10 @@ export class TeamHandler implements AgentHandler {
         this.checkpointer = new SqliteCheckpointStore({
             path: resolveWorkspacePath('harness', 'checkpoints.db'),
             compress: true,
+            // Cap per-thread history. ~30 resumable turns is plenty for
+            // crash recovery; without this the DB grows unbounded
+            // (long-running chat threads were hitting hundreds of MB).
+            keepLatestPerThread: 30,
         });
 
         // Persistent semantic memory store. Previously flopsygraph's default
@@ -312,6 +346,33 @@ export class TeamHandler implements AgentHandler {
         role: InvokeRole = 'user',
         media?: ReadonlyArray<InboundMedia>,
     ): Promise<AgentResult> {
+        // PR 4: resolve the inbound peer-routing-key (e.g. telegram:dm:5257796557)
+        // into an effective threadId carrying the active session
+        // (e.g. telegram:dm:5257796557#s-19834-4a7b9f1). Daily-4am OR 24h-idle
+        // rotation. Heartbeats/cron sources do not extend session freshness.
+        // Identity facts/preferences attach to the peer (permanent) — sessions
+        // bound conversation context.
+        threadId = this.resolveSessionThreadId(threadId, role);
+
+        // If an away recap was queued for this thread (session just rotated on
+        // idle), race against an 8s window. If the model returns in time the
+        // recap is prepended to the user's first message so the agent has
+        // "where we left off" context without an extra round-trip. If the LLM
+        // is slow, we skip rather than hold up the user.
+        const RECAP_INJECT_TIMEOUT_MS = 8_000;
+        let awayRecap: string | null = null;
+        const recapPromise = this.pendingRecapPromises.get(threadId);
+        if (recapPromise && role === 'user') {
+            this.pendingRecapPromises.delete(threadId);
+            awayRecap = await Promise.race([
+                recapPromise,
+                new Promise<null>((resolve) => setTimeout(() => resolve(null), RECAP_INJECT_TIMEOUT_MS)),
+            ]);
+            if (awayRecap) {
+                log.info({ threadId, chars: awayRecap.length }, 'away recap injected into first turn');
+            }
+        }
+
         const entry = await this.getOrCreateThread(threadId);
         entry.lastUsedAt = Date.now();
 
@@ -412,7 +473,10 @@ export class TeamHandler implements AgentHandler {
                 }
             }
 
-            const content = buildContent(text, media);
+            const effectiveText = awayRecap
+                ? `[Resuming after idle — previous session context: ${awayRecap}]\n\n${text}`
+                : text;
+            const content = buildContent(effectiveText, media);
 
             const result = await entry.entry.agent.invoke(
                 { messages: [{ role, content }] },
@@ -512,6 +576,7 @@ export class TeamHandler implements AgentHandler {
                     type: def.type,
                     enabled: def.enabled,
                     status: def.enabled ? 'idle' : 'disabled',
+                    ...staticConfigFields(def),
                 }));
 
             return {
@@ -596,12 +661,14 @@ export class TeamHandler implements AgentHandler {
         // later add a turn-in-flight signal.
         const team = this.config.team
             .map((def): import('@flopsy/gateway').TeamMemberStatus => {
+                const staticFields = staticConfigFields(def);
                 if (!def.enabled) {
                     return {
                         name: def.name,
                         type: def.type,
                         enabled: false,
                         status: 'disabled',
+                        ...staticFields,
                     };
                 }
                 // Find the first active task whose worker is this agent
@@ -626,6 +693,7 @@ export class TeamHandler implements AgentHandler {
                             runningMs: now - activeTask.createdAt,
                         },
                         ...(lastActiveAt !== undefined ? { lastActiveAt } : {}),
+                        ...staticFields,
                     };
                 }
                 return {
@@ -634,6 +702,7 @@ export class TeamHandler implements AgentHandler {
                     enabled: true,
                     status: 'idle',
                     ...(lastActiveAt !== undefined ? { lastActiveAt } : {}),
+                    ...staticFields,
                 };
             });
 
@@ -660,9 +729,53 @@ export class TeamHandler implements AgentHandler {
         if (!entry) return;
         try {
             await entry.entry.harnessInterceptor?.flush();
+            // Close the flopsygraph sandbox session if the agent had one —
+            // releases Docker containers / K8s pods promptly. Best-effort:
+            // closing a never-opened session or one already closed is a
+            // no-op but mustn't throw into the evict path.
+            await entry.entry.sandboxSession?.close().catch((err) =>
+                log.warn({ threadId, err }, 'sandbox session close failed'),
+            );
         } finally {
             this.threads.delete(threadId);
         }
+    }
+
+    /**
+     * Aggregate view across every live thread — the data source for
+     * `flopsy tasks` and the top-level `flopsy status` work surface.
+     * Applies filters (thread, status, limit) and sorts active-first
+     * then recent-first by end time.
+     */
+    queryAllTasks(filter: TaskListFilter = {}): AggregateTaskSummary[] {
+        const statusFilter = filter.status ? new Set(filter.status) : null;
+        const out: AggregateTaskSummary[] = [];
+        for (const [threadId, entry] of this.threads) {
+            if (filter.threadId && threadId !== filter.threadId) continue;
+            for (const t of entry.registry.list()) {
+                if (statusFilter && !statusFilter.has(t.status)) continue;
+                out.push({
+                    threadId,
+                    id: t.id,
+                    worker: t.type === 'teammate' ? t.workerName : t.type,
+                    description: t.description,
+                    status: t.status,
+                    startedAtMs: t.createdAt,
+                    endedAtMs: t.endedAt,
+                    error: t.error,
+                });
+            }
+        }
+        // Active first, then recent by endedAt desc.
+        out.sort((a, b) => {
+            const aActive = a.status === 'pending' || a.status === 'running' || a.status === 'idle';
+            const bActive = b.status === 'pending' || b.status === 'running' || b.status === 'idle';
+            if (aActive !== bActive) return aActive ? -1 : 1;
+            if (aActive) return b.startedAtMs - a.startedAtMs;
+            return (b.endedAtMs ?? 0) - (a.endedAtMs ?? 0);
+        });
+        if (filter.limit && out.length > filter.limit) out.length = filter.limit;
+        return out;
     }
 
     async shutdown(): Promise<void> {
@@ -688,6 +801,112 @@ export class TeamHandler implements AgentHandler {
             await this.mcpManager.closeAll();
         } catch (err) {
             log.warn({ err: redactSecrets(err) }, 'mcp shutdown failed');
+        }
+    }
+
+    /**
+     * Resolve the inbound peer-routing-key into an effective threadId
+     * carrying the active session (PR 4 — peer + session model).
+     *
+     * Idempotent on already-resolved keys: if `rawKey` already contains
+     * the `#` separator, treat it as already-resolved and pass through
+     * unchanged (used by proactive engine which resolves at fire time
+     * with its own source semantics, and by /new slash command which
+     * forces rotation explicitly).
+     *
+     * Parses peerInfo from the routing-key shape `<channel>:<scope>:<peerNativeId>`.
+     * If the shape doesn't match (legacy or odd input), passes through
+     * unchanged — no rotation, no migration. This keeps the failure mode
+     * "behave like before" instead of "drop messages."
+     */
+    private resolveSessionThreadId(rawKey: string, role: InvokeRole): string {
+        if (rawKey.includes('#')) return rawKey;
+        const parts = rawKey.split(':');
+        if (parts.length < 3) return rawKey;
+        const [channel, scope, ...rest] = parts;
+        const peerNativeId = rest.join(':');
+        if (!channel || !scope || !peerNativeId) return rawKey;
+
+        const source = role === 'user' ? 'user' : 'cron';
+        try {
+            const result = this.sessionResolver.resolve(
+                rawKey,
+                { channel, scope, peerNativeId },
+                { source },
+            );
+
+            // Queue an away recap when a session rotates on idle so the model
+            // can greet the user with "where we left off" context. Only fires
+            // when an AwayReviewer is configured — otherwise this is a no-op.
+            if (
+                result.isNew &&
+                result.closeReason === 'idle' &&
+                result.previousSessionId &&
+                this.awayReviewer
+            ) {
+                const prevThreadId = `${result.peerId}#${result.previousSessionId}`;
+                const recapPromise = this.awayReviewer
+                    .generateRecap(prevThreadId)
+                    .catch(() => null);
+                this.pendingRecapPromises.set(result.threadId, recapPromise);
+                log.debug(
+                    { peerId: result.peerId, prevThreadId, newThreadId: result.threadId },
+                    'away recap queued for new idle session',
+                );
+            }
+
+            return result.threadId;
+        } catch (err) {
+            log.warn(
+                { err: redactSecrets(err), rawKey },
+                'session resolution failed — falling back to raw threadId',
+            );
+            return rawKey;
+        }
+    }
+
+    forceNewSession(rawKey: string): string | undefined {
+        // rawKey is the peer routing key: `channel:scope:nativeId`
+        const parts = rawKey.split(':');
+        if (parts.length < 3) return undefined;
+        const [channel, scope, ...rest] = parts;
+        const peerNativeId = rest.join(':');
+        if (!channel || !scope || !peerNativeId) return undefined;
+        try {
+            const result = this.sessionResolver.resolve(
+                rawKey,
+                { channel, scope, peerNativeId },
+                { source: 'user', force: true },
+            );
+            log.info({ rawKey, newSessionId: result.sessionId }, '/new: forced session rotation');
+            return result.sessionId;
+        } catch (err) {
+            log.warn({ err: redactSecrets(err), rawKey }, 'forceNewSession failed');
+            return undefined;
+        }
+    }
+
+    resolveProactiveThreadId(
+        channelName: string,
+        peer: { id: string; type: 'user' | 'group' | 'channel' },
+        source: 'heartbeat' | 'cron',
+    ): string | undefined {
+        // Map peer.type → the scope segment used in our peerId format.
+        const scope = peer.type === 'user' ? 'dm' : peer.type;
+        const peerId = `${channelName}:${scope}:${peer.id}`;
+        try {
+            const result = this.sessionResolver.resolve(
+                peerId,
+                { channel: channelName, scope, peerNativeId: peer.id },
+                { source },
+            );
+            return result.threadId;
+        } catch (err) {
+            log.warn(
+                { err: redactSecrets(err), peerId },
+                'resolveProactiveThreadId failed — will use ephemeral thread',
+            );
+            return undefined;
         }
     }
 
@@ -814,18 +1033,10 @@ export class TeamHandler implements AgentHandler {
                 const workerModel = await resolveWorkerModel(def, this.config.model);
 
                 // P5 tool-call telemetry: warn when a worker's roster-listed
-                // MCP servers produced zero bridged tools. This catches the
+                // MCP servers produced zero bridged tools. Catches the
                 // "disabled MCP in flopsy.json5 but still delegated to"
                 // scenario before the worker runs for minutes and gets killed.
-                const rosterMcpNames = (() => {
-                    const pull = def.mcpServers;
-                    if (pull && pull.length > 0) return pull;
-                    return Object.entries(this.mcpAssignToMap)
-                        .filter(([, assigned]) =>
-                            assigned.includes(def.name) || assigned.includes('*'),
-                        )
-                        .map(([name]) => name);
-                })();
+                const rosterMcpNames = this.mcpServersForWorker(def);
                 if (rosterMcpNames.length > 0 && workerMcpTools.length === 0) {
                     log.warn(
                         {
@@ -908,43 +1119,35 @@ export class TeamHandler implements AgentHandler {
     }
 
     /**
-     * Workers gandalf is allowed to delegate to. Derived once from the team
-     * config. Respects the main agent's `workers: string[]` allowlist if
-     * present; otherwise defaults to every enabled non-main agent.
-     */
-    /**
      * Build the capability roster for the main agent's system prompt —
      * one entry per enabled peer, listing toolsets + MCP servers that
      * will actually route to them. Without this, gandalf picks workers
      * by name alone and hallucinates capabilities that aren't there.
-     *
-     * Filters to enabled workers that are in gandalf's `workers` list
-     * (same filter `allowedWorkers` uses); skips disabled to keep the
-     * prompt concise.
      */
     private buildTeamRoster(): readonly TeamRosterEntry[] {
-        const workers = this.allowedWorkers;
-        return workers.map((def): TeamRosterEntry => {
-            // MCP servers this worker will see:
-            //   - explicit pull via `def.mcpServers` takes precedence
-            //   - otherwise, each server whose assignTo includes this
-            //     worker's name (or the "*" broadcast wildcard)
-            const pull = def.mcpServers;
-            const mcpServers = pull && pull.length > 0
-                ? [...pull]
-                : Object.entries(this.mcpAssignToMap)
-                    .filter(([, assigned]) =>
-                        assigned.includes(def.name) || assigned.includes('*'),
-                    )
-                    .map(([name]) => name);
-            return {
-                name: def.name,
-                type: def.type,
-                ...(def.domain !== undefined ? { domain: def.domain } : {}),
-                toolsets: def.toolsets ?? [],
-                mcpServers,
-            };
-        });
+        return this.allowedWorkers.map((def): TeamRosterEntry => ({
+            name: def.name,
+            type: def.type,
+            ...(def.domain !== undefined ? { domain: def.domain } : {}),
+            toolsets: def.toolsets ?? [],
+            mcpServers: this.mcpServersForWorker(def),
+        }));
+    }
+
+    /**
+     * MCP server names a worker will see:
+     *   - explicit pull via `def.mcpServers` takes precedence
+     *   - otherwise each server whose assignTo includes this worker's name
+     *     (or the "*" broadcast wildcard)
+     */
+    private mcpServersForWorker(def: AgentDefinition): string[] {
+        const pull = def.mcpServers;
+        if (pull && pull.length > 0) return [...pull];
+        return Object.entries(this.mcpAssignToMap)
+            .filter(([, assigned]) =>
+                assigned.includes(def.name) || assigned.includes('*'),
+            )
+            .map(([name]) => name);
     }
 
     private get allowedWorkers(): ReadonlyArray<AgentDefinition> {
@@ -995,13 +1198,6 @@ export class TeamHandler implements AgentHandler {
 // ---------------------------------------------------------------------------
 
 /**
- * Local YYYY-MM-DD for the process's timezone. Used as the `date` column
- * in `token_usage` so day boundaries respect the user's wall clock rather
- * than UTC (which would otherwise split "today" in two for non-UTC users).
- * Computed in JS instead of `date('now')` in SQLite so a long-running
- * transaction won't straddle midnight and land writes on the wrong day.
- */
-/**
  * Resolve the BaseChatModel a worker should run on. If the worker has
  * its own `model: "provider:name"` in flopsy.json5, build it via the
  * ModelLoader singleton (cached across calls). Otherwise inherit the
@@ -1019,8 +1215,6 @@ async function resolveWorkerModel(
     if (!def.model) return fallback;
     try {
         const ref = parseModelString(def.model);
-        // Trust the config: flopsy.json5's model strings are authored
-        // by the user and load errors are caught below.
         return await ModelLoader.getInstance().from({
             provider: ref.provider as Provider,
             name: ref.name,
@@ -1038,6 +1232,13 @@ async function resolveWorkerModel(
     }
 }
 
+/**
+ * Local YYYY-MM-DD for the process's timezone. Used as the `date` column
+ * in `token_usage` so day boundaries respect the user's wall clock rather
+ * than UTC (which would otherwise split "today" in two for non-UTC users).
+ * Computed in JS instead of `date('now')` in SQLite so a long-running
+ * transaction won't straddle midnight and land writes on the wrong day.
+ */
 function localDateString(d: Date = new Date()): string {
     const y = d.getFullYear();
     const m = String(d.getMonth() + 1).padStart(2, '0');
@@ -1045,20 +1246,6 @@ function localDateString(d: Date = new Date()): string {
     return `${y}-${m}-${day}`;
 }
 
-// ---------------------------------------------------------------------------
-// Secret redaction for error logs (shared/scrubPii on error message + stack)
-// ---------------------------------------------------------------------------
-
-/**
- * Build the LLM content payload for an inbound turn.
- *
- * Images with binary data or a URL become vision ContentBlocks placed before
- * the text so the model can reference them naturally. Images without data (e.g.
- * oversized or download-failed) fall back to an inline notice in the text body.
- *
- * Non-image media types (video, document, sticker, location) are already
- * encoded as structured text by the channel adapters — nothing extra to emit.
- */
 /**
  * Build the LLM content payload for an inbound turn.
  *
@@ -1109,4 +1296,32 @@ function redactSecrets(err: unknown): { name?: string; message: string; stack?: 
         };
     }
     return { message: scrubPii(String(err)) };
+}
+
+/**
+ * Extract the static (config-driven) fields from an AgentDefinition so
+ * `/team` in chat carries the same metadata that `flopsy team show` does
+ * on the CLI side — role, domain, model, toolsets, mcp servers, sandbox
+ * toggle — without the handler needing to re-read flopsy.json5.
+ */
+function staticConfigFields(def: AgentDefinition): Partial<import('@flopsy/gateway').TeamMemberStatus> {
+    const sb = (def as AgentDefinition & { sandbox?: Record<string, unknown> }).sandbox;
+    const sandbox = sb && sb['enabled'] === true
+        ? {
+              enabled: true as const,
+              ...(typeof sb['backend'] === 'string' ? { backend: sb['backend'] as string } : {}),
+              ...(typeof sb['language'] === 'string' ? { language: sb['language'] as string } : {}),
+              ...(typeof sb['programmaticToolCalling'] === 'boolean'
+                  ? { programmaticToolCalling: sb['programmaticToolCalling'] as boolean }
+                  : {}),
+          }
+        : undefined;
+    return {
+        ...(def.role ? { role: def.role } : {}),
+        ...(def.domain ? { domain: def.domain } : {}),
+        ...(def.model ? { model: def.model } : {}),
+        ...(def.toolsets && def.toolsets.length > 0 ? { toolsets: def.toolsets } : {}),
+        ...(def.mcpServers && def.mcpServers.length > 0 ? { mcpServers: def.mcpServers } : {}),
+        ...(sandbox ? { sandbox } : {}),
+    };
 }

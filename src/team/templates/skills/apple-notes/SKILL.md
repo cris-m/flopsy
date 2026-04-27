@@ -13,18 +13,18 @@ Read and write notes in the macOS Apple Notes app via MCP tools. Falls back to A
 **CRITICAL: Follow this order on ANY failure. Do NOT stop at step 1.**
 
 1. **MCP tool** (e.g., `notes_search`) — try the native tool first
-2. **AppleScript fallback via `execute()`** — if MCP server is down or returns errors:
+2. **AppleScript fallback via `Bash`** — if MCP server is down or returns errors:
    ```
-   execute('osascript -e "tell application \"Notes\" to get name of every note"')
-   execute('osascript -e "tell application \"Notes\" to get body of note \"Title\""')
-   execute('osascript -e "tell application \"Notes\" to make new note at folder \"Notes\" with properties {name:\"Title\", body:\"Content\"}"')
+   Bash: osascript -e 'tell application "Notes" to get name of every note'
+   Bash: osascript -e 'tell application "Notes" to get body of note "Title"'
+   Bash: osascript -e 'tell application "Notes" to make new note at folder "Notes" with properties {name:"Title", body:"Content"}'
    ```
 3. **Report failure** — ONLY after both MCP and AppleScript fail. State which steps were tried
 
 **"Note not found"**: Don't give up after one search. Try:
 - Different keywords (shorter, broader terms)
 - `notes_list` to browse all notes first, then `notes_get` by ID
-- AppleScript search: `execute('osascript -e "tell application \"Notes\" to get name of notes whose name contains \"keyword\""')`
+- AppleScript search via Bash: `osascript -e 'tell application "Notes" to get name of notes whose name contains "keyword"'`
 
 ## Platform Requirements
 
@@ -50,14 +50,14 @@ Read and write notes in the macOS Apple Notes app via MCP tools. Falls back to A
 1. Determine the target folder (ask user or use default)
 2. Collect the note title and body content
 3. `notes_create` with folder ID, title, and body
-4. If MCP fails → `execute('osascript -e "tell application \"Notes\" to make new note at folder \"Notes\" with properties {name:\"My Note\", body:\"Content here\"}"')`
+4. If MCP fails → run via Bash: `osascript -e 'tell application "Notes" to make new note at folder "Notes" with properties {name:"My Note", body:"Content here"}'`
 5. Confirm creation
 
 ### Finding a Note
 1. `notes_search` with relevant keywords
 2. If no results → try shorter/broader keywords
 3. If still no results → `notes_list` to browse all notes
-4. If MCP fails → `execute('osascript -e "tell application \"Notes\" to get name of notes whose name contains \"keyword\""')`
+4. If MCP fails → run via Bash: `osascript -e 'tell application "Notes" to get name of notes whose name contains "keyword"'`
 5. `notes_get` to retrieve full content
 
 ### Updating a Note
@@ -65,11 +65,11 @@ Read and write notes in the macOS Apple Notes app via MCP tools. Falls back to A
 2. `notes_get` to retrieve current content
 3. Apply the requested changes
 4. `notes_update` with the note ID and new content
-5. If MCP fails → `execute('osascript -e "tell application \"Notes\" to set body of note \"Title\" to \"New content\""')`
+5. If MCP fails → run via Bash: `osascript -e 'tell application "Notes" to set body of note "Title" to "New content"'`
 
 ## AppleScript Fallback Reference
 
-When MCP tools are down, use `execute()` with these commands:
+When MCP tools are down, run these commands via `Bash`:
 
 | Action | Command |
 |--------|---------|

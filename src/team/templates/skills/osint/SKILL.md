@@ -30,7 +30,7 @@ Systematic methodology for gathering and analyzing publicly available informatio
 
 ---
 
-## Investigation Process
+## Workflow
 
 ### Step 1: Define Scope
 

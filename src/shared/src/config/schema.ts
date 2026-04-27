@@ -285,10 +285,12 @@ const deliveryTargetSchema = z.object({
 });
 
 const heartbeatDefinitionSchema = z.object({
+    id: z.string().min(1).optional(),
     name: z.string().min(1),
     enabled: z.boolean().default(true),
     interval: z.string().min(1),
-    prompt: z.string().min(1),
+    prompt: z.string().default(''),
+    promptFile: z.string().optional(),
     deliveryMode: z.enum(['always', 'conditional', 'silent']).default('always'),
     activeHours: z
         .object({
@@ -316,6 +318,7 @@ const cronPayloadSchema = z.object({
     delivery: deliveryTargetSchema.optional(),
     threadId: z.string().optional(),
     deliveryMode: z.enum(['always', 'conditional', 'silent']).default('always'),
+    oneshot: z.boolean().default(false),
 });
 
 const jobDefinitionSchema = z.object({
@@ -344,19 +347,33 @@ const proactiveSchema = z
         enabled: z.boolean().default(false),
         statePath: z.string().default('state/proactive.json'),
         retryQueuePath: z.string().default('state/retry-queue.json'),
+        /** Fallback delivery target when a schedule has no explicit `delivery`. */
         delivery: deliveryTargetSchema.optional(),
+        /**
+         * When true, proactive messages without an explicit `delivery` go to
+         * the channel+peer of the user's MOST RECENT inbound message (auto-
+         * routes to wherever they're chatting). Falls back to
+         * `proactive.delivery` when no inbound activity has been recorded yet.
+         */
+        followActiveChannel: z.boolean().default(false),
         heartbeats: z
             .object({
                 enabled: z.boolean().default(false),
+                /** @deprecated Since v2 — schedules live in proactive.db. This
+                 * array is kept only for one-time migration on first boot
+                 * (see `configSeededAt` in proactive.json). Edit schedules via
+                 * `flopsy schedule` CLI or the manage_schedule agent tool. */
                 heartbeats: z.array(heartbeatDefinitionSchema).default([]),
             })
             .default({}),
         scheduler: z
             .object({
                 enabled: z.boolean().default(false),
+                /** @deprecated — see heartbeats.heartbeats above. */
                 jobs: z.array(jobDefinitionSchema).default([]),
             })
             .default({}),
+        /** @deprecated — webhooks will migrate to proactive.db in the next pass. */
         webhooks: z.array(externalWebhookSchema).default([]),
         healthMonitor: healthMonitorSchema,
     })
@@ -378,6 +395,43 @@ const approvalsSchema = z.object({
     actions: z
         .array(z.enum(['approve', 'skip', 'revise', 'feedback']))
         .optional(),
+});
+
+/**
+ * Per-agent sandbox configuration. When `enabled: true` the agent gets
+ * an `execute_code` tool. When `programmaticToolCalling: true` it also
+ * gets `execute_code_with_tools` — the model can write Python/JS code
+ * that calls ANY of the agent's tools as regular functions and only the
+ * `print()` output enters the LLM context.
+ *
+ * Only `enabled` is required. All other fields carry sensible defaults
+ * suitable for local development. For production set `backend: 'docker'`
+ * and harden `memoryLimit` / `timeout`.
+ */
+const sandboxConfigSchema = z.object({
+    enabled: z.boolean().default(false),
+    backend: z.enum(['local', 'docker', 'kubernetes']).default('local'),
+    language: z.enum(['python', 'javascript', 'typescript', 'bash']).default('python'),
+    /** Hard wall-clock cap on a single execution, in ms. */
+    timeout: z.number().int().positive().default(30_000),
+    /** RAM ceiling in bytes (Docker/K8s only; ignored for local). */
+    memoryLimit: z.number().int().positive().optional(),
+    /** CPU shares (Docker/K8s only). */
+    cpuLimit: z.number().positive().optional(),
+    /**
+     * Allow the sandbox to reach the network. Auto-enabled when
+     * `programmaticToolCalling: true` so the sandbox can call back to
+     * the tool bridge on `host.docker.internal`.
+     */
+    networkEnabled: z.boolean().default(false),
+    /** Reuse the session between invocations instead of tearing down. */
+    keepAlive: z.boolean().default(true),
+    /**
+     * Turn on the `execute_code_with_tools` tool — the model writes code
+     * that orchestrates multiple of this agent's tools in one pass,
+     * keeping intermediate data out of the LLM context.
+     */
+    programmaticToolCalling: z.boolean().default(false),
 });
 
 const agentDefinitionSchema = z.object({
@@ -405,8 +459,8 @@ const agentDefinitionSchema = z.object({
     routing: modelRoutingSchema,
 
     // Named toolset bundles the agent subscribes to. Resolved at runtime via
-    // the TOOLSETS registry (src/agent/src/tools/index.ts). Unknown names fail
-    // loud at startup.
+    // the TOOLSETS registry (src/team/src/toolsets/index.ts). Unknown names
+    // fail loud at startup.
     toolsets: z.array(z.string()).default([]),
 
     // Optional path (relative to FLOPSY_HOME) to a markdown prompt file that
@@ -445,6 +499,12 @@ const agentDefinitionSchema = z.object({
     //                      Does NOT support arbitrary tools or our harness/role
     //                      interceptors — its workflow is hardcoded.
     graph: z.enum(['react', 'deep-research']).default('react'),
+
+    // Sandbox opt-in. Absent / disabled → agent has no code execution tools.
+    // When enabled the agent gets `execute_code`; when programmaticToolCalling
+    // is also on it gets `execute_code_with_tools` that exposes every other
+    // tool this agent has as a function the model can call from sandbox code.
+    sandbox: sandboxConfigSchema.optional(),
 });
 
 /**
@@ -499,6 +559,12 @@ const mcpServerSchema = z.object({
     platform: z.enum(['darwin', 'linux', 'win32']).optional(),
     assignTo: z.array(z.string()).default([]),
     description: z.string().optional(),
+    // Per-server call timeout (ms). Omit → default (30s in McpClientManager).
+    // Set higher (e.g. 600000 = 10 min) for slow servers with big data like
+    // obsidian vaults or Google Drive indexes. Set to 0 to disable the
+    // timeout entirely — only do this if you trust the server not to hang,
+    // since a stuck call will pin the agent's turn forever.
+    callTimeoutMs: z.number().int().min(0).optional(),
     // Full OAuth redirect URI for provider auth flows that need a
     // dashboard-registered URI (e.g. Spotify). Must match exactly what
     // you register in the provider's developer dashboard. The CLI's

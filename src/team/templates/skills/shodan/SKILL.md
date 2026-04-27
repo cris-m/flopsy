@@ -1,5 +1,6 @@
 ---
 name: shodan
+compatibility: Designed for FlopsyBot agent
 description: Search and analyze internet-connected devices, open ports, vulnerabilities, and DNS records using Shodan. Use when investigating IP addresses, scanning infrastructure, or checking network exposure.
 ---
 

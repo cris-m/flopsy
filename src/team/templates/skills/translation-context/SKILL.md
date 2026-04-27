@@ -16,7 +16,7 @@ Go beyond word-for-word translation — explain what the text really means, incl
 - User needs to communicate something in another language with the right tone
 - User encounters an idiom or expression that doesn't translate directly
 
-## Translation Process
+## Workflow
 
 ### Step 1: Literal Translation
 Provide a direct translation — word for word where possible.

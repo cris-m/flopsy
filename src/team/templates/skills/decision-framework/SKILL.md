@@ -15,7 +15,7 @@ Structured methodology for making decisions under uncertainty. Goes beyond simpl
 - User is stuck in analysis paralysis
 - Any decision with significant consequences
 
-## Decision Process
+## Workflow
 
 ### Step 1: Define the Decision
 - What exactly is being decided?

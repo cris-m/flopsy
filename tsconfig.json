@@ -2,8 +2,8 @@
   "files": [],
   "references": [
     { "path": "./src/shared" },
-    { "path": "./src/agent" },
     { "path": "./src/cli" },
-    { "path": "./src/gateway" }
+    { "path": "./src/gateway" },
+    { "path": "./src/team" }
   ]
 }

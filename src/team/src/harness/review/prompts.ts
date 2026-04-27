@@ -21,16 +21,38 @@ Do NOT capture: one-off tasks, general knowledge, anything obvious from the agen
 
 ## Part 2 — User preference facts
 
-Extract 0–5 observable facts about the user's preferences from the conversation.
-Only extract what is CLEARLY EVIDENT — do not infer or guess.
+Extract observable facts about the user's preferences from the conversation.
+Default is an empty array. Most reviews should yield zero facts. Silence is the right answer.
+
+### Hard rules (a fact that breaks any of these is INVALID — drop it):
+
+1. **GROUNDING.** Every fact must quote the user's verbatim words that prove it.
+   The quote must come from a [User] line in the snapshot — never from [Agent].
+   If you cannot point to an exact phrase the user typed, do NOT emit the fact.
+
+2. **NO INFERENCE.** Stay literal. Extract only what was said, never what the topic
+   could relate to. If the user discusses GPUs do not output "crypto mining". If
+   the user asks about kubernetes do not output "devops interest". Adjacent topics
+   are not the same topic.
+
+3. **REPETITION FOR INTEREST.** Only emit \`domain_interest\` when the user has
+   raised the same topic in 2+ separate turns. A single mention is curiosity,
+   not interest.
+
+4. **USER ONLY.** Facts describe the user, not the agent. If the agent talked about
+   bitcoin while the user asked about AI, the fact is "user is interested in AI"
+   (if repeated) — never "user is interested in bitcoin".
+
+5. **WHEN UNSURE, RETURN \`facts: []\`.** Empty is safe. A wrong fact is worse than
+   no fact, because the system will act on it.
 
 Valid fact predicates (use exactly these strings):
 - prefers_format         (e.g. "bullet points", "numbered lists", "prose paragraphs")
 - communication_style    (e.g. "terse", "detailed", "uses technical jargon")
-- domain_interest        (e.g. "quantitative finance", "machine learning", "home automation")
+- domain_interest        (only after 2+ mentions across turns)
 - response_length_pref   (e.g. "concise", "thorough")
-- timezone               (e.g. "Europe/Paris")
-- language_pref          (e.g. "French preferred for casual messages")
+- timezone               (only if user states it explicitly)
+- language_pref          (only if user requests a specific language)
 
 Respond with a raw JSON object (no markdown fences):
 
@@ -39,9 +61,15 @@ Respond with a raw JSON object (no markdown fences):
   "skillName": "kebab-case-name",
   "skillContent": "full SKILL.md content",
   "facts": [
-    { "predicate": "prefers_format", "object": "bullet points" }
+    {
+      "predicate": "domain_interest",
+      "object": "local AI inference",
+      "evidence": "verbatim phrase the user typed that proves this"
+    }
   ]
 }
+
+The \`evidence\` field is REQUIRED. Facts without evidence are dropped.
 
 skillName and skillContent are ONLY required when shouldWrite=true.
 facts may be an empty array when nothing is clearly evident.
@@ -95,7 +123,11 @@ export function buildReviewPrompt(messages: MessageRow[]): string {
 export interface ReviewFact {
     predicate: string;
     object: string;
+    /** Verbatim user phrase that grounds the fact. Required — facts without it are dropped. */
+    evidence: string;
 }
+
+const MIN_EVIDENCE_LENGTH = 4;
 
 export interface ReviewDecision {
     shouldWrite: boolean;
@@ -121,18 +153,26 @@ export function parseReviewResponse(raw: string): ReviewDecision {
         if (typeof parsed !== 'object' || parsed === null) return empty;
         const obj = parsed as Record<string, unknown>;
 
-        // Parse facts — validate predicate allowlist and truncate object strings.
+        // Parse facts — require predicate allowlist + grounded evidence.
+        // Facts without verifiable evidence are dropped to prevent hallucinated
+        // preferences (e.g. extracting "bitcoin" from a conversation about AI).
         const rawFacts = Array.isArray(obj['facts']) ? obj['facts'] : [];
         const facts: ReviewFact[] = rawFacts
             .filter(
-                (f): f is { predicate: string; object: string } =>
+                (f): f is { predicate: string; object: string; evidence: string } =>
                     typeof f === 'object' &&
                     f !== null &&
                     typeof (f as Record<string, unknown>)['predicate'] === 'string' &&
-                    typeof (f as Record<string, unknown>)['object'] === 'string',
+                    typeof (f as Record<string, unknown>)['object'] === 'string' &&
+                    typeof (f as Record<string, unknown>)['evidence'] === 'string',
             )
             .filter((f) => ALLOWED_PREDICATES.has(f.predicate))
-            .map((f) => ({ predicate: f.predicate, object: String(f.object).slice(0, 200) }))
+            .filter((f) => f.evidence.trim().length >= MIN_EVIDENCE_LENGTH)
+            .map((f) => ({
+                predicate: f.predicate,
+                object: String(f.object).slice(0, 200),
+                evidence: String(f.evidence).slice(0, 400),
+            }))
             .slice(0, 5);
 
         if (obj['shouldWrite'] !== true) return { shouldWrite: false, facts };

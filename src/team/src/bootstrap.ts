@@ -20,6 +20,7 @@ import type { FlopsyGateway } from '@flopsy/gateway';
 import { TeamHandler } from './handler';
 import type { ThreadIdentity } from './handler';
 import { closeSharedLearningStore } from './harness';
+import { setScheduleFacade } from './tools/schedule-registry';
 
 const log = createLogger('bootstrap');
 
@@ -146,13 +147,35 @@ export async function startFlopsyBot(
     });
 
     gateway.setAgentHandler(handler);
+    // Expose the raw BaseChatModel so the proactive engine can run flopsygraph's
+    // StructuredLLM reformatter on conditional-mode replies. Reusing the main
+    // agent's model keeps it in-cache and avoids loading a second provider.
+    gateway.setStructuredOutputModel(model);
     log.info({ activeThreads: handler.activeThreadCount }, 'Agent handler attached to gateway');
 
     await gateway.start();
     log.info('Gateway started; awaiting channel traffic');
 
+    // Wire the manage_schedule agent tool to the live proactive engine. Must
+    // happen AFTER gateway.start() — that's when the engine is constructed.
+    // If proactive is disabled, getProactiveEngine() returns null and the
+    // tool responds with "Scheduler is not running".
+    const engine = gateway.getProactiveEngine();
+    if (engine) {
+        setScheduleFacade({
+            addRuntimeHeartbeat: (hb, createdBy) => engine.addRuntimeHeartbeat(hb, createdBy),
+            addRuntimeCronJob: (job, createdBy) => engine.addRuntimeCronJob(job, createdBy),
+            addRuntimeWebhook: (cfg, createdBy) => engine.addRuntimeWebhook(cfg, createdBy),
+            removeRuntimeSchedule: (id) => engine.removeRuntimeSchedule(id),
+            setRuntimeScheduleEnabled: (id, enabled) => engine.setRuntimeScheduleEnabled(id, enabled),
+            listSchedules: () => engine.listSchedules(),
+        });
+        log.info('manage_schedule tool wired to proactive engine');
+    }
+
     return async () => {
         log.info('Tearing down bootstrap');
+        setScheduleFacade(null);
         await handler.shutdown();
         closeSharedLearningStore();
         log.info('Bootstrap torn down');

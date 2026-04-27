@@ -17,7 +17,7 @@ import { existsSync } from 'fs';
 import Database from 'better-sqlite3';
 import { accent, bad, dim, ok, section, table, warn } from '../ui/pretty';
 import { readFlopsyConfig } from './config-reader';
-import { resolveWorkspacePath } from '@flopsy/shared';
+import { agoLabel, resolveWorkspacePath, truncate } from '@flopsy/shared';
 
 interface NamespaceRow {
     readonly namespace: string;
@@ -109,7 +109,7 @@ function renderKpi(db: Database.Database, asJson?: boolean): void {
     const now = Date.now();
     const tableRows: string[][] = rows.map((r) => {
         const ageMs = r.newest_ms ? now - r.newest_ms : null;
-        const ageFmt = ageMs !== null ? humanAge(ageMs) : dim('—');
+        const ageFmt = ageMs !== null ? agoLabel(ageMs) : dim('—');
         const fresh = ageMs !== null && ageMs < 60 * 60 * 1_000; // < 1h
         const stale = ageMs !== null && ageMs > 7 * 24 * 60 * 60 * 1_000; // > 7d
         const countFmt = stale
@@ -173,7 +173,7 @@ function renderKeys(db: Database.Database, ns: string, asJson?: boolean): void {
 
     const now = Date.now();
     const tableRows: string[][] = rows.map((r) => [
-        dim(humanAge(now - r.updated_at)),
+        dim(agoLabel(now - r.updated_at)),
         r.key,
         dim(truncate(r.preview, 60)),
     ]);
@@ -181,17 +181,3 @@ function renderKeys(db: Database.Database, ns: string, asJson?: boolean): void {
     console.log(table(tableRows));
 }
 
-function humanAge(ms: number): string {
-    const secs = Math.floor(ms / 1_000);
-    if (secs < 60) return `${secs}s ago`;
-    const mins = Math.floor(secs / 60);
-    if (mins < 60) return `${mins}m ago`;
-    const hrs = Math.floor(mins / 60);
-    if (hrs < 24) return `${hrs}h ago`;
-    return `${Math.floor(hrs / 24)}d ago`;
-}
-
-function truncate(s: string, max: number): string {
-    if (s.length <= max) return s;
-    return s.slice(0, max - 1) + '…';
-}

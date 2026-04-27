@@ -50,7 +50,7 @@ export function resolveToolsets(names: ReadonlyArray<string>): BaseTool[] {
             const available = Object.keys(TOOLSETS).join(', ');
             throw new Error(
                 `Unknown toolset "${name}". Available: ${available}. ` +
-                    `Register it in src/agent/src/tools/index.ts.`,
+                    `Register it in src/team/src/toolsets/index.ts.`,
             );
         }
         for (const tool of bundle) {

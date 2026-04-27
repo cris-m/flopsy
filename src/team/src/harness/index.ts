@@ -5,7 +5,7 @@
  * `src/gateway/src/proactive/`; the harness no longer re-exports them.
  */
 
-export { HarnessInterceptor, createHarnessInterceptor } from './hooks';
+export { HarnessInterceptor } from './hooks';
 export { SignalDetector } from './learning';
 export { LearningStore, getSharedLearningStore, closeSharedLearningStore } from './storage';
 export { AgentStateTracker, getAgentStateTracker } from './state';

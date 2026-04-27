@@ -1,77 +1,121 @@
 /**
- * `flopsy heartbeat` — inspect heartbeats from `proactive.heartbeats`.
+ * `flopsy heartbeat` — full CRUD over runtime heartbeats in proactive.db.
  *
- * Heartbeats are periodic pings the agent fires itself (e.g. "check
- * the log, say hi on Monday 9am"). Different from cron in that the
- * interval is relative ("every 1h") and usually ignored as ambient
- * ticks, not scheduled-calendar tasks.
+ * Reads work offline (direct DB access); writes go through the gateway's
+ * mgmt HTTP endpoint so the live engine hot-registers the change without
+ * a restart.
  */
 
 import { Command } from 'commander';
-import { bad, detail, dim, row, section, table } from '../ui/pretty';
-import { heartbeatsOf, readFlopsyConfig, type RawHeartbeat } from './config-reader';
-import { tint } from '../ui/theme';
+import { truncate } from '@flopsy/shared';
+import { detail, dim } from '../ui/pretty';
+import {
+    mgmtCreate,
+    mgmtDisable,
+    mgmtEnable,
+    mgmtRemove,
+} from './schedule-client';
+import {
+    renderFires,
+    renderScheduleList,
+    renderScheduleShow,
+    renderStats,
+} from './schedule-stats-render';
 
 export function registerHeartbeatCommands(root: Command): void {
     const hb = root
         .command('heartbeat')
         .alias('hb')
-        .description('Inspect configured heartbeats (periodic agent pings)');
+        .description('Manage runtime heartbeats (periodic agent pings)');
 
     hb.command('list')
-        .description('List every configured heartbeat + enabled state')
-        .action(() => {
-            const { config } = readFlopsyConfig();
-            renderList(heartbeatsOf(config));
-        });
+        .description('List every heartbeat + enabled state')
+        .action(() => renderList());
 
     hb.command('show')
-        .description('Detailed view of one heartbeat')
-        .argument('<name>', 'Heartbeat name')
-        .action((name: string) => {
-            const { config } = readFlopsyConfig();
-            const hbEntry = heartbeatsOf(config).find((h) => h.name === name);
-            if (!hbEntry) {
-                console.log(bad(`No heartbeat named "${name}" in flopsy.json5.`));
-                process.exit(1);
-            }
-            renderOne(hbEntry);
+        .description('Show full detail for one heartbeat')
+        .argument('<id>', 'Heartbeat id (from `flopsy heartbeat list`)')
+        .action((id: string) => renderOne(id));
+
+    hb.command('add')
+        .description('Create a heartbeat (fires on a fixed interval)')
+        .requiredOption('--name <name>', 'Heartbeat name')
+        .requiredOption('--interval <duration>', '"30s" | "5m" | "1h" | "1d"')
+        .option('--prompt <text>', 'Inline prompt the agent receives')
+        .option('--prompt-file <path>', 'Path to a prompt file (copied into workspace)')
+        .option('--delivery-mode <mode>', 'always | conditional | silent', 'always')
+        .option('--oneshot', 'Fire once then auto-disable', false)
+        .option('--id <id>', 'Stable id (defaults to runtime-hb-<name>)')
+        .action(async (opts) => {
+            const scheduleId: string = opts.id ?? `runtime-hb-${opts.name as string}`;
+            await mgmtCreate({
+                kind: 'heartbeat',
+                id: scheduleId,
+                name: opts.name,
+                interval: opts.interval,
+                prompt: opts.prompt,
+                promptFile: opts.promptFile,
+                deliveryMode: opts.deliveryMode,
+                oneshot: opts.oneshot,
+            });
         });
 
-    hb.action(() => {
-        const { config } = readFlopsyConfig();
-        renderList(heartbeatsOf(config));
+    hb.command('disable')
+        .description('Disable a heartbeat by id')
+        .argument('<id>', 'Heartbeat id')
+        .action((id: string) => void mgmtDisable(id));
+
+    hb.command('enable')
+        .description('Re-enable a heartbeat by id')
+        .argument('<id>', 'Heartbeat id')
+        .action((id: string) => void mgmtEnable(id));
+
+    hb.command('remove')
+        .alias('rm')
+        .description('Delete a heartbeat by id')
+        .argument('<id>', 'Heartbeat id')
+        .action((id: string) => void mgmtRemove(id));
+
+    hb.command('stats')
+        .description('Runs / delivered / suppressed counters; pass id for detail')
+        .argument('[id]', 'Optional heartbeat id for per-schedule detail')
+        .action((id?: string) => void renderStats('heartbeat', id));
+
+    hb.command('fires')
+        .description('Recent delivery history for one heartbeat')
+        .argument('<id>', 'Heartbeat id')
+        .option('--limit <n>', 'Max rows (default 20, max 500)', '20')
+        .action((id: string, opts: { limit?: string }) =>
+            void renderFires(id, Number(opts.limit ?? 20)),
+        );
+
+    hb.action(() => renderList());
+}
+
+function renderList(): void {
+    renderScheduleList('heartbeat', {
+        title: 'Heartbeats',
+        emptyLabel: 'heartbeats',
+        addHint: 'flopsy heartbeat add --help',
+        middleCells: (r, cfg) => {
+            const name = (cfg['name'] as string | undefined) ?? '(no name)';
+            const interval = (cfg['interval'] as string | undefined) ?? '—';
+            return [name, dim(interval), dim(r.id)];
+        },
     });
 }
 
-function renderList(items: ReadonlyArray<RawHeartbeat>): void {
-    console.log(section('Heartbeats'));
-    if (items.length === 0) {
-        console.log(row('beats', dim('no heartbeats configured')));
-        return;
-    }
-    const rows: string[][] = items.map((h) => {
-        const enabled = h.enabled !== false;
-        const dot = enabled ? tint.success('●') : dim('○');
-        const name = h.name ?? '(unnamed)';
-        const displayName = enabled ? name : dim(name);
-        const interval = h.interval ? dim(h.interval) : dim('(no interval)');
-        const tag = h.oneshot ? dim('one-shot') : '';
-        return [dot, displayName, interval, tag];
+function renderOne(id: string): void {
+    renderScheduleShow('heartbeat', id, {
+        label: 'heartbeat',
+        listCmd: 'flopsy heartbeat list',
+        nameOf: (_r, cfg) => (cfg['name'] as string | undefined) ?? '(no name)',
+        renderDetails: (_r, cfg) => {
+            if (cfg['interval']) console.log(detail('interval', String(cfg['interval'])));
+            if (cfg['deliveryMode']) console.log(detail('deliveryMode', String(cfg['deliveryMode'])));
+            if (cfg['oneshot']) console.log(detail('oneshot', 'yes'));
+            if (cfg['promptFile']) console.log(detail('promptFile', String(cfg['promptFile'])));
+            if (cfg['prompt']) console.log(detail('prompt', truncate(String(cfg['prompt']), 200)));
+        },
     });
-    console.log(table(rows));
-}
-
-function renderOne(h: RawHeartbeat): void {
-    const enabled = h.enabled !== false;
-    const dot = enabled ? tint.success('●') : dim('○');
-    const name = h.name ?? '(unnamed)';
-    const displayName = enabled ? name : dim(name);
-    const state = enabled ? dim('enabled') : dim('disabled');
-    console.log(section(`Heartbeat: ${name}`, 'success'));
-    console.log(`  ${dot} ${displayName}  ${state}`);
-    console.log(detail('interval', h.interval ?? '(none)'));
-    console.log(detail('oneshot', h.oneshot ? 'yes' : 'no'));
-    if (h.deliveryMode) console.log(detail('delivery', h.deliveryMode));
-    if (h.message) console.log(detail('message', h.message));
 }

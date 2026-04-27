@@ -16,7 +16,7 @@ Initialize new codebases using templates, starter kits, or framework generators.
 
 ## How to Run Commands
 
-**Always use the `execute` tool to run commands.** Pass the command string as the `command` parameter. Never tell the user to run commands themselves — you have the `execute` tool.
+**Always invoke shell commands via the Bash tool.** Pass the command string as the `command` parameter. Never tell the user to run commands themselves — you have the Bash tool.
 
 ## Common Scaffolding Tools
 

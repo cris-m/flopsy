@@ -3,7 +3,6 @@ import { createLogger } from '@flopsy/shared';
 import type {
     Channel,
     Message,
-    Peer,
     ChannelWorkerConfig,
     GatewayStatusSnapshot,
 } from '@gateway/types';

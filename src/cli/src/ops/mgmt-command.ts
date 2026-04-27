@@ -13,7 +13,7 @@
 
 import { Command } from 'commander';
 import { bad, dim, info, ok, row, section } from '../ui/pretty';
-import { readFlopsyConfig } from './config-reader';
+import { mgmtUrl } from './schedule-client';
 
 export function registerMgmtCommands(root: Command): void {
     const mgmt = root
@@ -23,7 +23,7 @@ export function registerMgmtCommands(root: Command): void {
     mgmt.command('ping')
         .description('Verify the gateway mgmt endpoint is responding')
         .action(async () => {
-            const url = buildUrl('/mgmt/ping');
+            const url = mgmtUrl('/mgmt/ping');
             try {
                 const res = await fetchWithAuth(url);
                 const body = await res.json();
@@ -34,16 +34,9 @@ export function registerMgmtCommands(root: Command): void {
             } catch (err) {
                 console.log(section('Gateway ping', '#9B59B6'));
                 console.log(row('endpoint', url));
-                console.log(row('status', bad(`unreachable`)));
+                console.log(row('status', bad('unreachable')));
                 console.log(
-                    row(
-                        'hint',
-                        dim(
-                            err instanceof Error
-                                ? err.message
-                                : String(err),
-                        ),
-                    ),
+                    row('hint', dim(err instanceof Error ? err.message : String(err))),
                 );
                 process.exit(1);
             }
@@ -53,7 +46,7 @@ export function registerMgmtCommands(root: Command): void {
         .description('Live status snapshot from the running gateway')
         .option('--json', 'Emit raw JSON')
         .action(async (opts: { json?: boolean }) => {
-            const url = buildUrl('/mgmt/status');
+            const url = mgmtUrl('/mgmt/status');
             try {
                 const res = await fetchWithAuth(url);
                 if (!res.ok) {
@@ -77,34 +70,18 @@ export function registerMgmtCommands(root: Command): void {
         });
 }
 
-function buildUrl(path: string): string {
-    try {
-        const { config } = readFlopsyConfig();
-        const gw = config.gateway ?? {};
-        const port =
-            (gw as { mgmt?: { port?: number } }).mgmt?.port ??
-            ((gw.port ?? 18789) + 1);
-        const host = (gw as { mgmt?: { host?: string } }).mgmt?.host ?? '127.0.0.1';
-        return `http://${host}:${port}${path}`;
-    } catch {
-        return `http://127.0.0.1:18790${path}`;
-    }
-}
-
 async function fetchWithAuth(url: string): Promise<Response> {
     const token = process.env['FLOPSY_MGMT_TOKEN'];
     return fetch(url, {
-        headers: {
-            ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
         signal: AbortSignal.timeout(3000),
     });
 }
 
 /**
- * Render the live snapshot — shape comes from gateway's getStatusSnapshot()
- * which already carries channels + counts. Kept loose (Record<string,
- * unknown>) to not couple the CLI tightly to a type that's still evolving.
+ * Render the live snapshot. Shape comes from gateway's getStatusSnapshot()
+ * which already carries channels + counts. Kept loose (Record<string, unknown>)
+ * to not couple the CLI tightly to a type that's still evolving.
  */
 function renderSnapshot(snap: Record<string, unknown>): void {
     console.log(section('Gateway (live)', '#9B59B6'));
@@ -131,9 +108,7 @@ function renderSnapshot(snap: Record<string, unknown>): void {
     const webhook = snap['webhook'] as Record<string, unknown> | undefined;
     if (webhook) {
         console.log(section('Webhook (live)', '#E67E22'));
-        console.log(
-            row('state', webhook['enabled'] ? ok('on') : dim('off')),
-        );
+        console.log(row('state', webhook['enabled'] ? ok('on') : dim('off')));
         if (webhook['routeCount'] !== undefined) {
             console.log(row('routes', String(webhook['routeCount'])));
         }
@@ -142,9 +117,7 @@ function renderSnapshot(snap: Record<string, unknown>): void {
     const proactive = snap['proactive'] as Record<string, unknown> | undefined;
     if (proactive) {
         console.log(section('Proactive (live)', '#1ABC9C'));
-        console.log(
-            row('running', proactive['running'] ? ok('yes') : bad('no')),
-        );
+        console.log(row('running', proactive['running'] ? ok('yes') : bad('no')));
         if (proactive['heartbeats'] !== undefined) {
             console.log(row('heartbeats', String(proactive['heartbeats'])));
         }

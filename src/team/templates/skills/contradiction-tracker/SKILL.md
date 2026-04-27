@@ -15,7 +15,7 @@ Monitor public statements from entities (politicians, companies, public figures)
 - Tracking an entity's positions over time
 - As part of critical-analysis-chain when analyzing claims from a known entity
 
-## Process
+## Workflow
 
 ### Step 1: Log Statements
 When analyzing content from a public entity, save notable claims to memory:

@@ -40,6 +40,7 @@ export class MessageQueue {
                 this.coalesceTimer = null;
                 this.flush();
             }, this.coalesceDelayMs);
+            this.coalesceTimer.unref();
         }
     }
 

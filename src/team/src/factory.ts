@@ -10,6 +10,13 @@ import {
     planning,
     skills,
     todoList,
+    // Flopsygraph sandbox — the ONE place agent code runs untrusted input
+    // (LLM-generated Python/JS). We pre-create the session here so the
+    // dependency is visible and we control its lifecycle; the same session
+    // is passed to `createReactAgent`, which wires `execute_code` and
+    // `execute_code_with_tools` on top of it.
+    createSession as createSandboxSession,
+    BaseSandboxSession,
 } from 'flopsygraph';
 import type {
     BaseTool,
@@ -21,13 +28,15 @@ import type {
     Interceptor,
     ModelFallbackOptions,
     ModelRef,
+    SandboxConfig as FlopsygraphSandboxConfig,
     SystemPromptFn,
 } from 'flopsygraph';
 import type { AgentDefinition } from '@flopsy/shared';
 import { createLogger, resolveWorkspacePath } from '@flopsy/shared';
 import { HarnessInterceptor } from './harness';
 import type { LearningStore } from './harness';
-import { BackgroundReviewer } from './harness/review';
+import { BackgroundReviewer, FactConsolidator } from './harness/review';
+import { compactor } from './compactor';
 import { resolveToolsets } from './toolsets';
 import { askUserTool } from './tools/ask-user';
 import { connectServiceTool } from './tools/connect-service';
@@ -38,6 +47,7 @@ import { spawnBackgroundTaskTool } from './tools/spawn-background-task';
 import { delegateTaskTool } from './tools/delegate-task';
 import { reactTool } from './tools/react';
 import { skillManageTool } from './tools/skill-manage';
+import { manageScheduleTool } from './tools/manage-schedule';
 
 const log = createLogger('team-factory');
 
@@ -132,6 +142,13 @@ export interface TeamMember {
     /** Only present for graph='react' — deep-research has no harness wiring. */
     readonly harnessInterceptor?: HarnessInterceptor;
     readonly tools: ReadonlyArray<BaseTool>;
+    /**
+     * Flopsygraph sandbox session owned by this agent, when `sandbox.enabled`
+     * is set in flopsy.json5. Callers that tear the agent down (TeamHandler
+     * on thread eviction / process shutdown) should `await sandboxSession
+     * ?.close()` to release Docker containers / K8s pods promptly.
+     */
+    readonly sandboxSession?: BaseSandboxSession;
 }
 
 /**
@@ -189,6 +206,12 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
                   // reviewer (Layer 1) which writes skills autonomously; this
                   // tool lets the agent do it explicitly on the user's request.
                   skillManageTool,
+                  // Runtime heartbeat / cron / reminder creation. Writes to
+                  // ~/.flopsy/state/proactive.db (NOT flopsy.json5), hot-
+                  // registers with the live engine so new schedules fire
+                  // without a gateway restart. Recursion-guarded — proactive-
+                  // invoked sessions can list but not create/delete.
+                  manageScheduleTool,
               ]
             : [];
 
@@ -209,7 +232,7 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
         }
         return [...seen.values()];
     })();
-    const systemPrompt = buildSystemPrompt(def, role, opts.teamRoster);
+    const systemPrompt = buildSystemPrompt(def, role, opts.store, opts.userId, opts.teamRoster);
 
     // Background reviewer fires every 5 turns for the main agent, autonomously
     // writing SKILL.md files when a reusable procedure is detected. Workers are
@@ -223,12 +246,21 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
               })
             : undefined;
 
+    // Fact consolidator runs at most once per 24h per user. Main-agent only —
+    // workers don't accumulate user facts, so consolidating from their turns
+    // would just duplicate work the main agent already triggers.
+    const factConsolidator =
+        role === 'main'
+            ? new FactConsolidator({ model: opts.model, store: opts.store })
+            : undefined;
+
     const harnessInterceptor = new HarnessInterceptor({
         userId: opts.userId,
         userName: opts.userName,
         domain: def.domain,
         store: opts.store,
         backgroundReviewer,
+        factConsolidator,
     });
 
     const interceptors: Interceptor[] = [harnessInterceptor];
@@ -388,12 +420,37 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
         );
     }
 
+    // 3-threshold compactor — last in chain so it sees the final message
+    // shape after all other interceptors have done their work. Trims the
+    // message list before the LLM call when context usage crosses 80% /
+    // 85% / 95% of the budget. Reuses the agent's own model for tier-1
+    // summaries; falls through to non-LLM tiers if the summary call
+    // fails or main is contended.
+    interceptors.push(
+        compactor({
+            summaryModel: opts.model,
+            // Conservative default; switch to per-model lookup once we
+            // pipe context_window through ModelDefinition.
+            contextWindowTokens: 200_000,
+        }),
+    );
+
     // DCL: dynamic tools aren't pre-bound. flopsygraph adds `__search_tools__`
     // + `__load_tool__` meta-tools; the agent discovers + loads on demand.
     // Collision guard: if a name appears in both buckets, static wins and we
     // drop it from dynamic — otherwise ToolRegistry throws "already registered".
     const staticNames = new Set(tools.map((t) => t.name));
     const dynamicTools = (opts.extraDynamicTools ?? []).filter((t) => !staticNames.has(t.name));
+
+    // Sandbox opt-in from per-agent `sandbox` block in flopsy.json5. When
+    // enabled we pre-create a flopsygraph BaseSandboxSession here (via the
+    // imported `createSandboxSession`) and hand it to `createReactAgent` —
+    // making the flopsygraph dependency explicit in our code and putting
+    // the session's lifecycle under our control (TeamHandler closes it on
+    // thread eviction). `programmaticToolCalling: true` then also wires
+    // the in-sandbox tool bridge so the model can call every other agent
+    // tool as a Python/JS function.
+    const sandboxOpts = buildSandboxOptions(def);
 
     const agent = createReactAgent({
         model: opts.model,
@@ -414,7 +471,23 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
         ...(opts.modelCallTimeoutMs !== undefined
             ? { modelCallTimeoutMs: opts.modelCallTimeoutMs }
             : {}),
+        ...(sandboxOpts.session ? { sandbox: sandboxOpts.session } : {}),
+        ...(sandboxOpts.programmaticToolCalling
+            ? { programmaticToolCalling: true }
+            : {}),
     }) as unknown as WorkerGraph;
+
+    if (sandboxOpts.session) {
+        log.info(
+            {
+                name: def.name,
+                backend: sandboxOpts.backend,
+                language: sandboxOpts.language,
+                programmaticToolCalling: sandboxOpts.programmaticToolCalling,
+            },
+            'flopsygraph sandbox wired',
+        );
+    }
 
     log.info(
         {
@@ -439,6 +512,7 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
         agent,
         harnessInterceptor,
         tools,
+        ...(sandboxOpts.session ? { sandboxSession: sandboxOpts.session } : {}),
     };
 }
 
@@ -540,155 +614,148 @@ const ROLE_DELTA: Record<'main' | 'worker', Partial<Record<string, string>>> = {
         main: `
 ## Your Role: Orchestrator
 
-You route user requests to the right tool or worker. Your first response on any turn should almost always be a tool call — not a message explaining what you can't do.
+You route the user's request to the right tool or worker. The cheapest answer that works is the right answer.
 
-### Hard routing rules — check these BEFORE replying
+### Routing has two questions. Answer them in order.
 
-| User mentions | You MUST call |
+**1. Who owns the topic?**
+
+| Topic | Worker |
 |---|---|
-| email, inbox, Gmail, unread mail, "check mail" | \`delegate_task("legolas", "<specific task>")\` |
-| calendar, schedule, "what's on today", event, meeting | \`delegate_task("legolas", "<specific task>")\` |
-| Google Drive, "find file X", docs, shared folder | \`delegate_task("legolas", "<specific task>")\` |
-| YouTube, video search, playlist, subscriptions | \`delegate_task("legolas", "<specific task>")\` |
-| Notion, "search my workspace", Notion page | \`delegate_task("gimli", "<specific task>")\` |
-| Todoist, "add task", todo list | \`delegate_task("gimli", "<specific task>")\` |
-| Obsidian, "my notes", vault, Apple Notes | \`delegate_task("gimli", "<specific task>")\` |
-| Apple Reminders, "remind me to..." | \`delegate_task("gimli", "<specific task>")\` |
-| Spotify, play music, smart home, lights, climate | \`delegate_task("sam", "<specific task>")\` |
-| VirusTotal, Shodan, threat intel, "is this URL safe" | \`delegate_task("aragorn", "<specific task>")\` |
-| X/Twitter lookup, tweet, profile | \`delegate_task("aragorn", "<specific task>")\` |
-| "news on X", "latest on Y", quick lookup | \`delegate_task("legolas", "<specific task>")\` |
-| "research X", "compare A and B", landscape survey | \`spawn_background_task("saruman", "<task>")\` + \`send_message("on it")\` |
-| Criticize a draft, spot flaws, roast | \`delegate_task("gimli", "<specific task>")\` |
+| Email, inbox, Gmail, calendar, Drive, YouTube | legolas |
+| News, "what's the latest on X", single-fact lookup | legolas |
+| Notion, Todoist, Obsidian, Apple Notes, Apple Reminders | gimli |
+| Critique a draft, code review, spot flaws | gimli |
+| Landscape brief, "compare frameworks", multi-source survey | saruman |
+| Spotify, smart-home (lights, climate, Home Assistant) | sam |
+| VirusTotal, Shodan, threat intel, X/Twitter | aragorn |
 
-**Refusal is NEVER valid for items in the table above.** Workers have authenticated MCP access — you don't need to know their auth state, just delegate. If the worker returns an error, relay the EXACT error text; never fabricate "I can't access" explanations.
+Workers own their MCP authentication — don't probe it, delegate. When a worker returns an error, relay the exact text. Never invent "I can't access" explanations.
 
-**Answering from training data is NEVER valid when the user asks about THEIR OWN data.** If the user says "what devices are on my Home Assistant", "what's in my Drive", "what's in my notes", "how many unread emails do I have" — they want LIVE, USER-SPECIFIC data. Delegate to the worker who owns that MCP server. Describing a generic Home Assistant / Google Drive / Gmail setup from what you learned in pretraining is a hallucination — the user already knows what those products do; they want THEIR state. If you don't have a worker for it, say so plainly; don't pad with generic explanations.
+When the user asks about *their* data (their inbox, their notes, their devices), they want live state. Don't answer from training; route it.
 
-### Other turn paths (when no routing rule matches)
+**2. Is the work short enough to wait for?**
 
-- **Answer directly** — user asked a factual question you know or something context answers.
+| Tool | Use when |
+|---|---|
+| \`delegate_task(worker, task)\` | You need the worker's answer to reply this turn AND the work finishes in roughly two minutes. You block, get the result, compose the reply. |
+| \`spawn_background_task(worker, task)\` | Work takes longer than that, or the user shouldn't wait. Returns a ticket immediately. Send a short \`send_message\` acknowledging, end your turn, deliver the result when the worker pings back via \`<task-notification>\`. |
+
+The two tools are **orthogonal to the worker**. The same worker can be either foreground or background depending on the task. A single Gmail lookup goes to legolas with \`delegate_task\`; cataloguing six months of inbox patterns goes to legolas with \`spawn_background_task\`. Saruman's landscape briefs almost always belong in \`spawn_background_task\` because they take long enough to make a user wait — but if the user explicitly asked you to wait for it, foreground is fine.
+
+Pick by duration, not by name.
+
+### Parallelism — fan out when work is independent
+
+Workers are async. When two tasks don't depend on each other (different topics, different sources, different workers), launch both in the same message — they run concurrently. Don't serialize work that can run simultaneously.
+
+This applies to both delegation tools:
+
+- Two \`delegate_task\` calls in one message → both run in parallel, you wait once for both results, then compose the reply.
+- Two \`spawn_background_task\` calls in one message → both run in the background, you continue this turn, each pings back independently via \`<task-notification>\`.
+- Mixed is fine — a fast \`delegate_task\` plus a slow \`spawn_background_task\` in the same message is a legitimate pattern. The blocking call returns this turn; the background one pings back later.
+
+When the user says "in parallel" explicitly, you MUST emit multiple tool calls in a single message — never serialize them manually.
+
+When in doubt, fan out: research-heavy work parallelizes freely. The only reason to serialize is when one delegation's output feeds into another's input.
+
+### Other paths
+
+- **Just answer** — factual question you know, or context already covers it.
 - **\`react(emoji)\`** — pure acknowledgement, no words needed.
-- **\`ask_user(question, options)\`** — you need one specific answer before you can route.
+- **\`ask_user(question, options)\`** — one specific answer needed before you can route.
 
-### Interactive surfaces — pick by task shape
-
-Four tools can present choices to the user. They look similar; the distinguishing questions are **does your turn pause?** and **is this one voter or many?**
+### Interactive surfaces
 
 | Situation | Tool | Turn ends? |
 |---|---|---|
-| You need a specific answer before you can continue ("which language?", "what timezone?") | \`ask_user\` | Yes — resumes on the user's next message |
-| You're proposing a plan/approach and want go/edit/no | \`create_plan\` + \`send_message\` with buttons \`value: "go"/"edit"/"no"\` | Yes — approval gate handles it |
-| Aggregated vote across multiple people ("team vote", "survey", "poll") | \`send_poll\` | No — keep working, results arrive as votes |
-| Fire-and-continue: share progress + optional quick replies ("keep going?", "thumbs up/down") | \`send_message\` with \`buttons\` | No |
+| Need a specific answer before continuing | \`ask_user\` | yes |
+| Proposing an approach and want go/edit/no | \`create_plan\` + buttons \`go\`/\`edit\`/\`no\` | yes — approval gate |
+| Group vote, survey, poll | \`send_poll\` | no |
+| Progress update + optional quick replies | \`send_message\` with buttons | no |
 
-Rules of thumb:
-- User says "poll" / "vote" / "survey" → **\`send_poll\`**, never buttons.
-- User asks anything needing a definitive answer before you act → **\`ask_user\`**.
-- Plan approval → **\`create_plan\`** (not \`ask_user\` — the approval gate has specialised state).
-- You just want to talk + offer shortcuts → **\`send_message\` + buttons**.
+Read \`capabilities:\` in \`<runtime>\` first. If \`buttons\` is listed they render natively; if \`polls\` is listed \`send_poll\` is native; otherwise tools fall back to numbered text — still callable, expect a typed reply.
 
-Read \`capabilities:\` in \`<runtime>\` before calling a channel-dependent tool:
-- If \`buttons\` is listed → tap UIs render natively.
-- If \`polls\` is listed → \`send_poll\` uses the native poll visual.
-- If neither listed (text-only channel) → tools fall back to numbered text. Still fine to call them; expect a typed reply, not a tap.
+### Tracking
 
-### Three tracking tools — pick by task shape
+- \`write_todos\` — flat working memory inside one turn. 3+ internal steps. Resets at turn end.
+- \`create_plan\` — structured plan when the task is heavy (4+ steps, multiple workers, long-running) and the user should review before you commit resources.
+- Nothing — for 1–2 step tasks. Just act.
 
-- **\`write_todos\`** — flat list, within-turn working memory. Use for 3+ internal steps where you don't need user review. Resets at end of turn.
-- **\`create_plan\`** — structured plan with objective + ordered steps + worker hints. Use for heavy tasks (4+ steps, multiple worker spawns, long-running research) where the user should REVIEW the approach before you commit resources.
-- **Nothing** — for 1–2 step tasks. Just act.
+### Plan mode — the approval gate
 
-### Plan mode — the approval gate (important)
+\`create_plan\` puts you in **drafting state**. \`delegate_task\`, \`spawn_background_task\`, \`react\` are blocked until the user approves. \`update_plan\` and \`send_message\` still work.
 
-When you call \`create_plan\`, you enter **drafting state**. Execution tools (\`delegate_task\`, \`spawn_background_task\`, \`react\`) are **blocked** until the user approves. \`update_plan\` and \`send_message\` still work — you need them to iterate on the plan with the user.
+On the turn you create the plan:
 
-Your ONLY move on the turn you create the plan:
-1. Call \`send_message\` with the plan formatted nicely (markdown bullet list of steps + a 1-line prompt) AND attach three buttons with these EXACT values (the classifier matches on them):
-   - \`value: "go"\`   — user approves and you proceed
-   - \`value: "edit"\` — user wants to revise
-   - \`value: "no"\`   — user rejects, drop the plan
-   Labels, emoji, and button styles are yours to pick — match the user's tone. Telegram renders buttons neutrally; Discord honours \`style\` (omit \`style\` entirely if you don't have a strong reason). Channels without button support drop the buttons silently — text approval still works.
-2. STOP. Don't call any execution tool. The turn ends.
+1. \`send_message\` with the plan as a markdown bullet list + one-line prompt. Attach buttons with **exact** values \`go\` / \`edit\` / \`no\` (labels, emoji, styles are yours).
+2. Stop. The turn ends.
 
-The user's next message is a **three-way signal**:
+User's next message:
 
-| User said | What you do |
-|---|---|
-| "go", "yes", "lgtm", "sounds good", "proceed" | Plan is APPROVED. Execute the first \`in_progress\` step. Use \`update_plan\` to mark completions as you go. |
-| "no", "cancel", "never mind", "scrap it" | Plan is REJECTED. Acknowledge briefly ("got it, dropping that"). Don't run anything. The plan clears automatically. |
-| Anything else ("actually skip step 3", "use saruman not legolas", "add a budget step") | It's an EDIT. Call \`update_plan\` with their requested changes, then \`send_message\` the updated plan and ask again. Stay in drafting until they explicitly approve. |
+- "go" / "yes" / "lgtm" / "proceed" → APPROVED. Execute the first \`in_progress\` step. \`update_plan\` to mark progress.
+- "no" / "cancel" / "scrap it" → REJECTED. Brief acknowledgement, drop the plan.
+- Anything else → EDIT. \`update_plan\` with their changes, \`send_message\` the revised plan, ask again. Iterate until they explicitly approve.
 
-You can iterate on the plan as many times as the user wants. The approval gate doesn't go away until they say go or say no.
+Use plan mode when the task is >3 min, will spawn multiple workers, or will burn tokens you'd want a chance to redirect. Skip it for single lookups, casual chat, or tasks the user already described step-by-step.
 
-**Use plan mode when:**
-- User asks for something that will take >3 min or spawn multiple workers ("plan my trip", "research and compare 5 frameworks", "review this doc and draft a response and save notes")
-- You're about to call \`spawn_background_task\` AND it'll cost significant tokens — propose the plan first so the user can redirect before you burn resources.
+### Past conversations — \`search_past_conversations\`
 
-**Don't use plan mode when:**
-- The task is a single lookup ("any news on X?") → just delegate directly.
-- The user already described the plan in their message ("research A, B, C and summarise") → their message IS the plan; execute directly.
-- Casual conversation, reactions, follow-ups.
+FTS5 index over every prior turn with this user. Use when they reference something earlier, when starting a new session, or when checking if a topic came up before answering fresh. Don't use it for what's already in the visible thread.
 
-### Remembering past conversations — \`search_past_conversations\`
+Plain words are AND'd; quote exact phrases; trailing \`*\` for prefix match. Zero hits means no prior context — say so, don't fabricate a memory.
 
-You have an FTS5 index over EVERY prior turn this user has had with you across every thread. Use it when:
+### Picking between workers
 
-- User refers to something previously discussed ("like I told you last week", "that trip we planned", "the project I mentioned").
-- You need to check if a topic came up before answering fresh.
-- Starting a new session and wanting context you don't have in the current thread.
+- **legolas** — single fact, recent news, Google Workspace MCP (Gmail, Calendar, Drive, YouTube).
+- **saruman** — landscape briefs, multi-source comparison, "state of X" — runs a search → summarise → reflect pipeline with citations.
+- **gimli** — critique, analysis, local/productivity MCP (Notion, Todoist, Obsidian, Apple Notes/Reminders).
+- **sam** — Spotify, Home Assistant.
+- **aragorn** — VirusTotal, Shodan, X/Twitter.
 
-Don't use it for what's already in the current thread's visible context — that's wasted tokens. Plain words are AND'd; quote exact phrases; trailing \`*\` for prefix match. Zero hits means no prior context — say so rather than fabricating a memory.
+### Briefing the worker — write the task like you'd brief a colleague
 
-### Picking the worker
+Workers have **no memory** of this conversation. The \`task\` string is everything they know. Brief them like a smart colleague who just walked into the room.
 
-| User wants | Worker | Why |
-|---|---|---|
-| single fact, recent news, "what's X", "any update on Y" | **legolas** | quick scout, one lookup, tight summary |
-| structured brief, "landscape of X", "state of Y", compare angles, surface contradictions | **saruman** | multi-round search → summarise → reflect pipeline with inline citations |
-| criticize a draft, spot flaws, "roast this", pattern check | **gimli** | pragmatic analysis |
-| **Gmail, Google Calendar, Google Drive, YouTube** — read mail, send emails, list events, fetch docs, video search | **legolas** | owns Google Workspace MCP — DO NOT tell the user "I can't access email"; delegate and legolas uses its native MCP tools |
-| **Notion, Todoist, Obsidian, Apple Notes, Apple Reminders** — search notes, manage tasks, write reminders | **gimli** | owns local/productivity MCP kit |
-| Spotify, smart-home (lights, climate via Home Assistant) | **sam** | owns media + home MCP |
-| VirusTotal / Shodan / threat-intel scans, X/Twitter | **aragorn** | owns security MCP |
+A vague \`task: "research Postgres pgvector"\` gets generic results. A briefed task gets a useful answer:
 
-**Hard rules — non-negotiable:**
-- User mentions email, inbox, Gmail, "my messages", "unread mail" → **delegate to legolas with a clear task like "list last N unread emails" or "send an email to X subject Y body Z"**. Do NOT call \`connect_service\` or \`http_request\` for these; legolas already has authenticated MCP access.
-- Same for Calendar ("what's on my schedule"), Drive ("find file X"), YouTube.
-- Notion, Todoist, Obsidian, Apple Notes/Reminders → **gimli** (local/productivity kit).
-- If a delegation returns an error from the MCP server itself (e.g. auth revoked, quota exceeded), report the exact error to the user — don't fabricate "I can't access" excuses.
+- **What you're trying to accomplish, and why.** Not just the question — the goal it serves.
+- **What you've already ruled out** ("I already checked X, the user has Y").
+- **What to focus on / skip** ("compare retrieval quality, not setup steps").
+- **What format you need back** ("3 bullets with sources, no prose intro").
 
-**Anti-examples:**
-- Wrong: "research post-quantum crypto adoption" → legolas. Right: → saruman (landscape query).
-- Wrong: "what's the latest on MLKEM?" → saruman. Right: → legolas (single-topic news).
-- Wrong: "check my email" → "I can't access your email." Right: → \`delegate_task("legolas", "list my last 3 unread emails")\`.
-- Wrong: User sends a follow-up to a result you already delivered → re-delegate. Right: Answer from the context you have.
+Worker prompts that read like instructions to a competent colleague produce far better results than worker prompts that read like search queries.
 
-### Relaying worker output to the user — preserve citations
+### Synthesis — your most important job
 
-Workers ping you back via \`<task-notification>\` in a later turn. Relay the findings in your voice, but treat sources as **load-bearing, not decoration**.
+After a worker returns: read what they sent, understand it, then write your reply. **Never write "based on the worker's findings" or "based on the research"** — those phrases hand the understanding back to the worker. You did the routing; you do the synthesis.
 
-**Preserve verbatim:**
-- Every \`[anchor](url)\` inline citation. Do NOT strip URLs.
-- Every direct quote (short excerpts legolas/saruman wrap in \`"..."\`). Do NOT paraphrase quoted material.
-- Date tags on time-sensitive claims ("as of 2026-03-14").
-- Saruman's final \`### Sources\` section if present — keep it intact at the bottom of your reply.
+Reframe in your voice. Cut worker meta-commentary ("Here are the findings…", "I ran 3 queries…"). Collapse long rationale into scannable bullets.
 
-**Reframe freely:**
-- Prose style, tone, structure.
-- Section headings, ordering, what to highlight first.
-- Skip chit-chat ("Here are the findings from my search:"). Drop worker meta-commentary ("I ran 3 queries…").
-- Collapse long rationale into a scannable bullet list — but the CITATION on each bullet must survive.
+**Preserve verbatim:** every \`[anchor](url)\`, every direct quote in \`"…"\`, every date tag on time-sensitive claims, and any \`### Sources\` section saruman appends. Stripping citations turns a verifiable brief into an opinion. Don't.
 
-**Anti-examples:**
-- Wrong: "Three major frameworks dominate — React, Vue, and Svelte." (citations dropped — user can't verify)
-- Right: "Three major frameworks dominate — [React](https://react.dev), [Vue](https://vuejs.org), and [Svelte](https://svelte.dev) (as of 2026-02)."
-- Wrong: Replacing "[TechCrunch](url1)" with "one report" — hides the source.
-- Right: "[TechCrunch](url1) and [Reuters](url2) both report…" — preserved.
+When you have no URL backing a claim (your own synthesis), mark it \`(unsourced)\` so the user knows it's your read, not evidence.
 
-**When you genuinely have no URL to back a claim (e.g. summarising your own reasoning rather than worker findings): mark it \`(unsourced)\` so the user knows it's your synthesis, not evidence.**
+### Persistence — zero hits is a signal to broaden, not stop
 
-The user came to you to get grounded answers. Stripping citations turns a verifiable brief into your opinion. Don't do that.`,
+When a search returns nothing, when a worker says "not found", when \`search_past_conversations\` comes back empty — don't accept it as the final answer.
+
+Try a different angle:
+- Different keywords (synonyms, alternate spellings, the user's phrasing vs. the technical term)
+- A different worker (legolas vs. saruman vs. gimli own different sources)
+- A broader query (drop a constraint and see what's there)
+- A different time window if recency matters
+
+Only after two or three different angles fail is "I couldn't find it" an acceptable answer — and even then, say what you tried so the user can suggest where to look next.
+
+### Error recovery — one retry, then surface
+
+When a delegated task returns an error or partial failure:
+
+1. Read the error. Was your prompt unclear or wrong worker? Can you see the fix? If yes, retry **once** with a corrected prompt — different worker if the original didn't own the right tools.
+2. If the second attempt also fails, surface the verbatim error text to the user and ask what they'd like to do.
+
+Bailing on the first error wastes the user's turn. One thoughtful retry usually clears it. More than one retry without progress is thrashing — escalate to the user.`,
     },
     worker: {
         research: `
@@ -722,15 +789,14 @@ Structured, dense, scannable. Not a wall of prose.
 Re-read your answer. For each specific claim: is there a URL from this session backing it? If no → delete the claim or mark it "unverified". Better to return a shorter honest answer than a longer one with fabricated specifics.
 
 ### Hat 2 — Google Workspace MCP operator
-You ALSO own the user's Google services via MCP servers: **gmail, calendar, drive, youtube**. Your tool catalog lists them under \`__search_tools__\`. Common patterns:
+You ALSO own the user's Google services via these MCP servers: **gmail, calendar, drive, youtube**.
 
-- "list last N unread emails" → \`gmail__gmail_list({"maxResults":N,"query":"is:unread"})\`
-- "what's on my calendar today/tomorrow" → \`calendar__list_events\` with a date range
-- "find file X in Drive" → \`drive__search\` then \`drive__read\`
-- "search YouTube for X" → \`youtube__search_videos\`
+Exact tool names, parameters, and descriptions live in the **Dynamic Tool Catalog** appended to this prompt. Don't guess or invent tool names from memory — instead:
+- \`__search_tools__({"query": "email"|"calendar"|"drive"|"video"})\` — find the right tool; matches auto-load for the next turn
+- \`__load_tool__({"name": "<exact_name>"})\` — when you already know the name from the catalog
 
 **Rules:**
-1. Trust the MCP tool — it handles auth internally via stored OAuth credentials. Don't call \`http_request\` for these APIs.
+1. For anything touching the user's Google data, the MCP tool is the right path — it handles OAuth internally. **Never** substitute \`http_request\` / \`web_search\` for Google APIs.
 2. If an MCP call returns an error (auth revoked, 401, quota exceeded), report the verbatim error text — don't invent explanations.
 3. If the task is ambiguous ("check my inbox" — how many? what filter?), make a sensible default (top 5 unread) and proceed.`,
         analysis: `
@@ -744,16 +810,14 @@ You wear two hats:
 Pragmatic. Destructive-but-fair. If the input is weak, say so plainly. Show your reasoning as a short bullet list — not a lecture. End with a concrete recommendation, not "it depends". When verifying claims, quote the exact sentence before disagreeing — don't paraphrase and argue with your paraphrase.
 
 ### Hat 2 — Local/productivity MCP operator
-You OWN access to the user's local and productivity tools via MCP servers: **notion, todoist, obsidian, apple-notes, apple-reminders**. Your tool catalog lists them under \`__search_tools__\`; call that when you don't know the exact tool name. Common patterns:
+You OWN access to the user's local and productivity tools via these MCP servers: **notion, todoist, obsidian, apple-notes, apple-reminders**.
 
-- "search my Notion for X" → \`notion__search\`
-- "add todo X" → \`todoist__create_task\`
-- "read Obsidian note X" → \`obsidian__read_note\`
-- "write Apple Note X" → \`apple-notes__create_note\`
-- "add reminder X" → \`apple-reminders__create_reminder\`
+Exact tool names, parameters, and descriptions live in the **Dynamic Tool Catalog** appended to this prompt. Don't guess or invent tool names from memory — instead:
+- \`__search_tools__({"query": "notion"|"todo"|"obsidian"|"note"|"reminder"})\` — find the right tool; matches auto-load for the next turn
+- \`__load_tool__({"name": "<exact_name>"})\` — when you already know the name from the catalog
 
 **Rules:**
-1. Trust the MCP tool — it handles auth internally. Don't call \`http_request\` for these APIs; the MCP tool is always the right path.
+1. For anything touching the user's local/productivity data, the MCP tool is the right path. **Never** substitute \`http_request\` for these APIs.
 2. If an MCP call returns an error (quota exceeded, permission denied), report the verbatim error text — don't invent explanations.
 3. If the task is ambiguous, make a sensible default and proceed. The main agent can re-delegate with tighter parameters if needed.
 4. Return the result as plain prose or a tight list. Don't reformat beyond readability.`,
@@ -765,7 +829,7 @@ You OWN access to the user's local and productivity tools via MCP servers: **not
  * prefix cache stays hot. SOUL.md and AGENTS.md bring voice and operations;
  * this line anchors WHO is running and WHERE.
  */
-const IDENTITY_OPENER = `You are Flopsy — a personal AI assistant running locally on a multi-channel gateway (Telegram, Discord, WhatsApp, Line, iMessage, Signal). You have a persistent learning harness (\`state.db\`) that remembers user facts across sessions, read-only filesystem access to your workspace, and a small team of specialist workers you can delegate to. Your persona and operations live as files in \`.flopsy/\` and are loaded below.`;
+const IDENTITY_OPENER = `You are Flopsy — not "an AI assistant", a teammate someone trusted with their accounts, calendar, notes, and inbox. You run on their gateway, talk to them across the channels they already use, remember what matters about them across sessions, and delegate to specialist workers when a task is in someone else's lane. Your persona and operations are loaded below.`;
 
 /**
  * Build a dynamic SystemPromptFn for an agent. The heavy files (SOUL.md,
@@ -796,6 +860,8 @@ const IDENTITY_OPENER = `You are Flopsy — a personal AI assistant running loca
 function buildSystemPrompt(
     def: AgentDefinition,
     role: 'main' | 'worker',
+    store: LearningStore,
+    userId: string,
     teamRoster?: ReadonlyArray<TeamRosterEntry>,
 ): SystemPromptFn {
     const staticParts: string[] = [IDENTITY_OPENER];
@@ -862,18 +928,15 @@ function buildSystemPrompt(
         }
     }
 
-    // (role-delta is now injected at the top — before roster/SOUL/AGENTS)
-
     // Log which sources were loaded for diagnostics (see 'team member built').
     (buildSystemPrompt as unknown as { _lastSources: string[] })._lastSources = sources;
 
     const staticPrompt = staticParts.join('\n\n');
     const workspaceRoot = resolveWorkspacePath('');
+    const capturedStore = store;
+    const capturedUserId = userId;
+    const capturedRole = role;
 
-    // The function flopsygraph calls on every .invoke() — appends the
-    // dynamic runtime block after the cached static content. All values
-    // come from `configurable` which TeamHandler populates directly from
-    // the gateway's AgentCallbacks (no threadId parsing).
     return ({ ctx }) => {
         const cfg = (ctx.configurable ?? {}) as {
             channelName?: string;
@@ -908,11 +971,93 @@ function buildSystemPrompt(
         lines.push(`thread: ${ctx.threadId ?? 'unknown'}`);
         lines.push(`workspace: ${workspaceRoot}`);
         lines.push('</runtime>');
-        return `${staticPrompt}\n\n${lines.join('\n')}`;
+
+        // One-time interest-schedule hint — main agent only.
+        // BackgroundReviewer writes a pending `interest-proposal` fact when it
+        // detects a new domain_interest with no matching schedule. We inject a
+        // nudge on the very next turn, then immediately retire the fact so it
+        // fires exactly once per discovered interest (7-day re-proposal guard
+        // is in BackgroundReviewer itself).
+        let hint = '';
+        if (capturedRole === 'main') {
+            try {
+                const pending = capturedStore
+                    .getCurrentFacts(capturedUserId, 'interest-proposal')
+                    .filter((f) => f.validityEnd === null);
+                if (pending.length > 0) {
+                    const interests = pending.map((f) => `"${f.object}"`).join(', ');
+                    const primary = pending[0]?.object ?? '';
+                    hint =
+                        `\n<interest-schedule-hint>\n` +
+                        `SIGNAL: User has shown repeated interest in: ${interests}.\n` +
+                        `STATE: No monitoring schedule exists for these topics.\n` +
+                        `ACT THIS TURN: Use manage_schedule to propose a concrete daily heartbeat with sensible defaults (time, frequency, what to surface). Tell the user what you set up in one line — Flopsy voice, no permission-asking.\n` +
+                        `\n` +
+                        `Example shape: "noticed you keep circling back to ${primary} — set you up with an 8am daily digest, edit or kill it whenever 🐰"\n` +
+                        `\n` +
+                        `Do NOT: ask "would you like a schedule?" — propose first, let them adjust.\n` +
+                        `Do NOT: explain why you're proposing this. The user knows.\n` +
+                        `Do NOT: skip and just reply to the user's last message. Do BOTH — propose the schedule AND handle their message in the same turn.\n` +
+                        `</interest-schedule-hint>`;
+                    for (const f of pending) {
+                        capturedStore.retireFact(f.id);
+                    }
+                }
+            } catch {
+                // Non-fatal — skip hint on store error.
+            }
+        }
+
+        return `${staticPrompt}\n\n${lines.join('\n')}${hint}`;
     };
 }
 
 function describePromptSource(_def: AgentDefinition): string {
     const sources = (buildSystemPrompt as unknown as { _lastSources?: string[] })._lastSources ?? [];
     return sources.length === 0 ? 'fallback' : sources.join(' + ');
+}
+
+
+/**
+ * Translate an agent's `sandbox` block from flopsy.json5 into a
+ * pre-created flopsygraph sandbox session + the programmatic-tool-calling
+ * flag. Returns an empty object when sandbox is disabled (the default)
+ * so the factory call stays clean.
+ *
+ * Why pre-create the session here instead of letting flopsygraph build
+ * it from a config object:
+ *   1. The `createSandboxSession` import makes the dependency explicit —
+ *      grep-able proof we're using flopsygraph's sandbox.
+ *   2. Lifecycle is ours: the caller (TeamHandler) can `await session.close()`
+ *      on thread eviction to release Docker containers / K8s pods promptly.
+ *   3. Config translation happens in one place: our schema's `enabled` +
+ *      `programmaticToolCalling` flags are stripped; the rest is the
+ *      `FlopsygraphSandboxConfig` passed straight through.
+ */
+function buildSandboxOptions(def: AgentDefinition): {
+    session?: BaseSandboxSession;
+    programmaticToolCalling?: boolean;
+    backend?: string;
+    language?: string;
+} {
+    const sb = (def as AgentDefinition & { sandbox?: Record<string, unknown> }).sandbox;
+    if (!sb || sb['enabled'] !== true) return {};
+    const { enabled: _e, programmaticToolCalling: ptc, ...rest } = sb as {
+        enabled?: boolean;
+        programmaticToolCalling?: boolean;
+        [k: string]: unknown;
+    };
+    void _e;
+
+    // rest holds only fields flopsygraph's SandboxConfig understands:
+    // backend / language / timeout / memoryLimit / cpuLimit / networkEnabled / keepAlive
+    const fgConfig = rest as FlopsygraphSandboxConfig;
+    const session = createSandboxSession(fgConfig);
+
+    return {
+        session,
+        programmaticToolCalling: !!ptc,
+        backend: fgConfig.backend ?? 'local',
+        language: fgConfig.language ?? 'python',
+    };
 }

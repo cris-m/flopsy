@@ -99,6 +99,27 @@ interface DbFactRow {
     source: string;
 }
 
+interface DbPeerRow {
+    peer_id: string;
+    channel: string;
+    scope: string;
+    peer_native_id: string;
+    created_at: number;
+    last_active_at: number;
+    active_session_id: string | null;
+}
+
+interface DbSessionRow {
+    session_id: string;
+    peer_id: string;
+    opened_at: number;
+    closed_at: number | null;
+    close_reason: string | null;
+    turn_count: number;
+    last_user_message_at: number;
+    source: string;
+}
+
 interface DbTopSkillRow {
     name: string;
     effectiveness: number;
@@ -568,6 +589,14 @@ export class LearningStore {
         return row;
     }
 
+    retireFact(id: string, validityEnd: number = Date.now()): void {
+        this.runWrite(() => {
+            this.db
+                .prepare(`UPDATE facts SET validity_end = ? WHERE id = ? AND validity_end IS NULL`)
+                .run(validityEnd, id);
+        });
+    }
+
     getCurrentFacts(userId: string, subject?: string): FactRow[] {
         const rows = subject
             ? (this.db
@@ -579,6 +608,132 @@ export class LearningStore {
                   .prepare(`SELECT * FROM facts WHERE user_id = ? AND validity_end IS NULL`)
                   .all(userId) as DbFactRow[]);
         return rows.map(rowToFact);
+    }
+
+    // PEERS + SESSIONS (PR 4) -------------------------------------------------
+
+    /**
+     * Insert peer if not present; refresh `last_active_at` either way.
+     * Returns the current row (post-update). Does NOT create a session —
+     * the SessionResolver decides when to open one.
+     */
+    upsertPeer(input: {
+        peerId: string;
+        channel: string;
+        scope: string;
+        peerNativeId: string;
+    }): PeerRow {
+        const now = Date.now();
+        this.runWrite(() => {
+            this.db
+                .prepare(
+                    `INSERT INTO peers (peer_id, channel, scope, peer_native_id, created_at, last_active_at, active_session_id)
+                     VALUES (?, ?, ?, ?, ?, ?, NULL)
+                     ON CONFLICT(peer_id) DO UPDATE SET last_active_at = excluded.last_active_at`,
+                )
+                .run(input.peerId, input.channel, input.scope, input.peerNativeId, now, now);
+        });
+        const row = this.getPeer(input.peerId);
+        if (!row) throw new Error(`upsertPeer post-condition failed: ${input.peerId}`);
+        return row;
+    }
+
+    getPeer(peerId: string): PeerRow | null {
+        const r = this.db
+            .prepare(`SELECT * FROM peers WHERE peer_id = ?`)
+            .get(peerId) as DbPeerRow | undefined;
+        return r ? rowToPeer(r) : null;
+    }
+
+    /**
+     * Open a new session for the given peer, marking it as the peer's
+     * active session. Caller is responsible for closing the previous
+     * active session first (via closeSession).
+     */
+    openSession(input: {
+        peerId: string;
+        source: SessionSource;
+        openedAt?: number;
+    }): SessionRow {
+        const sessionId = generateSessionId();
+        const openedAt = input.openedAt ?? Date.now();
+        this.runWrite(() => {
+            this.db
+                .prepare(
+                    `INSERT INTO sessions
+                     (session_id, peer_id, opened_at, closed_at, close_reason, turn_count, last_user_message_at, source)
+                     VALUES (?, ?, ?, NULL, NULL, 0, ?, ?)`,
+                )
+                .run(sessionId, input.peerId, openedAt, openedAt, input.source);
+            this.db
+                .prepare(`UPDATE peers SET active_session_id = ?, last_active_at = ? WHERE peer_id = ?`)
+                .run(sessionId, openedAt, input.peerId);
+        });
+        const row = this.getSession(sessionId);
+        if (!row) throw new Error(`openSession post-condition failed: ${sessionId}`);
+        return row;
+    }
+
+    closeSession(sessionId: string, reason: SessionCloseReason, closedAt: number = Date.now()): void {
+        this.runWrite(() => {
+            this.db
+                .prepare(
+                    `UPDATE sessions
+                     SET closed_at = ?, close_reason = ?
+                     WHERE session_id = ? AND closed_at IS NULL`,
+                )
+                .run(closedAt, reason, sessionId);
+            // Clear peer's active pointer if it was pointing here.
+            this.db
+                .prepare(
+                    `UPDATE peers SET active_session_id = NULL
+                     WHERE active_session_id = ?`,
+                )
+                .run(sessionId);
+        });
+    }
+
+    getSession(sessionId: string): SessionRow | null {
+        const r = this.db
+            .prepare(`SELECT * FROM sessions WHERE session_id = ?`)
+            .get(sessionId) as DbSessionRow | undefined;
+        return r ? rowToSession(r) : null;
+    }
+
+    /**
+     * Get the peer's currently active session, or null if none.
+     * "Active" means closed_at IS NULL AND peer.active_session_id matches.
+     */
+    getActiveSession(peerId: string): SessionRow | null {
+        const peer = this.getPeer(peerId);
+        if (!peer || !peer.activeSessionId) return null;
+        const session = this.getSession(peer.activeSessionId);
+        if (!session || session.closedAt !== null) return null;
+        return session;
+    }
+
+    /**
+     * Bump turn_count on the session. If the source is 'user', also bump
+     * last_user_message_at — heartbeat / cron sources do NOT extend
+     * freshness (OpenClaw invariant: background activity can't keep a
+     * dead session alive indefinitely).
+     */
+    touchSession(sessionId: string, source: SessionSource, ts: number = Date.now()): void {
+        this.runWrite(() => {
+            if (source === 'user') {
+                this.db
+                    .prepare(
+                        `UPDATE sessions
+                         SET turn_count = turn_count + 1, last_user_message_at = ?
+                         WHERE session_id = ?`,
+                    )
+                    .run(ts, sessionId);
+            } else {
+                this.db
+                    .prepare(`UPDATE sessions SET turn_count = turn_count + 1 WHERE session_id = ?`)
+                    .run(sessionId);
+            }
+        });
     }
 
     // TOKEN USAGE -------------------------------------------------------------
@@ -1016,10 +1171,71 @@ export class LearningStore {
         source         TEXT NOT NULL DEFAULT 'explicit'
       );
       CREATE INDEX IF NOT EXISTS idx_facts_current ON facts(user_id, subject, predicate, validity_end);
+
+      -- ── Peer + Session model (PR 4) ─────────────────────────────────
+      -- Permanent identity (peer) decoupled from bounded conversation
+      -- (session). Resolves the "thread grows forever" problem.
+      --
+      -- peer_id format: <channel>:<scope>:<peer_native_id>
+      --   e.g. telegram:dm:5257796557
+      -- session_id format: s-<unix-day>-<short-hex>
+      --   e.g. s-19834-4a7b9f1
+      -- effective threadId for checkpointer = <peer_id>#<session_id>
+
+      CREATE TABLE IF NOT EXISTS peers (
+        peer_id           TEXT PRIMARY KEY,
+        channel           TEXT NOT NULL,
+        scope             TEXT NOT NULL,
+        peer_native_id    TEXT NOT NULL,
+        created_at        INTEGER NOT NULL,
+        last_active_at    INTEGER NOT NULL,
+        active_session_id TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS sessions (
+        session_id            TEXT PRIMARY KEY,
+        peer_id               TEXT NOT NULL,
+        opened_at             INTEGER NOT NULL,
+        closed_at             INTEGER,
+        close_reason          TEXT,
+        turn_count            INTEGER NOT NULL DEFAULT 0,
+        last_user_message_at  INTEGER NOT NULL,
+        source                TEXT NOT NULL DEFAULT 'user'
+      );
+      CREATE INDEX IF NOT EXISTS idx_sessions_peer
+        ON sessions(peer_id, opened_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_sessions_active
+        ON sessions(peer_id) WHERE closed_at IS NULL;
     `);
         log.info('initial schema applied');
     }
 }
+
+// ── Peer + Session types (PR 4) ────────────────────────────────────────
+
+export interface PeerRow {
+    peerId: string;
+    channel: string;
+    scope: string;
+    peerNativeId: string;
+    createdAt: number;
+    lastActiveAt: number;
+    activeSessionId: string | null;
+}
+
+export interface SessionRow {
+    sessionId: string;
+    peerId: string;
+    openedAt: number;
+    closedAt: number | null;
+    closeReason: string | null;
+    turnCount: number;
+    lastUserMessageAt: number;
+    source: SessionSource;
+}
+
+export type SessionCloseReason = 'idle' | 'daily' | 'length' | 'user' | 'migration';
+export type SessionSource = 'user' | 'heartbeat' | 'cron' | 'webhook';
 
 // Row → Model converters -----------------------------------------------------
 
@@ -1139,6 +1355,46 @@ function rowToFact(r: DbFactRow): FactRow {
         confidence: r.confidence,
         source: r.source,
     };
+}
+
+function rowToPeer(r: DbPeerRow): PeerRow {
+    return {
+        peerId: r.peer_id,
+        channel: r.channel,
+        scope: r.scope,
+        peerNativeId: r.peer_native_id,
+        createdAt: r.created_at,
+        lastActiveAt: r.last_active_at,
+        activeSessionId: r.active_session_id,
+    };
+}
+
+function rowToSession(r: DbSessionRow): SessionRow {
+    return {
+        sessionId: r.session_id,
+        peerId: r.peer_id,
+        openedAt: r.opened_at,
+        closedAt: r.closed_at,
+        closeReason: r.close_reason,
+        turnCount: r.turn_count,
+        lastUserMessageAt: r.last_user_message_at,
+        source: r.source as SessionSource,
+    };
+}
+
+/**
+ * Generate a sortable, explainable session id.
+ *   s-<unix-day>-<short-hex>
+ *   e.g. s-19834-4a7b9f1   ← day 19834 since epoch (≈ Apr 27 2026), random suffix
+ *
+ * Sortable means SELECT ... ORDER BY session_id naturally orders by date.
+ * Suffix is 7 hex chars (28 bits) — collision-proof for any plausible
+ * volume of sessions per day per peer.
+ */
+function generateSessionId(): string {
+    const dayNum = Math.floor(Date.now() / 86_400_000);
+    const suffix = Math.floor(Math.random() * 0xfffffff).toString(16).padStart(7, '0');
+    return `s-${dayNum}-${suffix}`;
 }
 
 function safeJsonParse<T>(raw: unknown, fallback: T): T {

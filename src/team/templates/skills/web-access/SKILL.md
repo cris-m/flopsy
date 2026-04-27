@@ -63,3 +63,44 @@ Every factual claim from web research MUST include source URL:
 - List format: Sources section with clickable links
 - If URL unavailable: "(source unavailable)"
 - News: include source name + time (e.g., "— Reuters, 2h ago")
+
+## Output Format
+
+When presenting web-access results, structure the response so the user can see which strategy worked, what was found, and where it came from:
+
+```markdown
+## Web Access Result
+
+**URL:** <the URL you fetched>
+**Strategy used:** web_extract | browser-agent | http_request | social-media API
+**Status:** success | partial | failed (with reason)
+
+### Summary
+[2-4 sentences capturing the main content — what the page is about and the key
+facts relevant to the user's question.]
+
+### Key Findings
+- **[Finding 1]:** [Detail] ([Source](url))
+- **[Finding 2]:** [Detail] ([Source](url))
+- **[Finding 3]:** [Detail] ([Source](url))
+
+### Sources
+- [Primary source name](url) — fetched via [strategy], [date/time]
+- [Secondary source name](url) — cross-reference, [date/time]
+```
+
+If a fallback strategy was used (e.g., `web_extract` failed and a browser agent
+succeeded), note that in the Status line so the user can see which path worked.
+When multiple sources were combined, list each one separately and attribute each
+claim to its specific source rather than lumping them together.
+
+## Guidelines
+
+- **Retry with a different strategy, not the same one** — if `web_extract` fails,
+  escalate to the browser agent or raw HTTP; do not loop on the same tool.
+- **Cap retries** — try each strategy at most once per URL; after all three
+  strategies fail, report exactly which ones were attempted and the errors.
+- **Respect rate limits and timeouts** — on 429 or repeated timeouts, back off
+  instead of hammering the source; swap to a different tool or search engine.
+- **Never fabricate content** — if every strategy fails, say so plainly; do not
+  invent summaries or attribute claims to URLs you could not actually read.

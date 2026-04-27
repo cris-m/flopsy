@@ -57,6 +57,18 @@ export interface RawAgent {
     workers?: readonly string[];
     mcpServers?: readonly string[];
     approvals?: { tools?: readonly string[]; actions?: readonly string[] };
+    /** Per-agent sandbox opt-in — matches `sandboxConfigSchema` in shared. */
+    sandbox?: {
+        enabled?: boolean;
+        backend?: 'local' | 'docker' | 'kubernetes' | string;
+        language?: 'python' | 'javascript' | 'typescript' | 'bash' | string;
+        timeout?: number;
+        memoryLimit?: number;
+        cpuLimit?: number;
+        networkEnabled?: boolean;
+        keepAlive?: boolean;
+        programmaticToolCalling?: boolean;
+    };
 }
 
 export interface RawMcpServer {

@@ -1,6 +1,6 @@
 ---
 name: propaganda-recognition
-compatibility: All modules
+compatibility: Designed for FlopsyBot agent
 description: Recognize propaganda techniques in media and information. Use when fact-checking news, analyzing articles for bias, or identifying manipulative rhetoric.
 ---
 
@@ -46,7 +46,7 @@ This skill provides insight into recognizing propaganda in media and information
 - **Appeals to Authority**: Assertion that something must be true because an authority supports it, regardless of evidence.
 - **Scapegoating**: Blaming a person, group, or situation unfairly for broader problems.
 
-## Execution Protocol
+## Workflow
 
 1. **Cross-Verify Information**: Ensure diverse sources are consulted to compare different perspectives.
 2. **Language Analysis**: Scrutinize language for emotional manipulation.
@@ -54,4 +54,58 @@ This skill provides insight into recognizing propaganda in media and information
 4. **Fact-Checking Tools**: Utilize dedicated agents to validate facts and figures.
 5. **Consider Diverse Perspectives**: Incorporate alternative viewpoints and understand their framing.
 
-By implementing this skill, users are equipped with the ability to discern and navigate through misleading information and propaganda effectively.
+## Output Format
+
+When analyzing content, emit a report using this template. Keep it scannable — only include sections with real findings.
+
+```markdown
+## Propaganda Analysis: [Source / Title]
+
+**Source:** [URL or citation]
+**Date analyzed:** [YYYY-MM-DD]
+**Overall confidence this content uses propaganda:** [Low / Medium / High]
+
+### Detected Patterns
+
+| Technique | Confidence | Example Quote |
+|-----------|-----------|---------------|
+| Emotionally Charged Language | High | "A tidal wave of destruction threatens our way of life." |
+| Us-vs-Them Framing | Medium | "They will never understand what we stand for." |
+| Bandwagon Appeal | Low | "Everyone is waking up to the truth." |
+
+### Psychological Tactics
+
+- **Fear Mongering:** [Brief explanation + short quote]
+- **Appeals to Authority:** [Brief explanation + short quote]
+- **Scapegoating:** [Brief explanation + short quote]
+
+### What's Missing
+
+- Contradicting evidence, dissenting expert views, or context the piece omits
+- Inconvenient facts that weaken its core claim
+
+### Recommendations
+
+- Cross-check specific claim X against [independent source]
+- Note emotional framing when sharing or citing this piece
+- Seek the steel-man version of the opposing view before forming a position
+
+### Caveats
+
+- Propaganda detection is probabilistic, not deterministic
+- A pattern match does not automatically mean the claim is false — evaluate evidence separately
+```
+
+## Confidence Rubric
+
+Use these thresholds when assigning per-technique confidence:
+
+| Level | Criteria |
+|-------|----------|
+| **High** | Multiple clear textual examples; the technique is central to the piece's persuasion |
+| **Medium** | At least one clear example; technique supports but doesn't define the piece |
+| **Low** | Faint or arguable match; could also be ordinary rhetoric |
+
+For the overall confidence that a piece uses propaganda, require at least two Medium-or-above techniques before assigning High.
+
+By implementing this skill, users are equipped to discern and navigate misleading information and propaganda effectively.

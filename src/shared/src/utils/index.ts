@@ -9,3 +9,14 @@ export {
     type WorkspacePathResolver,
 } from './workspace';
 export { installWarningFilter, shouldIgnoreWarning } from './warning-filter';
+export { sequential } from './sequential';
+export { registerCleanup, runCleanup } from './cleanup-registry';
+export {
+    copyPromptFile,
+    deletePromptFile,
+    readPromptFile,
+    resolvePromptPath,
+    promptDir,
+    PROMPT_KIND_DIR,
+    type PromptKind,
+} from './prompt-files';

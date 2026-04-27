@@ -14,13 +14,25 @@ import type { CommandDef } from './types';
 import { statusCommand } from './handlers/status';
 import { helpCommand } from './handlers/help';
 import { auditCommand } from './handlers/audit';
+import { teamCommand } from './handlers/team';
+import { tasksCommand } from './handlers/tasks';
+import { doctorCommand } from './handlers/doctor';
+import { dndCommand } from './handlers/dnd';
+import { newCommand } from './handlers/new';
+import { planCommand } from './handlers/plan';
 
 /**
  * All registered slash commands. Order matters only for the /help display —
  * dispatch is keyed by name/alias in a Map.
  */
 export const COMMANDS: readonly CommandDef[] = [
+    newCommand,
+    planCommand,
     statusCommand,
+    teamCommand,
+    tasksCommand,
+    doctorCommand,
+    dndCommand,
     auditCommand,
     helpCommand,
 ];

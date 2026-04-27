@@ -1,4 +1,7 @@
 import { loadConfig, type FlopsyConfig, workspace } from '@flopsy/shared';
+import { setDndFacade } from './commands/dnd-facade';
+import { setSessionFacade } from './commands/session-facade';
+import { runCleanup } from '@flopsy/shared';
 import type { Channel, Message, WebhookChannel } from '@gateway/types';
 import { isWebhookChannel } from '@gateway/types';
 import { BaseGateway } from '@gateway/core/base-gateway';
@@ -6,7 +9,9 @@ import { WebhookServer } from '@gateway/core/base-webhook';
 import { MessageRouter } from '@gateway/core/message-router';
 import { WebhookRouter, type ExternalWebhookConfig } from '@gateway/core/webhook-router';
 import type { AgentHandler } from '@gateway/types/agent';
-import { ProactiveEngine } from './proactive';
+import { ProactiveEngine, type ProactiveEmbedder } from './proactive';
+import { buildAgentCaller } from './proactive/agent-bridge';
+import { OllamaEmbedder, type BaseChatModel } from 'flopsygraph';
 import { MgmtServer } from './mgmt/server';
 import { ConfigReloader, type ReloadRule, type ReloadHandlerContext } from './config-reload';
 import { getConfigPath } from '@flopsy/shared';
@@ -26,6 +31,8 @@ export class FlopsyGateway extends BaseGateway {
     private proactiveEngine: ProactiveEngine | null = null;
     private mgmtServer: MgmtServer | null = null;
     private configReloader: ConfigReloader | null = null;
+    private agentHandler: AgentHandler | null = null;
+    private structuredOutputModel: BaseChatModel | null = null;
     private cfg: FlopsyConfig;
 
     constructor(config?: FlopsyConfig) {
@@ -108,7 +115,30 @@ export class FlopsyGateway extends BaseGateway {
         );
     }
 
+    /**
+     * Register a raw BaseChatModel used for provider-enforced structured
+     * output in the proactive engine's conditional mode. The model runs a
+     * second pass over the agent's free-form reply to coerce it into the
+     * ProactiveOutput schema via flopsygraph's `structuredLLM`.
+     *
+     * Optional — when not set, proactive falls back to post-hoc JSON
+     * extraction from the agent's reply (lossier, no retry).
+     */
+    setStructuredOutputModel(model: BaseChatModel): void {
+        this.structuredOutputModel = model;
+    }
+
     setAgentHandler(handler: AgentHandler): void {
+        this.agentHandler = handler;
+
+        // Wire /new session-facade so the slash command can force-rotate
+        // sessions without the command layer depending on the team package.
+        if (handler.forceNewSession) {
+            setSessionFacade({
+                forceNewSession: (rawKey) => handler.forceNewSession!(rawKey),
+            });
+        }
+
         this.router = new MessageRouter({
             agentHandler: handler,
             coalesceDelayMs: this.cfg.gateway.coalesceDelayMs,
@@ -152,17 +182,57 @@ export class FlopsyGateway extends BaseGateway {
             : { enabled: false, routeCount: 0 };
 
         const p = this.cfg.proactive;
+        // Live schedule counts — runtime DB (not config). Merge across
+        // heartbeat/cron/webhook so `flopsy status` shows what's ACTUALLY
+        // scheduled, not just what was pre-seeded in flopsy.json5.
+        const schedules = this.proactiveEngine?.listSchedules() ?? [];
+        const runtimeByKind = {
+            heartbeat: schedules.filter((s) => s.kind === 'heartbeat' && s.enabled).length,
+            cron: schedules.filter((s) => s.kind === 'cron' && s.enabled).length,
+            webhook: schedules.filter((s) => s.kind === 'webhook' && s.enabled).length,
+        };
+
+        // 24h delivery funnel — sum per-schedule JobState counters into
+        // one aggregate so the compact /status can show "↓42 ✕8 !1".
+        // Best-effort: if the engine isn't running, all zero.
+        let funnel24h:
+            | { delivered: number; suppressed: number; errors: number; queued: number; retryQueue: number }
+            | undefined;
+        const engine = this.proactiveEngine;
+        if (engine) {
+            // getProactiveStats is async — we read a cached synchronous
+            // version for the snapshot. Since JobState + deliveries are in
+            // SQLite + JSON which load fast, sync-ish behaviour is fine
+            // for the few schedules a single user has.
+            let delivered = 0;
+            let suppressed = 0;
+            let errors = 0;
+            let queued = 0;
+            for (const row of schedules) {
+                const js = engine.getStateStore().getJobStateSync(row.id);
+                if (!js) continue;
+                delivered += js.deliveredCount ?? 0;
+                suppressed += js.suppressedCount ?? 0;
+                errors += js.consecutiveErrors ?? 0;
+                queued += js.queuedCount ?? 0;
+            }
+            funnel24h = {
+                delivered,
+                suppressed,
+                errors,
+                queued,
+                retryQueue: engine.getRetryQueueDepth(),
+            };
+        }
+
         const proactive = p.enabled
             ? {
                   running: this.proactiveEngine?.isRunning() ?? false,
-                  heartbeats: p.heartbeats.enabled
-                      ? p.heartbeats.heartbeats.filter((h) => h.enabled).length
-                      : 0,
-                  cronJobs: p.scheduler.enabled
-                      ? p.scheduler.jobs.filter((j) => j.enabled).length
-                      : 0,
-                  inboundWebhooks: p.webhooks.length,
+                  heartbeats: runtimeByKind.heartbeat,
+                  cronJobs: runtimeByKind.cron,
+                  inboundWebhooks: runtimeByKind.webhook,
                   lastHeartbeatAt: this.proactiveEngine?.getLastHeartbeatAt(),
+                  ...(funnel24h ? { funnel24h } : {}),
               }
             : { running: false, heartbeats: 0, cronJobs: 0, inboundWebhooks: 0 };
 
@@ -313,6 +383,37 @@ export class FlopsyGateway extends BaseGateway {
         return this.proactiveEngine;
     }
 
+    /**
+     * Mgmt endpoint handler for `GET /mgmt/tasks`. Query params:
+     *   thread — filter to one thread
+     *   status — comma-separated list (pending,running,idle,completed,failed,killed)
+     *   limit  — max rows returned (defaults to 100)
+     * Returns { tasks: AggregateTaskSummary[] } or { tasks: [] } when the
+     * agent layer doesn't implement `queryAllTasks`.
+     */
+    private handleMgmtTasks(query: URLSearchParams): Record<string, unknown> {
+        const handler = this.agentHandler;
+        if (!handler || typeof handler.queryAllTasks !== 'function') {
+            return { tasks: [] };
+        }
+        const threadId = query.get('thread') ?? undefined;
+        const statusRaw = query.get('status');
+        const status = statusRaw
+            ? (statusRaw.split(',').filter(Boolean) as ReadonlyArray<
+                  'pending' | 'running' | 'idle' | 'completed' | 'failed' | 'killed'
+              >)
+            : undefined;
+        const limitRaw = query.get('limit');
+        const limit = limitRaw ? Math.max(1, Math.min(500, Number(limitRaw) || 100)) : 100;
+
+        const tasks = handler.queryAllTasks({
+            ...(threadId ? { threadId } : {}),
+            ...(status ? { status } : {}),
+            limit,
+        });
+        return { tasks };
+    }
+
     protected getProactiveHealth(): Record<string, unknown> {
         const { proactive } = this.cfg;
         const cron = this.proactiveEngine?.getCronTrigger();
@@ -390,6 +491,64 @@ export class FlopsyGateway extends BaseGateway {
                 port: mgmtPort,
                 token: process.env['FLOPSY_MGMT_TOKEN'],
                 snapshotFn: () => this.getStatusSnapshot(),
+                // Schedule handlers — lambdas dereference proactiveEngine
+                // at request time so the mgmt server can start BEFORE
+                // the engine (and gracefully 503 when proactive is off).
+                scheduleHandlers: {
+                    list: () =>
+                        (this.proactiveEngine?.listSchedules() ?? []).map((r) => ({
+                            id: r.id,
+                            kind: r.kind,
+                            enabled: r.enabled,
+                            createdAt: r.createdAt,
+                            createdByThread: r.createdByThread,
+                            createdByAgent: r.createdByAgent,
+                            config: safeParse(r.configJson),
+                        })),
+                    create: (body) => {
+                        if (!this.proactiveEngine) {
+                            return { ok: false as const, error: 'proactive engine not running' };
+                        }
+                        return handleMgmtScheduleCreate(this.proactiveEngine, body);
+                    },
+                    remove: (id) => {
+                        if (!this.proactiveEngine) return { ok: false, message: 'proactive engine not running' };
+                        return this.proactiveEngine.removeRuntimeSchedule(id)
+                            ? { ok: true, message: `deleted ${id}` }
+                            : { ok: false, message: `no schedule with id "${id}"` };
+                    },
+                    setEnabled: (id, enabled) => {
+                        if (!this.proactiveEngine) return { ok: false, message: 'proactive engine not running' };
+                        return this.proactiveEngine.setRuntimeScheduleEnabled(id, enabled)
+                            ? { ok: true, message: `${enabled ? 'enabled' : 'disabled'} ${id}` }
+                            : { ok: false, message: `no schedule with id "${id}"` };
+                    },
+                },
+                tasksFn: (query) => this.handleMgmtTasks(query),
+                proactiveStatsHandlers: {
+                    getStats: async (windowMs: number) =>
+                        (await this.proactiveEngine?.getProactiveStats(windowMs)) ?? {
+                            window: { sinceMs: Date.now(), windowMs },
+                            aggregate: { delivered: 0, retryQueueDepth: 0 },
+                            perSchedule: [],
+                        },
+                    getFires: (id: string, limit: number) =>
+                        this.proactiveEngine?.getScheduleFires(id, limit) ?? [],
+                },
+                dndHandlers: {
+                    status: async () => (await this.proactiveEngine?.getDndStatus()) ?? { active: false },
+                    setDnd: async (body) => {
+                        if (!this.proactiveEngine) return { ok: false, error: 'engine not running' };
+                        return this.proactiveEngine.setDnd(body.durationMs, body.reason);
+                    },
+                    clearDnd: async () => {
+                        await this.proactiveEngine?.clearDnd();
+                    },
+                    setQuietHours: async (body) => {
+                        if (!this.proactiveEngine) return { ok: false, error: 'engine not running' };
+                        return this.proactiveEngine.setQuietHoursUntil(body.untilMs);
+                    },
+                },
             });
             try {
                 await this.mgmtServer.start();
@@ -407,13 +566,57 @@ export class FlopsyGateway extends BaseGateway {
 
             const { proactive } = this.cfg;
 
+            const embedderCfg = this.cfg.memory?.embedder;
+            let embedder: ProactiveEmbedder | undefined;
+            if (this.cfg.memory?.enabled !== false && embedderCfg?.model) {
+                embedder = new OllamaEmbedder(
+                    embedderCfg.model,
+                    {},
+                    undefined,
+                    embedderCfg.baseUrl,
+                );
+            }
+
             this.proactiveEngine = new ProactiveEngine({
                 statePath: workspace.state('proactive.json'),
                 retryQueuePath: workspace.state('retry-queue.json'),
+                dedupDbPath: workspace.state('proactive.db'),
+                promptBaseDir: workspace.root(),
+                followActiveChannel: proactive.followActiveChannel === true,
+                // Auto-routes proactive messages to wherever the user is
+                // chatting RIGHT NOW when followActiveChannel is on. Pulled
+                // live from BaseGateway.handleInbound().
+                getActivePeer: () => {
+                    const live = this.getLastActivePeer();
+                    if (!live) return null;
+                    return { channelName: live.channelName, peer: live.peer };
+                },
+                ...(embedder ? { embedder } : {}),
+                ...(this.structuredOutputModel
+                    ? { structuredOutputModel: this.structuredOutputModel }
+                    : {}),
                 healthMonitor: proactive.healthMonitor.enabled
                     ? proactive.healthMonitor
                     : undefined,
+                // When the agent handler supports session resolution, heartbeats
+                // and cron fires reuse the peer's active session instead of
+                // creating ephemeral `proactive:<jobId>:<timestamp>` threads.
+                ...(this.agentHandler?.resolveProactiveThreadId
+                    ? {
+                          threadIdResolver: (channelName, peer, source) =>
+                              this.agentHandler!.resolveProactiveThreadId!(
+                                  channelName,
+                                  peer,
+                                  source,
+                              ),
+                      }
+                    : {}),
             });
+
+            const agentHandler = this.agentHandler;
+            if (!agentHandler) {
+                this.log.warn('proactive engine starting without agent handler — jobs will be skipped');
+            }
 
             await this.proactiveEngine.start(
                 (name) => this.channels.get(name)?.status === 'connected',
@@ -422,15 +625,17 @@ export class FlopsyGateway extends BaseGateway {
                     if (!ch) return undefined;
                     return ch.send({ peer, body: text });
                 },
-                async (message) => {
-                    this.log.warn(
-                        { message: message.slice(0, 80) },
-                        'agent caller not yet wired — proactive job skipped',
-                    );
-                    return { response: '' };
-                },
+                agentHandler
+                    ? buildAgentCaller(agentHandler)
+                    : async (message) => {
+                          this.log.warn(
+                              { message: message.slice(0, 80) },
+                              'no agent handler — proactive job skipped',
+                          );
+                          return { response: '' };
+                      },
                 async (threadId) => {
-                    this.log.debug({ threadId }, 'thread cleaner not yet wired');
+                    this.log.debug({ threadId }, 'proactive thread eviction (LRU-managed)');
                 },
                 () => this.channels,
             );
@@ -440,16 +645,72 @@ export class FlopsyGateway extends BaseGateway {
                 peer: { id: '', type: 'user' as const },
             };
 
-            if (proactive.heartbeats.enabled && proactive.heartbeats.heartbeats.length > 0) {
+            // Initialize the heartbeat/cron triggers unconditionally when the
+            // subsystem toggle is on — NOT gated on config array length.
+            //
+            // Runtime schedules (created via `flopsy schedule add` or the
+            // `manage_schedule` agent tool) live in proactive.db and are
+            // registered via `addRuntimeHeartbeat` / `addRuntimeCronJob`,
+            // which REQUIRE the triggers to already be initialized (they
+            // check `!this.heartbeat || !this.defaultDelivery` and fail).
+            //
+            // The old `.length > 0` guards meant a config with no pre-defined
+            // schedules (the expected post-migration state) would leave the
+            // triggers null, making every runtime add return false with the
+            // misleading "duplicate name or invalid interval" message from
+            // manage_schedule.ts. Pass an empty array — startHeartbeats /
+            // startCronJobs both handle that fine, register the trigger,
+            // and runtime adds work as intended.
+            if (proactive.heartbeats.enabled) {
                 await this.proactiveEngine.startHeartbeats(
                     proactive.heartbeats.heartbeats,
                     defaultDelivery,
                 );
             }
 
-            if (proactive.scheduler.enabled && proactive.scheduler.jobs.length > 0) {
+            if (proactive.scheduler.enabled) {
                 await this.proactiveEngine.startCronJobs(proactive.scheduler.jobs, defaultDelivery);
             }
+
+            // Give the engine a handle to WebhookRouter so `addRuntimeWebhook`
+            // can register live HTTP routes. Null-safe when webhook server
+            // isn't configured — runtime webhook adds then 400 gracefully.
+            if (this.webhookRouter) {
+                this.proactiveEngine.setWebhookRouter(this.webhookRouter);
+            }
+
+            // Wire DND facade so /dnd slash + `flopsy dnd` CLI can reach the
+            // live PresenceManager. Module-level singleton (same pattern as
+            // ScheduleFacade) — fire-and-forget cleanup on engine stop.
+            {
+                const engine = this.proactiveEngine;
+                setDndFacade({
+                    setDnd: async (ms, r) => {
+                        const { until, reason } = await engine.setDnd(ms, r);
+                        return { active: true, reason: 'dnd', untilMs: until, ...(reason ? { label: reason } : {}) };
+                    },
+                    clearDnd: () => engine.clearDnd(),
+                    setQuietHours: async (until) => {
+                        const { until: u } = await engine.setQuietHoursUntil(until);
+                        return { active: true, reason: 'quiet hours', untilMs: u };
+                    },
+                    getStatus: () => engine.getDndStatus(),
+                });
+            }
+
+            // Startup catchup — fire at most 5 schedules whose last run is
+            // far enough in the past that we missed a tick during downtime.
+            // Staggered by 5s so they don't stampede the LLM; excess
+            // candidates are deferred (their next regular fire handles
+            // them). Non-blocking — the engine logs the outcome itself.
+            void this.proactiveEngine
+                .catchupMissedFires({ maxPerRestart: 5, staggerMs: 5_000 })
+                .catch((err) =>
+                    this.log.warn(
+                        { err: err instanceof Error ? err.message : String(err) },
+                        'startup catchup threw — non-fatal',
+                    ),
+                );
 
             this.log.info('proactive engine started');
         } else {
@@ -566,6 +827,13 @@ export class FlopsyGateway extends BaseGateway {
     }
 
     protected async onStop(): Promise<void> {
+        // Run all registered cleanup functions in parallel first (subsystems
+        // that called registerCleanup() during startup — FactConsolidator,
+        // awaySummary abort controller, etc.).
+        await runCleanup().catch((err: unknown) => {
+            this.log.warn({ err }, 'one or more cleanup handlers failed');
+        });
+
         if (this.configReloader) {
             this.configReloader.stop();
             this.configReloader = null;
@@ -574,6 +842,7 @@ export class FlopsyGateway extends BaseGateway {
             this.log.info('stopping proactive engine');
             await this.proactiveEngine.stop();
             this.proactiveEngine = null;
+            setDndFacade(null);
         }
 
         if (this.router) {
@@ -684,4 +953,119 @@ export class FlopsyGateway extends BaseGateway {
             this.log.debug({ channel: message.channelName }, 'ack reaction failed');
         }
     }
+}
+
+function safeParse(s: string): unknown {
+    try { return JSON.parse(s); } catch { return {}; }
+}
+
+/**
+ * Translate a loose JSON body (from the mgmt HTTP endpoint or the CLI) into
+ * a ProactiveEngine.addRuntime* call. Kept tolerant — validates presence of
+ * required fields but doesn't lock down the full zod schema here since the
+ * engine already validates. Mirrors the shape of the manage_schedule tool.
+ */
+function handleMgmtScheduleCreate(
+    engine: ProactiveEngine,
+    rawBody: unknown,
+): { ok: true; id: string; message: string } | { ok: false; error: string } {
+    const body = (rawBody ?? {}) as Record<string, unknown>;
+    const kind = body['kind'] as string | undefined;
+    const createdBy = (body['createdBy'] ?? {}) as {
+        threadId?: string;
+        agentName?: string;
+    };
+
+    if (kind === 'heartbeat') {
+        if (typeof body['name'] !== 'string' || !body['name']) {
+            return { ok: false, error: 'heartbeat requires `name`' };
+        }
+        if (typeof body['interval'] !== 'string' || !body['interval']) {
+            return { ok: false, error: 'heartbeat requires `interval` (e.g. "30m")' };
+        }
+        if (!body['prompt'] && !body['promptFile']) {
+            return { ok: false, error: 'heartbeat requires `prompt` or `promptFile`' };
+        }
+        const hb = {
+            id: (body['id'] as string | undefined) ?? `runtime-hb-${body['name'] as string}`,
+            name: body['name'] as string,
+            enabled: true,
+            interval: body['interval'] as string,
+            prompt: (body['prompt'] as string | undefined) ?? '',
+            promptFile: body['promptFile'] as string | undefined,
+            deliveryMode: (body['deliveryMode'] as 'always' | 'conditional' | 'silent' | undefined) ?? 'always',
+            oneshot: body['oneshot'] === true,
+            activeHours: body['activeHours'] as { start: number; end: number } | undefined,
+            delivery: body['delivery'] as Parameters<typeof engine.addRuntimeHeartbeat>[0]['delivery'],
+        };
+        const ok = engine.addRuntimeHeartbeat(hb, createdBy);
+        return ok
+            ? { ok: true, id: hb.id, message: `heartbeat "${hb.name}" created` }
+            : { ok: false, error: 'failed to add heartbeat (duplicate name or invalid interval)' };
+    }
+
+    if (kind === 'cron') {
+        if (!body['schedule']) {
+            return { ok: false, error: 'cron requires `schedule` { kind, atMs|everyMs|expr }' };
+        }
+        if (!body['message'] && !body['promptFile'] && !body['prompt']) {
+            return { ok: false, error: 'cron requires `message` or `promptFile`' };
+        }
+        const id =
+            (body['id'] as string | undefined) ??
+            `runtime-cron-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const job = {
+            id,
+            name: (body['name'] as string | undefined) ?? id,
+            enabled: true,
+            schedule: body['schedule'] as Parameters<typeof engine.addRuntimeCronJob>[0]['schedule'],
+            payload: {
+                message:
+                    (body['message'] as string | undefined) ??
+                    (body['prompt'] as string | undefined),
+                promptFile: body['promptFile'] as string | undefined,
+                deliveryMode: (body['deliveryMode'] as 'always' | 'conditional' | 'silent' | undefined) ?? 'always',
+                oneshot: body['oneshot'] === true,
+                threadId: body['threadId'] as string | undefined,
+                delivery: body['delivery'] as Parameters<typeof engine.addRuntimeCronJob>[0]['payload']['delivery'],
+            },
+            requires: [] as string[],
+        };
+        const ok = engine.addRuntimeCronJob(job, createdBy);
+        return ok
+            ? { ok: true, id, message: `cron job "${job.name}" created` }
+            : { ok: false, error: 'failed to add cron job (engine not running?)' };
+    }
+
+    if (kind === 'webhook') {
+        // Webhook creation registers an HTTP route on the gateway's
+        // WebhookServer so external services (GitHub, Stripe, Zapier, etc.)
+        // can POST and have the body routed into a channel worker's event
+        // queue. Signature verification is optional at MVP — add `secret` +
+        // `signature` fields later to enable HMAC checks.
+        if (typeof body['name'] !== 'string' || !body['name']) {
+            return { ok: false, error: 'webhook requires `name` (also used as the id)' };
+        }
+        if (typeof body['path'] !== 'string' || !(body['path'] as string).startsWith('/')) {
+            return { ok: false, error: 'webhook requires `path` starting with "/" (e.g. "/webhook/github")' };
+        }
+        if (typeof body['targetChannel'] !== 'string' || !body['targetChannel']) {
+            return { ok: false, error: 'webhook requires `targetChannel` (channel name that receives the event)' };
+        }
+        const cfg = {
+            name: body['name'] as string,
+            path: body['path'] as string,
+            targetChannel: body['targetChannel'] as string,
+            ...(typeof body['secret'] === 'string' ? { secret: body['secret'] as string } : {}),
+            ...(typeof body['eventTypeHeader'] === 'string'
+                ? { eventTypeHeader: body['eventTypeHeader'] as string }
+                : {}),
+        };
+        const ok = engine.addRuntimeWebhook(cfg, createdBy);
+        return ok
+            ? { ok: true, id: cfg.name, message: `webhook "${cfg.name}" registered at ${cfg.path}` }
+            : { ok: false, error: 'failed to register webhook (server not up or duplicate path)' };
+    }
+
+    return { ok: false, error: `unknown kind "${kind ?? '(missing)'}" — expected "heartbeat" | "cron" | "webhook"` };
 }

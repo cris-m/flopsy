@@ -17,9 +17,9 @@ A methodical approach to finding and fixing bugs when code doesn't behave as exp
 
 ## How to Run Commands
 
-**Always use the `execute` tool to run commands.** Pass the command string as the `command` parameter. Never tell the user to run commands themselves — you have the `execute` tool.
+**Always use the `Bash` tool to run commands.** Never tell the user to run commands themselves — you have the `Bash` tool.
 
-## Debugging Process
+## Workflow
 
 ### Step 1: Reproduce the Issue
 **Goal:** Get a reliable way to trigger the bug.

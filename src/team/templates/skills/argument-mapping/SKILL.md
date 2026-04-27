@@ -15,7 +15,7 @@ Decompose any argument into its logical structure. Identify what's being claimed
 - Evaluating the logic of a proposal, pitch, or claim
 - As part of critical-analysis-chain
 
-## Process
+## Workflow
 
 ### Step 1: Identify the Conclusion
 What is the speaker/writer ultimately trying to convince you of? State it in one sentence.
