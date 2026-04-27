@@ -38,6 +38,8 @@ export interface LoadedMcpServer {
     readonly env: Readonly<Record<string, string>>;
     readonly assignTo: readonly string[];
     readonly description?: string;
+    /** Per-server tool-call timeout override (ms). Undefined → use client default. */
+    readonly callTimeoutMs?: number;
 }
 
 export interface LoaderResult {
@@ -140,6 +142,7 @@ export async function loadMcpServers(
             env: finalEnv,
             assignTo: cfg.assignTo,
             ...(cfg.description ? { description: cfg.description } : {}),
+            ...(cfg.callTimeoutMs ? { callTimeoutMs: cfg.callTimeoutMs } : {}),
         });
     }
 

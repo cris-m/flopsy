@@ -1,82 +1,126 @@
 /**
- * `flopsy webhook` — inspect the webhook receiver config.
+ * `flopsy webhook` — full CRUD over runtime inbound webhooks.
  *
- * FlopsyBot has TWO webhook concepts:
- *   - `webhook` — the inbound HTTP server (host/port/secret) that accepts
- *     external callbacks. One per gateway.
- *   - `proactive.webhooks` — individual routes registered on that server
- *     (each fires a pre-defined agent task).
+ * Each webhook registers an HTTP path on the gateway's webhook server.
+ * When an external service POSTs to that path, the body is routed into
+ * the target channel worker's event queue as a `task_complete` event.
  *
- * Both are displayed here.
+ * Writes go through the mgmt HTTP endpoint so the live gateway registers
+ * the route without a restart. Reads use proactive.db directly (offline).
  */
 
 import { Command } from 'commander';
-import { dim, ok, row, section, table } from '../ui/pretty';
-import { inboundWebhooksOf, readFlopsyConfig, type RawInboundWebhook } from './config-reader';
-import { tint } from '../ui/theme';
+import { detail, dim } from '../ui/pretty';
+import {
+    mgmtCreate,
+    mgmtDisable,
+    mgmtEnable,
+    mgmtRemove,
+} from './schedule-client';
+import {
+    renderFires,
+    renderScheduleList,
+    renderScheduleShow,
+    renderStats,
+} from './schedule-stats-render';
 
 export function registerWebhookCommands(root: Command): void {
-    const wh = root.command('webhook').description('Inspect the webhook server + routes');
-
-    wh.command('show')
-        .description('Show webhook receiver config (host/port/enabled)')
-        .action(() => {
-            const { config } = readFlopsyConfig();
-            const cfg = config.webhook ?? {};
-            console.log(section('Webhook receiver', '#E67E22'));
-            console.log(
-                row(
-                    'state',
-                    cfg.enabled === true ? ok('enabled') : dim('off'),
-                ),
-            );
-            if (cfg.enabled === true) {
-                console.log(row('address', `${cfg.host ?? '127.0.0.1'}:${cfg.port ?? '?'}`));
-                if (cfg.allowedIps && cfg.allowedIps.length > 0) {
-                    console.log(row('allowed ips', cfg.allowedIps.join(', ')));
-                }
-                if (cfg.secret) {
-                    console.log(
-                        row('secret', dim('(set — ' + String(cfg.secret).slice(0, 2) + '***)')),
-                    );
-                }
-            }
-        });
+    const wh = root.command('webhook').description('Manage inbound webhook endpoints');
 
     wh.command('list')
-        .description('List individual webhook routes from proactive.webhooks')
-        .action(() => {
-            const { config } = readFlopsyConfig();
-            renderRoutes(inboundWebhooksOf(config));
+        .description('List every runtime webhook + enabled state')
+        .action(() => renderList());
+
+    wh.command('show')
+        .description('Show full detail for one webhook')
+        .argument('<id>', 'Webhook id (= its name)')
+        .action((id: string) => renderOne(id));
+
+    wh.command('add')
+        .description('Register an inbound webhook endpoint')
+        .requiredOption('--name <name>', 'Webhook id / label (e.g. "github-releases")')
+        .requiredOption(
+            '--path <path>',
+            'URL path on the webhook server (must start with "/")',
+        )
+        .requiredOption(
+            '--target-channel <name>',
+            'Channel whose worker receives the event (e.g. "telegram")',
+        )
+        .option('--secret <secret>', 'HMAC secret for signature verification')
+        .option(
+            '--event-type-header <header>',
+            'Header carrying the event type (e.g. "x-github-event")',
+        )
+        .action(async (opts) => {
+            await mgmtCreate({
+                kind: 'webhook',
+                name: opts.name,
+                path: opts.path,
+                targetChannel: opts.targetChannel,
+                secret: opts.secret,
+                eventTypeHeader: opts.eventTypeHeader,
+            });
         });
 
-    wh.action(() => {
-        const { config } = readFlopsyConfig();
-        const cfg = config.webhook ?? {};
-        console.log(section('Webhook receiver', '#E67E22'));
-        console.log(
-            row('state', cfg.enabled === true ? ok('enabled') : dim('off')),
+    wh.command('disable')
+        .description('Disable a webhook by id')
+        .argument('<id>', 'Webhook id')
+        .action((id: string) => void mgmtDisable(id));
+
+    wh.command('enable')
+        .description('Re-enable a webhook by id')
+        .argument('<id>', 'Webhook id')
+        .action((id: string) => void mgmtEnable(id));
+
+    wh.command('remove')
+        .alias('rm')
+        .description('Remove a webhook (unregisters the HTTP route)')
+        .argument('<id>', 'Webhook id')
+        .action((id: string) => void mgmtRemove(id));
+
+    wh.command('stats')
+        .description('Runs / delivered / suppressed counters; pass id for detail')
+        .argument('[id]', 'Optional webhook id for per-schedule detail')
+        .action((id?: string) => void renderStats('webhook', id));
+
+    wh.command('fires')
+        .description('Recent delivery history for one webhook')
+        .argument('<id>', 'Webhook id')
+        .option('--limit <n>', 'Max rows (default 20, max 500)', '20')
+        .action((id: string, opts: { limit?: string }) =>
+            void renderFires(id, Number(opts.limit ?? 20)),
         );
-        if (cfg.enabled === true) {
-            console.log(row('address', `${cfg.host ?? '127.0.0.1'}:${cfg.port ?? '?'}`));
-        }
-        renderRoutes(inboundWebhooksOf(config));
+
+    wh.action(() => renderList());
+}
+
+function renderList(): void {
+    renderScheduleList('webhook', {
+        title: 'Webhooks',
+        emptyLabel: 'webhooks',
+        addHint: 'flopsy webhook add --help',
+        middleCells: (r, cfg) => {
+            const name = (cfg['name'] as string | undefined) ?? r.id;
+            const path = (cfg['path'] as string | undefined) ?? '—';
+            const target = (cfg['targetChannel'] as string | undefined) ?? '—';
+            return [name, dim(path), dim(`→ ${target}`)];
+        },
     });
 }
 
-function renderRoutes(routes: ReadonlyArray<RawInboundWebhook>): void {
-    console.log(section('Webhook routes'));
-    if (routes.length === 0) {
-        console.log(row('routes', dim('no routes configured under proactive.webhooks')));
-        return;
-    }
-    const rows: string[][] = routes.map((w) => {
-        const enabled = w.enabled !== false;
-        const dot = enabled ? tint.webhook('●') : dim('○');
-        const name = w.name ?? '(unnamed)';
-        const displayName = enabled ? name : dim(name);
-        const path = w.path ? dim(w.path) : dim('(no path)');
-        return [dot, displayName, path];
+function renderOne(id: string): void {
+    renderScheduleShow('webhook', id, {
+        label: 'webhook',
+        listCmd: 'flopsy webhook list',
+        nameOf: (r, cfg) => (cfg['name'] as string | undefined) ?? r.id,
+        renderDetails: (_r, cfg) => {
+            if (cfg['path']) console.log(detail('path', String(cfg['path'])));
+            if (cfg['targetChannel'])
+                console.log(detail('target channel', String(cfg['targetChannel'])));
+            if (cfg['secret']) console.log(detail('secret', dim('(set — hidden)')));
+            if (cfg['eventTypeHeader'])
+                console.log(detail('event type header', String(cfg['eventTypeHeader'])));
+        },
     });
-    console.log(table(rows));
 }

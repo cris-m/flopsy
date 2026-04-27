@@ -42,15 +42,51 @@ export interface ExternalWebhookConfig {
 export class WebhookRouter {
     private readonly log = createLogger('webhook-router');
     private readonly configs: ExternalWebhookConfig[];
+    /**
+     * Server + router refs captured on `register()` so runtime adds can
+     * register new routes without re-plumbing. Null until `register` runs.
+     */
+    private webhookServer: WebhookServer | null = null;
+    private messageRouter: MessageRouter | null = null;
+    /** Paths registered dynamically after start — tracked so we can unregister. */
+    private readonly runtimeRoutes = new Set<string>();
 
     constructor(configs: ExternalWebhookConfig[]) {
         this.configs = configs;
     }
 
     register(webhookServer: WebhookServer, messageRouter: MessageRouter): void {
+        this.webhookServer = webhookServer;
+        this.messageRouter = messageRouter;
         for (const cfg of this.configs) {
             this.registerEndpoint(webhookServer, messageRouter, cfg);
         }
+    }
+
+    /**
+     * Register a webhook route created at runtime (via `flopsy schedule add
+     * webhook` or the `manage_schedule` agent tool). Relies on `register()`
+     * having already wired `webhookServer` + `messageRouter` at gateway
+     * start — runtime adds before that are a no-op returning false.
+     */
+    addRuntimeRoute(cfg: ExternalWebhookConfig): boolean {
+        if (!this.webhookServer || !this.messageRouter) return false;
+        this.registerEndpoint(this.webhookServer, this.messageRouter, cfg);
+        this.runtimeRoutes.add(cfg.path);
+        return true;
+    }
+
+    /**
+     * Tear down a runtime-registered webhook route. Returns false if the
+     * path isn't runtime-tracked (e.g. config-defined route — those are
+     * immutable) or the server isn't up.
+     */
+    removeRuntimeRoute(path: string): boolean {
+        if (!this.webhookServer) return false;
+        if (!this.runtimeRoutes.has(path)) return false;
+        const removed = this.webhookServer.unregisterRoute(path);
+        if (removed) this.runtimeRoutes.delete(path);
+        return removed;
     }
 
     private registerEndpoint(

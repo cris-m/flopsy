@@ -79,6 +79,10 @@ export abstract class BaseGateway implements Gateway {
     private readonly clients = new Map<string, WsClient>();
     private readonly _channels = new Map<string, Channel>();
     private readonly dedup = new Map<string, number>();
+    /** Channel+peer of the most recent inbound message. Used by proactive
+     * delivery when `followActiveChannel: true` — proactive messages without
+     * an explicit `delivery` route to wherever the user is chatting now. */
+    private lastActivePeer: { channelName: string; peer: import('@gateway/types').Peer; at: number } | null = null;
     private dedupSweep: ReturnType<typeof setInterval> | null = null;
     private readonly startedAt = Date.now();
     private readonly handlers = new Map<
@@ -101,6 +105,15 @@ export abstract class BaseGateway implements Gateway {
 
     get channels(): ReadonlyMap<string, Channel> {
         return this._channels;
+    }
+
+    /**
+     * Channel+peer of the most-recent inbound message, or null if no message
+     * has been received this session. Consumers: proactive engine's
+     * `followActiveChannel` routing.
+     */
+    getLastActivePeer(): { channelName: string; peer: import('@gateway/types').Peer; at: number } | null {
+        return this.lastActivePeer;
     }
 
     /**
@@ -644,12 +657,33 @@ export abstract class BaseGateway implements Gateway {
 
         const sanitized: Message = { ...message, ...clean };
 
+        // Track the most-recent inbound peer so proactive `followActiveChannel`
+        // routing can send to wherever the user just chatted. Stamped AFTER
+        // the dedup check so replayed duplicates don't stomp a newer value.
+        this.lastActivePeer = {
+            channelName: sanitized.channelName,
+            peer: sanitized.peer,
+            at: Date.now(),
+        };
+
         this.broadcast('message.inbound', {
             channel: sanitized.channelName,
             peer: sanitized.peer,
             sender: sanitized.sender,
             body: sanitized.body,
             messageId: sanitized.id,
+        });
+
+        // Subclass hook — fires once per dedup-clean inbound. The concrete
+        // FlopsyGateway uses this to tick the proactive PresenceManager so
+        // activityWindow reflects reality, and to drain the held-while-away
+        // queue when the user transitions back to active. Safe best-effort;
+        // errors must never break routing.
+        this.onUserActivity(sanitized).catch((err) => {
+            this.log.warn(
+                { err: err instanceof Error ? err.message : String(err), channel: sanitized.channelName },
+                'onUserActivity hook threw — non-fatal',
+            );
         });
 
         await this.route(sanitized);
@@ -682,6 +716,15 @@ export abstract class BaseGateway implements Gateway {
     protected abstract route(message: Message): Promise<void>;
     protected async onStart(): Promise<void> {}
     protected async onStop(): Promise<void> {}
+    /**
+     * Subclass hook fired on each inbound message that passes dedup. The
+     * concrete `FlopsyGateway` override updates the proactive
+     * PresenceManager (so `activityWindow` reflects live reality) and
+     * drains the held-while-away queue when the user transitions back to
+     * active. BaseGateway default is a no-op — tests and minimal gateways
+     * don't need it.
+     */
+    protected async onUserActivity(_message: Message): Promise<void> {}
     protected getProactiveHealth(): Record<string, unknown> {
         return {};
     }

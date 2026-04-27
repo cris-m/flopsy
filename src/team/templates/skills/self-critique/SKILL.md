@@ -45,7 +45,7 @@ After drafting your analysis, run through these:
 - [ ] Am I being contrarian for its own sake?
 - [ ] Does my analysis conveniently align with a popular narrative?
 
-## Process
+## Workflow
 
 1. **Draft your analysis** — form your position as you normally would
 2. **Pause** — before presenting, run the checklist above

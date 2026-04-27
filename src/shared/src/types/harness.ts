@@ -124,8 +124,7 @@ export interface Lesson {
  * Saved after successful complex tasks.
  * Reused in future similar tasks.
  *
- * NOT stored in src/agent/src/skills/ (that's hardcoded skills)
- * Stored in: ~/.flopsybot/skills/ or database
+ * Stored in: ~/.flopsy/skills/ (user skills) or state.db via LearningStore.
  */
 
 export interface SkillStep {

@@ -37,12 +37,12 @@ For images, charts, PDFs, and documents:
 CHECK → INSTALL → WRITE → RUN → VERIFY → DELIVER
 ```
 
-1. **Check** API keys: `execute("[ -n \"$OPENAI_API_KEY\" ] && echo 'set' || echo 'no'")`
-2. **Install** deps: `execute("source .venv/bin/activate && pip install <pkg>")`
-   - Create venv first if missing: `execute("python3 -m venv .venv")`
+1. **Check** API keys: run `[ -n "$OPENAI_API_KEY" ] && echo 'set' || echo 'no'`
+2. **Install** deps: run `source .venv/bin/activate && pip install <pkg>`
+   - Create venv first if missing: `python3 -m venv .venv`
 3. **Write** script: `write_file("/scratch/<name>.py", ...)`
-4. **Run**: `execute(".venv/bin/python /scratch/<name>.py")`
-5. **Verify**: `execute("ls -la /scratch/<output>")` — 0 bytes = failure
+4. **Run**: run the Python script with `.venv/bin/python /scratch/<name>.py`
+5. **Verify**: run `ls -la /scratch/<output>` — 0 bytes = failure
 6. **Deliver**: `send_message({ media: [{ type: "<type>", url: "/scratch/<output>" }] })`
 
 **Never skip step 5.** Delivering a nonexistent file is a silent failure.
@@ -207,5 +207,5 @@ send_message({
 | Output file is 0 bytes | API error body written instead of media | Add `raise_for_status()`, check `Content-Type` |
 | `ModuleNotFoundError` | System Python used | Use `.venv/bin/python`, install into venv first |
 | `_tkinter` crash | Missing `matplotlib.use("Agg")` | Must be called before `import matplotlib.pyplot` |
-| `FileNotFoundError` | Directory doesn't exist | `execute("mkdir -p /scratch")` |
+| `FileNotFoundError` | Directory doesn't exist | Run `mkdir -p /scratch` |
 | Same error 3x | Stuck on same approach | **Stop.** Switch library or method entirely |

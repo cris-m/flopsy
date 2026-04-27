@@ -10,7 +10,7 @@
  * avoid counting escape codes as visible width.
  */
 
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import chalk from 'chalk';
@@ -169,37 +169,277 @@ function tildeHome(p: string): string {
 interface ActivityEntry {
     readonly label: string;
     readonly mtimeMs: number;
+    /**
+     * Priority — higher wins when two entries share a similar timestamp.
+     * Specific events (proactive delivery, inbound message, schedule
+     * creation) get 10+. Generic churn (state.db write, checkpoint) get 1
+     * so they never crowd out the useful stuff on a noisy tick.
+     */
+    readonly priority: number;
 }
 
 function getRecentActivity(limit = 3): readonly ActivityEntry[] {
-    // Delegate to the shared workspace resolver — config-reader already
-    // ran dotenv + primeFlopsyHome, so `workspace.root()` returns the
-    // same absolute path the gateway sees.
+    // Read real event sources (proactive deliveries, schedule creation,
+    // credential refresh, etc.) instead of generic file-mtime noise.
+    // Weighted priority sort: specific events (priority 10) always beat
+    // generic churn (priority 1) so the banner rotates across useful
+    // signals even when the agent is busy writing state.db every turn.
     const flopsyHome = workspace.root();
+    const entries: ActivityEntry[] = [];
 
-    // Candidate artifacts — each maps to a human label. Files that don't
-    // exist are dropped. Order doesn't matter; sorted by mtime below.
-    const candidates: ReadonlyArray<readonly [string, string]> = [
-        [join(process.cwd(), 'flopsy.json5'), 'config edited'],
+    // ── HIGH-PRIORITY: specific, named events ────────────────────────
+    const proactiveJson = join(flopsyHome, 'state', 'proactive.json');
+    if (existsSync(proactiveJson)) {
+        try {
+            const parsed = JSON.parse(readFileSync(proactiveJson, 'utf-8')) as {
+                recentDeliveries?: Array<{ deliveredAt: number; source?: string }>;
+                jobs?: Record<
+                    string,
+                    { lastRunAt?: number; lastStatus?: string; deliveredCount?: number }
+                >;
+                completedOneshots?: string[];
+                presence?: {
+                    explicitStatus?: string;
+                    statusExpiry?: number;
+                    quietHoursUntil?: number;
+                };
+                configSeededAt?: number;
+            };
+
+            // Latest proactive delivery — name + action label.
+            const recent = parsed.recentDeliveries ?? [];
+            if (recent.length > 0) {
+                const top = recent[0]!;
+                entries.push({
+                    label: `${shortenSource(top.source ?? 'proactive')} delivered`,
+                    mtimeMs: top.deliveredAt,
+                    priority: 10,
+                });
+                // Second-most-recent too — gives variety when only a couple
+                // of schedules deliver frequently.
+                if (recent.length > 1) {
+                    const prev = recent[1]!;
+                    entries.push({
+                        label: `${shortenSource(prev.source ?? 'proactive')} delivered`,
+                        mtimeMs: prev.deliveredAt,
+                        priority: 9,
+                    });
+                }
+            }
+
+            // Latest schedule fire (even if suppressed) — from jobs state
+            // lastRunAt. Covers heartbeats that always get dedup-suppressed
+            // (they fire but don't land in recentDeliveries).
+            let mostRecentFire: { id: string; at: number; status?: string } | null = null;
+            for (const [id, js] of Object.entries(parsed.jobs ?? {})) {
+                if (!js.lastRunAt) continue;
+                if (!mostRecentFire || js.lastRunAt > mostRecentFire.at) {
+                    mostRecentFire = { id, at: js.lastRunAt, status: js.lastStatus };
+                }
+            }
+            if (mostRecentFire) {
+                const action =
+                    mostRecentFire.status === 'error' ? 'errored' : 'fired';
+                entries.push({
+                    label: `${shortenSource(mostRecentFire.id)} ${action}`,
+                    mtimeMs: mostRecentFire.at,
+                    priority: 9,
+                });
+            }
+
+            // DND state change — statusExpiry is set whenever DND or
+            // quiet hours are enabled. Surface "DND set" / "quiet hours
+            // ending at …" for ~12h after it happens.
+            const dndActivatedHint = Math.max(
+                parsed.presence?.statusExpiry ?? 0,
+                parsed.presence?.quietHoursUntil ?? 0,
+            );
+            if (dndActivatedHint > 0 && dndActivatedHint > Date.now() - 24 * 3_600_000) {
+                const active =
+                    parsed.presence?.explicitStatus === 'dnd' ||
+                    (parsed.presence?.quietHoursUntil ?? 0) > Date.now();
+                entries.push({
+                    label: active ? 'DND active' : 'DND ended',
+                    mtimeMs: active
+                        ? dndActivatedHint - 60_000 // ~when it was set
+                        : dndActivatedHint,
+                    priority: 9,
+                });
+            }
+
+            // Config seed marker — when the engine first imported
+            // flopsy.json5 schedules into proactive.db. Interesting once
+            // right after migration.
+            if (parsed.configSeededAt && parsed.configSeededAt > Date.now() - 7 * 86_400_000) {
+                entries.push({
+                    label: 'schedules migrated from config',
+                    mtimeMs: parsed.configSeededAt,
+                    priority: 8,
+                });
+            }
+        } catch {
+            /* malformed JSON — skip the whole block */
+        }
+    }
+
+    // Latest schedule added/removed — mtime on proactive.db-wal changes
+    // on write. We label it with createdAt/updatedAt if readable.
+    const proactiveDb = join(flopsyHome, 'state', 'proactive.db');
+    if (existsSync(proactiveDb)) {
+        try {
+            const m = statSync(proactiveDb).mtimeMs;
+            entries.push({ label: 'schedule added/edited', mtimeMs: m, priority: 8 });
+        } catch { /* skip */ }
+    }
+
+    // Latest credential refresh — strongest OAuth health signal.
+    const credsDir = join(flopsyHome, 'credentials');
+    if (existsSync(credsDir)) {
+        try {
+            let best: { name: string; mtimeMs: number } | null = null;
+            for (const name of readdirSync(credsDir)) {
+                if (!name.endsWith('.json')) continue;
+                const p = join(credsDir, name);
+                try {
+                    const mtime = statSync(p).mtimeMs;
+                    if (!best || mtime > best.mtimeMs) {
+                        best = { name: name.replace(/\.json$/, ''), mtimeMs: mtime };
+                    }
+                } catch { /* skip */ }
+            }
+            if (best) {
+                entries.push({
+                    label: `${best.name} auth refreshed`,
+                    mtimeMs: best.mtimeMs,
+                    priority: 9,
+                });
+            }
+        } catch { /* no access — skip */ }
+    }
+
+    // Latest skill edit — when the user (or background reviewer) last
+    // touched a SKILL.md. Great signal that the agent is learning.
+    const skillsDir = join(flopsyHome, 'skills');
+    if (existsSync(skillsDir)) {
+        try {
+            let best: { name: string; mtimeMs: number } | null = null;
+            for (const name of readdirSync(skillsDir)) {
+                const skillMd = join(skillsDir, name, 'SKILL.md');
+                if (!existsSync(skillMd)) continue;
+                try {
+                    const mtime = statSync(skillMd).mtimeMs;
+                    if (!best || mtime > best.mtimeMs) {
+                        best = { name, mtimeMs: mtime };
+                    }
+                } catch { /* skip */ }
+            }
+            if (best) {
+                entries.push({
+                    label: `skill "${best.name}" updated`,
+                    mtimeMs: best.mtimeMs,
+                    priority: 8,
+                });
+            }
+        } catch { /* skip */ }
+    }
+
+    // Latest prompt file edit (proactive/heartbeats + proactive/cron).
+    for (const kind of ['heartbeats', 'cron']) {
+        const dir = join(flopsyHome, 'proactive', kind);
+        if (!existsSync(dir)) continue;
+        try {
+            let best: { name: string; mtimeMs: number } | null = null;
+            for (const name of readdirSync(dir)) {
+                const p = join(dir, name);
+                try {
+                    const mtime = statSync(p).mtimeMs;
+                    if (!best || mtime > best.mtimeMs) {
+                        best = { name, mtimeMs: mtime };
+                    }
+                } catch { /* skip */ }
+            }
+            if (best) {
+                entries.push({
+                    label: `prompt file "${best.name}" edited`,
+                    mtimeMs: best.mtimeMs,
+                    priority: 7,
+                });
+            }
+        } catch { /* skip */ }
+    }
+
+    // ── MEDIUM-PRIORITY: structural changes ───────────────────────────
+    const pidfile = join(flopsyHome, 'gateway.pid');
+    if (existsSync(pidfile)) {
+        try {
+            entries.push({
+                label: 'gateway started',
+                mtimeMs: statSync(pidfile).mtimeMs,
+                priority: 5,
+            });
+        } catch { /* skip */ }
+    }
+
+    const configPath = join(process.cwd(), 'flopsy.json5');
+    if (existsSync(configPath)) {
+        try {
+            entries.push({
+                label: 'config edited',
+                mtimeMs: statSync(configPath).mtimeMs,
+                priority: 5,
+            });
+        } catch { /* skip */ }
+    }
+
+    // ── LOW-PRIORITY: generic churn (last-resort fallback) ────────────
+    const generic: ReadonlyArray<readonly [string, string]> = [
         [join(flopsyHome, 'harness', 'checkpoints.db-wal'), 'turn completed'],
         [join(flopsyHome, 'harness', 'checkpoints.db'), 'checkpoint written'],
         [join(flopsyHome, 'harness', 'state.db'), 'state updated'],
         [join(flopsyHome, 'harness', 'memory.db-wal'), 'memory write'],
-        [join(flopsyHome, 'logs', 'gateway.log'), 'gateway log'],
     ];
-
-    const entries: ActivityEntry[] = [];
-    for (const [path, label] of candidates) {
+    for (const [path, label] of generic) {
         if (!existsSync(path)) continue;
         try {
-            const mtime = statSync(path).mtimeMs;
-            entries.push({ label, mtimeMs: mtime });
-        } catch {
-            // permission issue / race — skip silently
-        }
+            entries.push({ label, mtimeMs: statSync(path).mtimeMs, priority: 1 });
+        } catch { /* skip */ }
     }
-    entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
-    return entries.slice(0, limit);
+
+    // Sort: high priority first, then newer first within a priority tier.
+    // This guarantees specific events crowd out generic churn even when
+    // the agent is actively writing state.db every turn.
+    entries.sort((a, b) => {
+        if (b.priority !== a.priority) return b.priority - a.priority;
+        return b.mtimeMs - a.mtimeMs;
+    });
+
+    // De-dupe by label so we don't show "heartbeat Presence Check delivered"
+    // twice if multiple sources happen to point at the same event.
+    const seen = new Set<string>();
+    const deduped: ActivityEntry[] = [];
+    for (const e of entries) {
+        if (seen.has(e.label)) continue;
+        seen.add(e.label);
+        deduped.push(e);
+        if (deduped.length >= limit) break;
+    }
+    return deduped;
+}
+
+/**
+ * Turn a schedule source id like `runtime-hb-Presence Check` into a
+ * short label: strip `runtime-hb-` / `runtime-cron-` prefixes and cap
+ * at 30 chars so the banner doesn't overflow its column.
+ */
+function shortenSource(source: string): string {
+    let s = source
+        .replace(/^runtime-hb-/, 'heartbeat ')
+        .replace(/^runtime-cron-/, 'cron ');
+    // Cron ids often end with `-1777029...-xyzabc`; strip the timestamp
+    // suffix to keep the human label visible.
+    s = s.replace(/-\d{13}-[a-z0-9]{4,8}$/, '');
+    if (s.length > 30) s = s.slice(0, 29) + '…';
+    return s;
 }
 
 /**

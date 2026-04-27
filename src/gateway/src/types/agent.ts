@@ -212,6 +212,46 @@ export interface AgentHandler {
      * instantiated yet.
      */
     queryStatus?(threadId: string): ThreadStatusSnapshot | undefined;
+    /**
+     * Aggregate task list across ALL threads — for `flopsy tasks` and the
+     * top-level `flopsy status` work surface. Returns undefined when the
+     * agent layer doesn't track tasks (tests, minimal stubs).
+     */
+    queryAllTasks?(filter?: TaskListFilter): AggregateTaskSummary[];
+    /**
+     * Resolve the effective threadId for a proactive fire targeting a known
+     * peer. Maps `channelName + peer` → the peer's active session threadId
+     * (`<peerId>#<sessionId>`). Returns undefined when the session layer is
+     * not available (tests, stubs, or before the first inbound message).
+     *
+     * Sources: 'heartbeat' or 'cron' — never extends lastUserMessageAt.
+     */
+    resolveProactiveThreadId?(
+        channelName: string,
+        peer: { id: string; type: 'user' | 'group' | 'channel' },
+        source: 'heartbeat' | 'cron',
+    ): string | undefined;
+
+    /**
+     * Force-close the peer's current session and open a fresh one. Used by
+     * the `/new` slash command. The `rawKey` is the peer routing key
+     * (`channel:scope:nativeId`). Returns the new sessionId for display,
+     * or undefined if the session layer is not available.
+     */
+    forceNewSession?(rawKey: string): string | undefined;
+}
+
+/** Filter options for `queryAllTasks`. All fields narrow the result set. */
+export interface TaskListFilter {
+    readonly threadId?: string;
+    readonly status?: ReadonlyArray<TaskStatusSummary['status']>;
+    /** Cap on the number of results (applied after sorting newest-first). */
+    readonly limit?: number;
+}
+
+/** `TaskStatusSummary` plus the thread it ran in. */
+export interface AggregateTaskSummary extends TaskStatusSummary {
+    readonly threadId: string;
 }
 
 export interface ThreadStatusSnapshot {
@@ -248,6 +288,18 @@ export interface ThreadStatusSnapshot {
 
 export interface TeamMemberStatus {
     readonly name: string;
+    /** Static agent config mirrored so `/team` matches `flopsy team show`. */
+    readonly role?: 'main' | 'worker' | string;
+    readonly domain?: string;
+    readonly model?: string;
+    readonly toolsets?: readonly string[];
+    readonly mcpServers?: readonly string[];
+    readonly sandbox?: {
+        readonly enabled: boolean;
+        readonly backend?: string;
+        readonly language?: string;
+        readonly programmaticToolCalling?: boolean;
+    };
     /** Domain/type from config — 'research', 'deep-research', 'analysis', etc. */
     readonly type: string;
     /** From flopsy.json5: configured-off workers show as 'disabled'. */

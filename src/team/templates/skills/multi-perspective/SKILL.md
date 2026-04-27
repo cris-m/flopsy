@@ -15,7 +15,7 @@ Never form a position from a single viewpoint. Identify all stakeholders, analyz
 - As part of critical-analysis-chain
 - Any situation with multiple actors who have different interests
 
-## Process
+## Workflow
 
 ### Step 1: Identify Stakeholders
 List everyone with a stake in the outcome:

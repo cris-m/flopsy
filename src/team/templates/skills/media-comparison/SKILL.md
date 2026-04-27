@@ -15,7 +15,7 @@ Compare coverage of the same event across multiple outlets to reveal framing, bi
 - Part of research on a controversial or polarizing topic
 - User says "give me multiple perspectives on this story"
 
-## Process
+## Workflow
 
 ### Step 1: Identify the Story
 Define the core event (stripped of framing): "What happened, to whom, when?"

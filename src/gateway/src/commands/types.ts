@@ -102,6 +102,22 @@ export interface TeamMemberSummary {
      * show "idle · last active 43s ago" instead of a bare "idle".
      */
     readonly lastActiveAt?: number;
+
+    // ── Static config — mirrored so `/team` can show the same info
+    //    `flopsy team show` does without the chat handler needing to
+    //    re-read flopsy.json5 each turn. Populated from AgentDefinition
+    //    in TeamHandler.buildTeamRoster / queryStatus.
+    readonly role?: 'main' | 'worker' | string;
+    readonly domain?: string;
+    readonly model?: string;
+    readonly toolsets?: readonly string[];
+    readonly mcpServers?: readonly string[];
+    readonly sandbox?: {
+        readonly enabled: boolean;
+        readonly backend?: string;
+        readonly language?: string;
+        readonly programmaticToolCalling?: boolean;
+    };
 }
 
 export interface TaskSummary {
@@ -121,6 +137,15 @@ export interface TaskSummary {
  */
 export interface CommandResult {
     readonly text: string;
+    /**
+     * When set, after sending `text` to the user, the channel-worker also
+     * enqueues this string into the agent message queue as if the user had
+     * typed it. Used by commands that arm a behavior (e.g. /plan) and then
+     * hand the actual task off to the agent. Wrap any system-style
+     * instructions in brackets so the agent can distinguish them from the
+     * user's own words.
+     */
+    readonly forwardToAgent?: string;
 }
 
 export type CommandHandler = (ctx: CommandContext) => Promise<CommandResult | null>;

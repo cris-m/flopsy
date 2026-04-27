@@ -1,8 +1,6 @@
 // Re-export shared proactive types that this file doesn't redefine locally.
-// (JobState, UserPresence, ActivityWindow, ExplicitStatus, ReportedItemType,
-// QueuedItem, RetryTaskType, RetryTask, ProactiveState, BACKOFF_SCHEDULE_MS,
-// RETRY_BACKOFF_MS, RETRY_MAX_ATTEMPTS are all defined below, so we only
-// import the remaining types for use here.)
+// JobState, UserPresence, RetryTask, ProactiveState, and the BACKOFF/RETRY
+// constants are defined below — gateway owns the persisted shape.
 import type {
     Peer,
     CronSchedule,
@@ -66,19 +64,6 @@ export interface UserPresence {
     quietHoursUntil?: number;
 }
 
-// ── Queue ───────────────────────────────────────────────────────
-
-export type ReportedItemType = 'emails' | 'meetings' | 'tasks' | 'news';
-
-export interface QueuedItem {
-    id: string;
-    content: string;
-    source: string;
-    priority: number;
-    createdAt: number;
-    delivery: DeliveryTarget;
-}
-
 // ── Retry ───────────────────────────────────────────────────────
 
 export type RetryTaskType = 'message' | 'job';
@@ -113,7 +98,6 @@ export interface ProactiveState {
     version: number;
     presence: UserPresence;
     jobs: Record<string, JobState>;
-    queue: QueuedItem[];
     reportedItems: {
         emails: string[];
         meetings: string[];
@@ -131,6 +115,8 @@ export interface ProactiveState {
         source: string;
         delivered?: boolean;
     }>;
+    completedOneshots?: string[];
+    configSeededAt?: number;
 }
 
 // ── Run History ─────────────────────────────────────────────────

@@ -6,8 +6,12 @@
  */
 
 import { Command } from 'commander';
-import { bad, detail, dim, row, section } from '../ui/pretty';
+import { renameSync, writeFileSync } from 'node:fs';
+import chalk from 'chalk';
+import { truncate } from '@flopsy/shared';
+import { bad, detail, dim, info, ok, row, section } from '../ui/pretty';
 import { readFlopsyConfig, type ModelRef, type RawAgent } from './config-reader';
+import { mgmtUrl } from './schedule-client';
 import { tint } from '../ui/theme';
 
 /** Format a ModelRef back into a "provider:name" string for display. */
@@ -17,13 +21,15 @@ function fmtModel(m: ModelRef | undefined): string | undefined {
 }
 
 export function registerTeamCommands(root: Command): void {
-    const team = root.command('team').description('Inspect the configured agent team');
+    const team = root.command('team').description('Inspect and manage the configured agent team');
 
     team.command('list')
-        .description('Show every configured agent + role + enabled state')
-        .action(() => {
+        .description('Show every configured agent + role + enabled state (+ live activity when gateway is running)')
+        .option('--no-live', 'Skip the live-activity probe (config view only)')
+        .action(async (opts: { live: boolean }) => {
             const { config } = readFlopsyConfig();
-            renderList(config.agents ?? [], buildPushMap(config.mcp?.servers ?? {}));
+            const live = opts.live !== false ? await fetchLiveAgents() : new Map();
+            renderList(config.agents ?? [], buildPushMap(config.mcp?.servers ?? {}), live);
         });
 
     team.command('show')
@@ -39,11 +45,123 @@ export function registerTeamCommands(root: Command): void {
             renderOne(agent, buildPushMap(config.mcp?.servers ?? {}));
         });
 
-    // Default: `flopsy team` with no subcommand → list.
-    team.action(() => {
+    team.command('enable')
+        .description('Enable an agent (sets enabled=true in flopsy.json5)')
+        .argument('<name>', 'Agent name')
+        .action((name: string) => writeAgentField(name, 'enabled', true));
+
+    team.command('disable')
+        .description('Disable an agent (sets enabled=false in flopsy.json5)')
+        .argument('<name>', 'Agent name')
+        .action((name: string) => writeAgentField(name, 'enabled', false));
+
+    team.command('set')
+        .description('Set a field on an agent; <value> is JSON-parsed, else string')
+        .argument('<name>', 'Agent name (e.g. legolas)')
+        .argument('<field>', 'Field path, e.g. `model`, `model_config.temperature`, `approvals.tools`')
+        .argument('<value>', 'JSON literal (true, 123, [..]) or plain string')
+        .action((name: string, field: string, rawValue: string) => {
+            const parsed = parseValue(rawValue);
+            writeAgentField(name, field, parsed);
+        });
+
+    // Default: `flopsy team` with no subcommand → list (with live probe).
+    team.action(async () => {
         const { config } = readFlopsyConfig();
-        renderList(config.agents ?? [], buildPushMap(config.mcp?.servers ?? {}));
+        const live = await fetchLiveAgents();
+        renderList(config.agents ?? [], buildPushMap(config.mcp?.servers ?? {}), live);
     });
+}
+
+// ── Live probe ───────────────────────────────────────────────────────────
+
+type LiveAgentMap = Map<string, { state: 'idle' | 'busy'; currentTask?: string }>;
+
+async function fetchLiveAgents(): Promise<LiveAgentMap> {
+    const url = mgmtUrl('/mgmt/status');
+    const token = process.env['FLOPSY_MGMT_TOKEN'];
+    const out: LiveAgentMap = new Map();
+    try {
+        const res = await fetch(url, {
+            headers: token ? { Authorization: `Bearer ${token}` } : {},
+            signal: AbortSignal.timeout(1500),
+        });
+        if (!res.ok) return out;
+        const body = (await res.json()) as { agents?: Array<{ name: string; state: 'idle' | 'busy'; currentTask?: string }> };
+        for (const a of body.agents ?? []) {
+            out.set(a.name, {
+                state: a.state,
+                ...(a.currentTask ? { currentTask: a.currentTask } : {}),
+            });
+        }
+    } catch {
+        /* gateway unreachable — config view only */
+    }
+    return out;
+}
+
+// ── Writes ───────────────────────────────────────────────────────────────
+
+function writeAgentField(name: string, field: string, value: unknown): void {
+    const { path: file, config } = readFlopsyConfig();
+    const cfg = config as Record<string, unknown>;
+    const agents = (cfg['agents'] as Array<Record<string, unknown>> | undefined) ?? [];
+    const idx = agents.findIndex((a) => a['name'] === name);
+    if (idx < 0) {
+        console.log(bad(`No agent named "${name}" in flopsy.json5.`));
+        process.exit(1);
+    }
+    setByPath(agents[idx]!, field, value);
+    atomicWrite(file, cfg);
+    console.log(ok(`set agents.${name}.${field} = ${prettyValue(value)}`));
+    console.log(dim(`wrote ${file}`));
+    console.log(info('restart the gateway to apply: `flopsy gateway restart`'));
+}
+
+function setByPath(obj: Record<string, unknown>, path: string, value: unknown): void {
+    const parts = path
+        .replace(/\[(\d+)\]/g, '.$1')
+        .split('.')
+        .filter((s) => s.length > 0);
+    const last = parts.pop();
+    if (!last) throw new Error('empty path');
+    let cur: Record<string, unknown> | unknown[] = obj;
+    for (const part of parts) {
+        if (Array.isArray(cur)) {
+            const i = Number(part);
+            if (!Number.isInteger(i)) throw new Error(`expected array index, got "${part}"`);
+            if (cur[i] === undefined || typeof cur[i] !== 'object' || cur[i] === null) cur[i] = {};
+            cur = cur[i] as Record<string, unknown> | unknown[];
+        } else {
+            if (cur[part] === undefined || typeof cur[part] !== 'object' || cur[part] === null) {
+                cur[part] = {};
+            }
+            cur = cur[part] as Record<string, unknown> | unknown[];
+        }
+    }
+    if (Array.isArray(cur)) {
+        const i = Number(last);
+        if (!Number.isInteger(i)) throw new Error(`expected array index, got "${last}"`);
+        (cur as unknown[])[i] = value;
+    } else {
+        (cur as Record<string, unknown>)[last] = value;
+    }
+}
+
+function parseValue(raw: string): unknown {
+    try { return JSON.parse(raw); } catch { return raw; }
+}
+
+function prettyValue(v: unknown): string {
+    if (typeof v === 'string') return `"${v}"`;
+    return JSON.stringify(v);
+}
+
+function atomicWrite(file: string, value: unknown): void {
+    const tmp = `${file}.tmp`;
+    const body = JSON.stringify(value, null, 4) + '\n';
+    writeFileSync(tmp, body, 'utf-8');
+    renameSync(tmp, file);
 }
 
 /**
@@ -76,7 +194,11 @@ function effectiveMcp(a: RawAgent, pushMap: PushMap): readonly string[] {
     return [...pushed, ...broadcast];
 }
 
-function renderList(agents: ReadonlyArray<RawAgent>, pushMap: PushMap): void {
+function renderList(
+    agents: ReadonlyArray<RawAgent>,
+    pushMap: PushMap,
+    live: LiveAgentMap = new Map(),
+): void {
     console.log(section('Team'));
     if (agents.length === 0) {
         console.log(row('roster', dim('no agents configured')));
@@ -89,13 +211,24 @@ function renderList(agents: ReadonlyArray<RawAgent>, pushMap: PushMap): void {
     // pop without extra colour.
     for (const a of agents) {
         const disabled = a.enabled === false;
-        const dot = disabled ? dim('○') : tint.team('●');
+        const liveState = live.get(a.name);
+        const dot = disabled ? dim('○') : liveState?.state === 'busy' ? chalk.cyan('▶') : tint.team('●');
         const name = disabled ? dim(a.name) : tint.team(a.name);
+        const activityTag = (() => {
+            if (disabled) return dim('disabled');
+            if (!liveState) return dim('');
+            if (liveState.state === 'busy') {
+                const task = liveState.currentTask ? `: ${truncate(liveState.currentTask, 40)}` : '';
+                return chalk.cyan(`working${task}`);
+            }
+            return dim('idle');
+        })();
         const meta = [a.type, a.role, a.domain]
             .filter(Boolean)
             .map((s) => dim(s as string))
             .join(dim(' · '));
-        console.log(`  ${dot}  ${name}  ${meta}`);
+        const metaWithLive = activityTag ? `${meta}  ${activityTag}` : meta;
+        console.log(`  ${dot}  ${name}  ${metaWithLive}`);
 
         const bullet = dim('-');
         if (a.model) console.log(`    ${bullet} ${dim('model   ')} ${dim(a.model)}`);
@@ -128,6 +261,14 @@ function renderList(agents: ReadonlyArray<RawAgent>, pushMap: PushMap): void {
             const source = a.mcpServers?.length ? '(pull)' : '(assignTo)';
             console.log(
                 `    ${bullet} ${dim('mcp     ')} ${dim(mcps.join(', '))} ${dim(source)}`,
+            );
+        }
+
+        // Sandbox — only shown when opted in (most agents don't have it).
+        if (a.sandbox?.enabled) {
+            const ptc = a.sandbox.programmaticToolCalling ? ' · programmatic-tools' : '';
+            console.log(
+                `    ${bullet} ${dim('sandbox ')} ${dim(`${a.sandbox.backend ?? 'local'}/${a.sandbox.language ?? 'python'}${ptc}`)}`,
             );
         }
     }
@@ -194,5 +335,23 @@ function renderOne(a: RawAgent, pushMap: PushMap): void {
                 `tools=${(a.approvals.tools ?? []).join(', ') || '(none)'} · actions=${(a.approvals.actions ?? []).join(', ') || '(none)'}`,
             ),
         );
+    }
+
+    // Sandbox — the per-agent flopsygraph sandbox + programmatic tool
+    // calling toggles. Rendered compactly on one line so it matches the
+    // density of the rest of the detail view; flip to multi-line only
+    // when the agent has non-default tuning.
+    if (a.sandbox?.enabled) {
+        const bits: string[] = [
+            `${a.sandbox.backend ?? 'local'}/${a.sandbox.language ?? 'python'}`,
+        ];
+        if (a.sandbox.programmaticToolCalling) bits.push('programmatic-tools');
+        if (a.sandbox.timeout) bits.push(`timeout=${a.sandbox.timeout}ms`);
+        if (a.sandbox.memoryLimit) bits.push(`mem=${Math.round(a.sandbox.memoryLimit / 1024 / 1024)}MB`);
+        if (a.sandbox.cpuLimit) bits.push(`cpu=${a.sandbox.cpuLimit}`);
+        if (a.sandbox.networkEnabled) bits.push('network');
+        console.log(detail('sandbox', bits.join(' · ')));
+    } else {
+        console.log(detail('sandbox', dim('disabled')));
     }
 }

@@ -18,7 +18,7 @@ Interact with GitHub repositories, issues, pull requests, releases, and workflow
 
 ## How to Run Commands
 
-**Always use the `execute` tool to run commands.** Pass the command string as the `command` parameter. Never tell the user to run commands themselves — you have the `execute` tool.
+Run `gh` and `git` commands directly via the available Bash-style command runner. Never tell the user to run commands themselves — run them yourself.
 
 ## Authentication
 
@@ -211,7 +211,7 @@ gh pr create                          # Open PR from current branch
 
 1. Determine what the user wants (view/create/update/explore)
 2. Identify the repository (owner/repo) — check context if not specified
-3. Run the appropriate `gh` command via the `execute` tool
+3. Run the appropriate `gh` command directly
 4. Present output clearly — summarize large results
 5. Chain follow-up actions when natural (e.g., clone → explore → create issue)
 
@@ -224,5 +224,5 @@ gh pr create                          # Open PR from current branch
 - For large repos, use API tree listing before cloning
 - Never force-push to main/master without explicit user confirmation
 - Use `--json` flag for machine-readable output when processing results
-- Use the `execute` tool for all `gh` and `git` commands — never tell the user to run them manually
+- Run all `gh` and `git` commands yourself — never tell the user to run them manually
 - When user sends a GitHub URL, extract owner/repo and use `gh` commands — never say "I can't access that"

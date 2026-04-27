@@ -1,6 +1,7 @@
 ---
 name: last30days
 description: Pull a user's last 30 days of public activity across X/Twitter, Reddit, and Hacker News without any paid API keys. Returns newest-first with date, body, engagement, and URL. Designed for daily digests, "catch me up on @user" workflows, and feeding Obsidian/Notion digests from cron jobs.
+compatibility: Designed for FlopsyBot agent
 ---
 
 # last30days — 30-day activity snapshot

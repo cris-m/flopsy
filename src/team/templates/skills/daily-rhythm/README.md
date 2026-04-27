@@ -19,7 +19,7 @@ This test suite validates the **daily-rhythm** skill's ability to:
 ### Option 1: Direct Python Execution
 
 ```bash
-cd /Users/munzihirwa/Documents/flopsy/FlopsyBot/src/agent/src/skills/daily-rhythm
+cd ~/.flopsy/skills/daily-rhythm
 python3 test_daily_rhythm.py
 ```
 

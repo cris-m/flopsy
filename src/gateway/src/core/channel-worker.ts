@@ -205,6 +205,22 @@ export class ChannelWorker {
 
             if (result) {
                 await this.sendReply(result.text, message.peer, message.id);
+                // Some commands (e.g. /plan) ask for the agent to also receive
+                // a follow-up text — typically a bracketed instruction plus the
+                // user's task. Inject it into the message queue exactly like a
+                // user-typed message so the normal turn pipeline runs.
+                if (result.forwardToAgent) {
+                    this.currentPeer = message.peer;
+                    this.currentSender = message.sender;
+                    this.lastMessageId = message.id;
+                    if (this.turnActive) {
+                        if (this.pending.length < MAX_PENDING) {
+                            this.pending.push(result.forwardToAgent);
+                        }
+                    } else {
+                        this.msgQueue.enqueue(result.forwardToAgent, undefined, false);
+                    }
+                }
                 return;
             }
 
@@ -698,6 +714,7 @@ export class ChannelWorker {
         this.typingInterval = setInterval(() => {
             void this.sendTyping(peer);
         }, 4_000);
+        this.typingInterval.unref();
     }
 
     private stopTypingLoop(): void {
@@ -720,7 +737,16 @@ export class ChannelWorker {
     private async sendTyping(peer: Peer): Promise<void> {
         try {
             await this.channel.sendTyping(peer);
-        } catch {}
+        } catch (err) {
+            // Don't spam at warn/error — typing is best-effort and transient
+            // failures are expected (rate limits, brief disconnects). If the
+            // transport is permanently broken the user will see an actual
+            // reply failure.
+            this.log.debug(
+                { err: err instanceof Error ? err.message : String(err), peer: peer.id },
+                'sendTyping failed',
+            );
+        }
     }
 
     private createWaitForEventOrStop(): [Promise<null>, () => void] {
@@ -762,6 +788,7 @@ function rejectAfterTimeout(
             abort.abort(new Error('Agent invocation timed out'));
             reject(new Error('Agent invocation timed out'));
         }, ms);
+        timer.unref();
         abort.signal.addEventListener('abort', () => clearTimeout(timer), { once: true });
     });
     const cleanup = (): void => {

@@ -25,7 +25,7 @@ import { Command } from 'commander';
 import JSON5 from 'json5';
 import { bad, dim, info, ok, row, section } from '../ui/pretty';
 import { printBanner } from '../ui/banner';
-import { configPath, readFlopsyConfig } from './config-reader';
+import { readFlopsyConfig } from './config-reader';
 
 /**
  * Which env var each channel needs. When a user enables a channel we
@@ -60,12 +60,10 @@ async function runOnboard(skipAuth: boolean): Promise<void> {
     console.log(dim("Re-running is safe — blank input keeps the current value."));
     console.log('');
 
-    // Step 1: Load current state
     const { path: cfgPath, config } = readFlopsyConfig();
     const channelsCfg = (config.channels ?? {}) as Record<string, { enabled?: boolean }>;
     const allChannelNames = Object.keys(channelsCfg).sort();
 
-    // Step 2: Channel selection
     console.log(section('Step 1: Channels', '#3498DB'));
     const defaultSelected = allChannelNames.filter((n) => channelsCfg[n]?.enabled === true);
     const selectedChannels = (await checkbox({
@@ -77,12 +75,10 @@ async function runOnboard(skipAuth: boolean): Promise<void> {
         })),
     })) as string[];
 
-    // Persist channel.enabled toggles
     flipChannels(cfgPath, allChannelNames, new Set(selectedChannels));
     console.log(ok(`${selectedChannels.length} channel(s) enabled.`));
     console.log('');
 
-    // Step 3: Tokens for enabled channels
     console.log(section('Step 2: Tokens', '#F1C40F'));
     const envEntries: Record<string, string> = {};
     for (const name of selectedChannels) {
@@ -115,7 +111,6 @@ async function runOnboard(skipAuth: boolean): Promise<void> {
     }
     console.log('');
 
-    // Step 4: Auth
     if (!skipAuth) {
         console.log(section('Step 3: Service auth', '#E67E22'));
         const provider = await select({
@@ -134,7 +129,6 @@ async function runOnboard(skipAuth: boolean): Promise<void> {
         console.log('');
     }
 
-    // Step 5: Optionally start
     console.log(section('Step 4: Start', '#2ECC71'));
     const start = await confirm({
         message: 'Start the gateway now?',
@@ -148,7 +142,6 @@ async function runOnboard(skipAuth: boolean): Promise<void> {
     }
     console.log('');
 
-    // Step 6: Final summary + doctor hint
     console.log(section('All set', '#9B59B6'));
     console.log(row('config', cfgPath));
     console.log(row('env', ENV_PATH()));

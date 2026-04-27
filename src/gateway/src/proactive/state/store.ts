@@ -32,7 +32,6 @@ function createDefaultState(): ProactiveState {
         version: STATE_VERSION,
         presence: getDefaultPresence(),
         jobs: {},
-        queue: [],
         reportedItems: {
             emails: [],
             meetings: [],
@@ -53,13 +52,26 @@ export class StateStore {
     constructor(filePath: string) {
         this.filePath = filePath;
         this.state = this.load();
+        // Clear any `isExecuting` flags left set by a crash/SIGKILL — otherwise
+        // a single bad shutdown permanently suppresses the job on every fire.
+        // Process-local mutual exclusion (not persisted) is the intended design.
+        let cleared = 0;
+        for (const js of Object.values(this.state.jobs)) {
+            if (js.isExecuting) {
+                js.isExecuting = false;
+                cleared++;
+            }
+        }
+        if (cleared > 0) {
+            this.dirty = true;
+            log.warn({ cleared }, 'cleared stale isExecuting flags on boot');
+        }
         this.flushTimer = setInterval(() => this.flush(), 10_000);
         this.flushTimer.unref();
         log.info(
             {
                 filePath,
                 jobs: Object.keys(this.state.jobs).length,
-                queueSize: this.state.queue.length,
             },
             'state store initialized',
         );
@@ -71,7 +83,10 @@ export class StateStore {
                 const raw = readFileSync(this.filePath, 'utf-8');
                 const parsed = JSON.parse(raw) as ProactiveState;
                 if (parsed.version === STATE_VERSION) return parsed;
-                log.warn({ version: parsed.version }, 'State version mismatch, resetting');
+                log.warn(
+                    { version: parsed.version, expected: STATE_VERSION },
+                    'State version mismatch — resetting to defaults',
+                );
             }
         } catch (err) {
             log.warn({ err }, 'Failed to load proactive state, using defaults');
@@ -116,9 +131,32 @@ export class StateStore {
         return this.state.jobs[jobId] ? { ...this.state.jobs[jobId] } : getDefaultJobState();
     }
 
+    /**
+     * Synchronous read for callers on the hot status path — data is all
+     * in-memory (loaded into `this.state` on construction). Returns null
+     * when the job has no recorded state yet (never fired).
+     */
+    getJobStateSync(jobId: string): JobState | null {
+        const js = this.state.jobs[jobId];
+        return js ? { ...js } : null;
+    }
+
     async setJobState(jobId: string, state: JobState): Promise<void> {
         this.state.jobs[jobId] = state;
         this.dirty = true;
+    }
+
+    /**
+     * Drop the cached stats for a deleted schedule. Without this, every
+     * removed heartbeat/cron leaves an orphan record in `jobs[]` that
+     * accumulates forever and shows up in `flopsy status` as a ghost
+     * schedule.
+     */
+    deleteJobState(jobId: string): boolean {
+        if (!(jobId in this.state.jobs)) return false;
+        delete this.state.jobs[jobId];
+        this.dirty = true;
+        return true;
     }
 
     async addDelivery(content: string, source: string): Promise<void> {
@@ -161,15 +199,44 @@ export class StateStore {
         return this.state.reportedItems[type].includes(id);
     }
 
-    getQueue(): Readonly<ProactiveState['queue']> {
-        return this.state.queue;
-    }
-
     getRecentDeliveries(): Readonly<ProactiveState['recentDeliveries']> {
         return this.state.recentDeliveries;
     }
 
     getRecentTopics(): Readonly<ProactiveState['recentTopics']> {
         return this.state.recentTopics;
+    }
+
+    isOneshotCompleted(id: string): boolean {
+        return this.state.completedOneshots?.includes(id) ?? false;
+    }
+
+    markOneshotCompleted(id: string): void {
+        if (!this.state.completedOneshots) this.state.completedOneshots = [];
+        if (!this.state.completedOneshots.includes(id)) {
+            this.state.completedOneshots.push(id);
+            this.dirty = true;
+        }
+    }
+
+    clearOneshotCompleted(id: string): boolean {
+        const list = this.state.completedOneshots;
+        if (!list) return false;
+        const idx = list.indexOf(id);
+        if (idx < 0) return false;
+        list.splice(idx, 1);
+        this.dirty = true;
+        return true;
+    }
+
+    // ── Config seed marker (one-time import from flopsy.json5) ────────────
+
+    getConfigSeededAt(): number | null {
+        return this.state.configSeededAt ?? null;
+    }
+
+    markConfigSeeded(): void {
+        this.state.configSeededAt = Date.now();
+        this.dirty = true;
     }
 }

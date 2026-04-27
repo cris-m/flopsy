@@ -22,7 +22,6 @@
 import { renameSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { Command } from 'commander';
-import JSON5 from 'json5';
 import { bad, dim, info, ok, section } from '../ui/pretty';
 import { configPath, readFlopsyConfig } from './config-reader';
 

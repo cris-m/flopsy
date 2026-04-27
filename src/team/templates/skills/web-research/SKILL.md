@@ -19,7 +19,7 @@ Structured multi-source research methodology for gathering accurate, current inf
 
 Every research query should produce at least 3 independent sources. A single source can be wrong, outdated, or biased.
 
-## Research Workflow
+## Workflow
 
 ### Step 1: Plan the Queries
 

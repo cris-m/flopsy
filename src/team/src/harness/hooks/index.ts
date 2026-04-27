@@ -1,2 +1,2 @@
-export { HarnessInterceptor, createHarnessInterceptor } from './harness-interceptor';
+export { HarnessInterceptor } from './harness-interceptor';
 export type { HarnessInterceptorConfig } from './harness-interceptor';

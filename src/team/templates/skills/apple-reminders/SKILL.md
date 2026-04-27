@@ -13,10 +13,10 @@ Manage tasks and reminders through the macOS Apple Reminders integration via MCP
 **CRITICAL: Follow this order on ANY failure. Do NOT stop at step 1.**
 
 1. **MCP tool** (e.g., `reminders_create`) — try the native tool first
-2. **AppleScript fallback via `execute()`** — if MCP server is down or returns errors:
+2. **AppleScript fallback via `Bash`** — if MCP server is down or returns errors:
    ```
-   execute('osascript -e "tell application \"Reminders\" to get name of every list"')
-   execute('osascript -e "tell application \"Reminders\" to make new reminder in list \"Reminders\" with properties {name:\"Buy milk\", due date:date \"2026-02-15 09:00:00\"}"')
+   Bash: osascript -e 'tell application "Reminders" to get name of every list'
+   Bash: osascript -e 'tell application "Reminders" to make new reminder in list "Reminders" with properties {name:"Buy milk", due date:date "2026-02-15 09:00:00"}'
    ```
 3. **Report failure** — ONLY after both MCP and AppleScript fail. State which steps were tried
 
@@ -42,24 +42,24 @@ Manage tasks and reminders through the macOS Apple Reminders integration via MCP
 1. Ask which list to add to (or use default list)
 2. Collect the reminder title and optional due date/time
 3. `reminders_create` with list ID, title, and due date
-4. If MCP fails → `execute('osascript -e "tell application \"Reminders\" to make new reminder in list \"Reminders\" with properties {name:\"Task\", due date:date \"2026-02-15 09:00:00\"}"')`
+4. If MCP fails → run via Bash: `osascript -e 'tell application "Reminders" to make new reminder in list "Reminders" with properties {name:"Task", due date:date "2026-02-15 09:00:00"}'`
 5. Confirm creation
 
 ### Checking Reminders
 1. `reminders_list` to list available reminder lists
 2. `reminders_get` from the relevant list
-3. If MCP fails → `execute('osascript -e "tell application \"Reminders\" to get name of every reminder in list \"Reminders\" whose completed is false"')`
+3. If MCP fails → run via Bash: `osascript -e 'tell application "Reminders" to get name of every reminder in list "Reminders" whose completed is false'`
 4. Present pending items clearly
 
 ### Completing or Deleting
 1. Identify the reminder by title or ID
 2. `reminders_complete` or `reminders_delete` as appropriate
-3. If MCP fails → `execute('osascript -e "tell application \"Reminders\" to set completed of reminder \"Task\" in list \"Reminders\" to true"')`
+3. If MCP fails → run via Bash: `osascript -e 'tell application "Reminders" to set completed of reminder "Task" in list "Reminders" to true'`
 4. Confirm the action
 
 ## AppleScript Fallback Reference
 
-When MCP tools are down, use `execute()` with these commands:
+When MCP tools are down, run these commands via `Bash`:
 
 | Action | Command |
 |--------|---------|

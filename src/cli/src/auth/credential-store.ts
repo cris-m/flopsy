@@ -10,7 +10,6 @@
  */
 
 import {
-    chmodSync,
     existsSync,
     mkdirSync,
     readdirSync,
@@ -50,14 +49,11 @@ export function saveCredential(cred: StoredCredential): void {
     ensureAuthDir();
     const path = credentialPath(cred.provider);
     const tmp = `${path}.tmp`;
-    // Atomic write: write to tmp, chmod, rename. Prevents a crash mid-write
-    // from leaving a truncated token file.
-    writeFileSync(tmp, JSON.stringify(cred, null, 2));
-    try {
-        chmodSync(tmp, FILE_MODE);
-    } catch {
-        /* best-effort on filesystems that don't support chmod */
-    }
+    // Atomic write: write to tmp with 0600 (honoured by Node on create — no
+    // umask race between write and chmod), then rename. Prevents a crash
+    // mid-write from leaving a truncated token file, AND prevents a racing
+    // reader from opening the tmp file while it's briefly 0644.
+    writeFileSync(tmp, JSON.stringify(cred, null, 2), { mode: FILE_MODE });
     renameSync(tmp, path);
 }
 

@@ -28,7 +28,7 @@ Match task difficulty to the user's natural energy. Learn these from `USER.md` a
 
 Check `USER.md` for the user's actual rhythm. Some people peak at 6am, others at 10pm. Don't assume.
 
-## Process
+## Workflow
 
 ### Step 1: Gather (PARALLEL — single turn)
 

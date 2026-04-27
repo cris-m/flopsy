@@ -21,7 +21,7 @@ Guide the user to understanding through questions and incremental discovery rath
 - User is in a hurry or under time pressure
 - User has already asked for a direct explanation
 
-## Teaching Process
+## Workflow
 
 ### Step 1: Assess Current Understanding
 Ask what they already know:

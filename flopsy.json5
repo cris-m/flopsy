@@ -40,7 +40,12 @@
                     "gimli",
                     "legolas"
                 ],
-                "description": "Read/search/write an Obsidian vault"
+                "description": "Read/search/write an Obsidian vault",
+                // Large vaults with deep fuzzy search can take minutes.
+                // Set to 0 to disable the timeout entirely if you still see
+                // spurious timeouts (beware: a truly hung call will block
+                // the agent turn indefinitely).
+                "callTimeoutMs": 600000
             },
             "home-assistant": {
                 "enabled": true,
@@ -240,7 +245,8 @@
                 "assignTo": [
                     "legolas"
                 ],
-                "description": "Google Drive file search + read. Same prereqs as gmail."
+                "description": "Google Drive file search + read. Same prereqs as gmail.",
+                "callTimeoutMs": 300000
             },
             "youtube": {
                 "enabled": true,
@@ -329,8 +335,8 @@
                 "web",
                 "finance"
             ],
-            // "model": "nvidia:nvidia/nemotron-3-super-120b-a12b",
-            "model": "openai:gpt-4o",
+            "model": "nvidia:mistralai/mistral-large-3-675b-instruct-2512",
+            // "model": "openai:gpt-4o-mini",
             "model_config": {
                 "temperature": 0,
                 "maxTokens": 4096
@@ -362,6 +368,17 @@
                         "name": "qwen3-coder:480b-cloud"
                     }
                 }
+            },
+            // Sandbox — gives gandalf `execute_code` + `execute_code_with_tools`.
+            // Programmatic tool calling lets the model write Python that calls
+            // status/tasks/team/doctor/MCP tools as functions and only prints
+            // the summary, saving thousands of tokens on multi-tool queries.
+            "sandbox": {
+                "enabled": true,
+                "backend": "local",
+                "language": "python",
+                "timeout": 30000,
+                "programmaticToolCalling": true
             }
         },
         {
@@ -762,27 +779,60 @@
         }
     },
     "proactive": {
+        // Runs the heartbeat/cron/webhook subsystem. Master off switch.
         "enabled": true,
+
+        // Persistent engine state (presence, queue, retry backoff).
         "statePath": "state/proactive.json",
         "retryQueuePath": "state/retry-queue.json",
-        "heartbeats": {
-            "enabled": true,
-            "heartbeats": [
-                {
-                    "name": "startup-ping",
-                    "enabled": true,
-                    "interval": "1h",
-                    "prompt": "Log a startup diagnostics ping.",
-                    "deliveryMode": "silent",
-                    "oneshot": true
-                }
-            ]
+
+        // ────────────────────────────────────────────────────────────────
+        // Delivery routing — where proactive messages land
+        // ────────────────────────────────────────────────────────────────
+        // Per-schedule `delivery` always wins. If a schedule omits `delivery`,
+        // resolution is:
+        //   1. followActiveChannel = true → the channel+peer of the user's
+        //      most recent inbound message (auto-routes to wherever they're
+        //      chatting right now)
+        //   2. fall back to proactive.delivery below
+        //   3. otherwise the job is skipped with "No delivery target"
+        // Auto-route proactive messages to wherever the user last chatted.
+        // No need to hardcode chat_id; the engine derives it from the most
+        // recent inbound message. The static `delivery` below becomes a
+        // fallback that fires only if no recent peer is known (e.g. after
+        // a fresh restart with no inbound traffic).
+        "followActiveChannel": true,
+        "delivery": {
+            "channelName": "telegram",
+            "peer": { "id": "YOUR_CHAT_ID", "type": "user" }
         },
-        "scheduler": {
-            "enabled": false,
-            "jobs": []
-        },
+
+        // ────────────────────────────────────────────────────────────────
+        // Subsystem toggles — enable the whole engine above, then flip
+        // individual subsystems off here to pause them without deleting.
+        // ────────────────────────────────────────────────────────────────
+        "heartbeats": { "enabled": true },
+        "scheduler":  { "enabled": true },
+
+        // ────────────────────────────────────────────────────────────────
+        // Schedules live in ~/.flopsy/state/proactive.db — NOT in this file.
+        //
+        // Manage them with:
+        //     flopsy schedule list
+        //     flopsy schedule add heartbeat --name triage --interval 30m --prompt "..."
+        //     flopsy schedule add cron --id weekly --cron "0 9 * * MON" --message "..."
+        //     flopsy schedule disable <id>
+        //     flopsy schedule remove <id>
+        //
+        // Or ask the agent: "remind me at 4pm to call mom",
+        //                   "check my inbox every 30 min".
+        //
+        // On first boot, any heartbeats/cron in this file are imported into
+        // the DB one time (see `configSeededAt` in proactive.json). After
+        // that, edits here are advisory — edit via CLI or the agent tool.
+        // ────────────────────────────────────────────────────────────────
         "webhooks": [],
+
         "healthMonitor": {
             "enabled": true,
             "checkIntervalMs": 300000,

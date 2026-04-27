@@ -1,100 +1,140 @@
 /**
  * `flopsy status` — one-screen overview of the whole system.
  *
- * Composes probes from every subsystem so the operator can `flopsy
- * status` before and after any change and see everything that matters:
- *   - Gateway: running? pid + uptime
- *   - Channels: configured + enabled count
- *   - Auth: which providers have stored credentials + expiry
- *   - MCP:   configured server count, routed count
- *   - Team:  agents + enabled/disabled split
- *   - Memory: path + embedder
- *   - Cron/heartbeats/webhooks: enabled counts
+ * Separates *scan* (data gathering: reads flopsy.json5 + probes the running
+ * gateway via mgmt HTTP) from *render* (output formatting). All three
+ * renderers (compact / verbose / json) share one `StatusSnapshot` from
+ * `@flopsy/shared` so the chat-side `/status` handler can reuse the same
+ * shape without duplication.
  *
- * The output is intentionally plain-text; pipe-friendly. Use `--json`
- * for machine reading (monitoring, diagnostics dumps).
+ * Flags:
+ *   (default)    one-line-per-section compact view (~7 lines)
+ *   --verbose    expanded per-section detail
+ *   --json       machine-readable JSON for monitoring/CI
  */
 
 import { Command } from 'commander';
+import chalk from 'chalk';
+import {
+    type StatusSnapshot,
+    type CliTheme,
+    renderCliCompact,
+    renderCliVerbose,
+} from '@flopsy/shared';
 import { listCredentialProviders, loadCredential } from '../auth/credential-store';
-import { accent, bad, dim, link, ok, section, state, table, warn } from '../ui/pretty';
+import { isColorTty } from '../ui/pretty';
 import { cronJobsOf, heartbeatsOf, inboundWebhooksOf, readFlopsyConfig } from './config-reader';
 import { probeGatewayState } from './gateway-state';
 
 export function registerStatusCommand(root: Command): void {
     root.command('status')
         .description('Show a unified status snapshot of gateway, channels, MCP, auth, and team')
+        .option('--verbose', 'Expanded per-section detail view')
         .option('--json', 'Emit structured JSON for monitoring/automation')
-        .action(async (opts: { json?: boolean }) => {
-            const snapshot = await gatherSnapshot();
+        .action(async (opts: { verbose?: boolean; json?: boolean }) => {
+            const snapshot = await scanStatus();
             if (opts.json) {
                 console.log(JSON.stringify(snapshot, null, 2));
                 return;
             }
-            await renderPlain(snapshot);
+            const theme = buildTheme();
+            if (opts.verbose) {
+                console.log(renderCliVerbose(snapshot, theme));
+            } else {
+                console.log(renderCliCompact(snapshot, theme));
+            }
         });
 }
 
-interface StatusSnapshot {
-    readonly gateway: {
-        readonly running: boolean;
-        readonly pid?: number;
-        readonly uptime?: string;
-        readonly host: string;
-        readonly port: number;
+/**
+ * Build a CliTheme using raw chalk — NOT the `pretty` module's ok/bad/warn
+ * because those prepend log-symbols (✔/✖/⚠) that would double up with the
+ * shared renderer's own markers (●/○). Keep it to pure colour.
+ */
+function buildTheme(): CliTheme {
+    const rich = isColorTty();
+    if (!rich) {
+        return {
+            ok: (s) => s,
+            warn: (s) => s,
+            bad: (s) => s,
+            dim: (s) => s,
+            accent: (s) => s,
+            heading: (s) => s,
+        };
+    }
+    return {
+        ok: (s) => chalk.green(s),
+        warn: (s) => chalk.yellow(s),
+        bad: (s) => chalk.red(s),
+        dim: (s) => chalk.dim(s),
+        accent: (s) => chalk.hex('#9B59B6')(s),
+        heading: (s) => chalk.bold.hex('#6C8EF5')(s),
     };
-    readonly channels: {
-        readonly enabled: readonly string[];
-        readonly disabled: readonly string[];
-    };
-    readonly auth: ReadonlyArray<{
-        readonly provider: string;
-        readonly email?: string;
-        readonly expiresInMinutes: number;
-        readonly expired: boolean;
-    }>;
-    readonly mcp: {
-        readonly enabled: boolean;
-        readonly configured: number;
-        readonly enabledCount: number;
-    };
-    readonly team: {
-        readonly enabled: readonly string[];
-        readonly disabled: readonly string[];
-    };
-    readonly memory: {
-        readonly enabled: boolean;
-        readonly embedder?: string;
-    };
-    readonly proactive: {
-        readonly enabled: boolean;
-        readonly heartbeats: number;
-        readonly jobs: number;
-        readonly webhooks: number;
-    };
-    readonly webhook: {
-        readonly enabled: boolean;
-        readonly host?: string;
-        readonly port?: number;
-    };
-    readonly configPath: string;
 }
 
-async function gatherSnapshot(): Promise<StatusSnapshot> {
+// ── Scan phase ───────────────────────────────────────────────────────────
+
+/**
+ * Gather the full StatusSnapshot by reading flopsy.json5 + probing the
+ * running gateway's mgmt endpoint (best-effort — config view if gateway is
+ * down).
+ */
+async function scanStatus(): Promise<StatusSnapshot> {
     const { path: configPath, config } = readFlopsyConfig();
     const port = config.gateway?.port ?? 18789;
     const host = config.gateway?.host ?? '127.0.0.1';
 
-    const gateway = await probeGatewayState(port);
-    const channels = Object.entries(config.channels ?? {}).reduce(
-        (acc, [name, cfg]) => {
-            if (cfg?.enabled === false) acc.disabled.push(name);
-            else acc.enabled.push(name);
-            return acc;
-        },
-        { enabled: [] as string[], disabled: [] as string[] },
-    );
+    const gw = await probeGatewayState(port);
+    const live = gw.running ? await fetchLive(host, port) : undefined;
 
+    // Channels — merge config with live status from mgmt
+    const liveChannels = new Map<string, { status?: string }>();
+    if (live && Array.isArray((live as { channels?: unknown }).channels)) {
+        for (const c of (live as { channels: Array<{ name: string; status?: string }> }).channels) {
+            liveChannels.set(c.name, { status: c.status });
+        }
+    }
+    const channels = Object.entries(config.channels ?? {}).map(([name, cfg]) => {
+        const enabled = cfg?.enabled !== false;
+        // If gateway is down we have no way to know the live connection state —
+        // leave `status` unset rather than lying with "unknown" on every row.
+        const liveStatus = liveChannels.get(name)?.status as StatusSnapshot['channels'][number]['status'] | undefined;
+        const status: StatusSnapshot['channels'][number]['status'] | undefined = !enabled
+            ? 'disabled'
+            : liveStatus;
+        return {
+            name,
+            enabled,
+            ...(status ? { status } : {}),
+        };
+    });
+
+    // Team — enrich config list with live activity
+    const liveAgents = new Map<string, { state: 'idle' | 'busy'; currentTask?: string; since?: number }>();
+    if (live && Array.isArray((live as { agents?: unknown }).agents)) {
+        for (const a of (live as { agents: Array<{ name: string; state: 'idle' | 'busy'; currentTask?: string; since?: number }> }).agents) {
+            liveAgents.set(a.name, a);
+        }
+    }
+    const team = (config.agents ?? []).map((a) => {
+        const enabled = a.enabled !== false;
+        const live = liveAgents.get(a.name);
+        const status: 'idle' | 'working' | 'disabled' = !enabled
+            ? 'disabled'
+            : live?.state === 'busy'
+              ? 'working'
+              : 'idle';
+        return {
+            name: a.name,
+            enabled,
+            status,
+            ...(live?.currentTask ? { currentTask: live.currentTask } : {}),
+            ...(live?.since ? { lastActiveAgoMs: Date.now() - live.since } : {}),
+        };
+    });
+
+    // Auth
     const authProviders = listCredentialProviders();
     const auth = authProviders.map((p) => {
         const cred = loadCredential(p);
@@ -108,72 +148,118 @@ async function gatherSnapshot(): Promise<StatusSnapshot> {
         };
     });
 
+    // MCP
     const mcpServers = config.mcp?.servers ?? {};
     const mcpConfigured = Object.keys(mcpServers).length;
-    const mcpEnabledCount = Object.values(mcpServers).filter((s) => s?.enabled !== false).length;
+    const mcpActive = Object.values(mcpServers).filter((s) => s?.enabled !== false).length;
 
-    const teamAgents = config.agents ?? [];
-    const team = teamAgents.reduce(
-        (acc, a) => {
-            if (a.enabled === false) acc.disabled.push(a.name);
-            else acc.enabled.push(a.name);
-            return acc;
-        },
-        { enabled: [] as string[], disabled: [] as string[] },
-    );
+    // Proactive — counts come from config; live stats from mgmt (optional)
+    const proactiveCfg = config.proactive ?? {};
+    const proactiveEnabled = proactiveCfg.enabled !== false;
+    const heartbeats = heartbeatsOf(config);
+    const jobs = cronJobsOf(config);
+    const webhookRoutes = inboundWebhooksOf(config);
 
-    const proactive = {
-        enabled: config.proactive?.enabled !== false,
-        heartbeats: heartbeatsOf(config).filter((h) => h?.enabled !== false).length,
-        jobs: cronJobsOf(config).filter((j) => j?.enabled !== false).length,
-        webhooks: inboundWebhooksOf(config).filter((w) => w?.enabled !== false).length,
-    };
+    const liveProactive =
+        live && typeof live['proactive'] === 'object' && live['proactive'] !== null
+            ? (live['proactive'] as Record<string, unknown>)
+            : undefined;
 
     const webhookCfg = config.webhook ?? {};
-    const webhook = {
-        enabled: webhookCfg.enabled === true,
-        ...(webhookCfg.host ? { host: webhookCfg.host } : {}),
-        ...(webhookCfg.port !== undefined ? { port: webhookCfg.port } : {}),
+    const webhookServerEnabled = webhookCfg.enabled === true;
+
+    // Prefer live runtime counts from /mgmt/status (which reads
+    // proactive.db) — config arrays are empty in the post-migration world
+    // where schedules live in proactive.db, not flopsy.json5. Fall back to
+    // config arrays when the gateway is down so the CLI still shows
+    // something useful offline.
+    const liveHb = typeof liveProactive?.['heartbeats'] === 'number' ? (liveProactive!['heartbeats'] as number) : null;
+    const liveCron = typeof liveProactive?.['cronJobs'] === 'number' ? (liveProactive!['cronJobs'] as number) : null;
+    const liveWh = typeof liveProactive?.['inboundWebhooks'] === 'number' ? (liveProactive!['inboundWebhooks'] as number) : null;
+
+    const proactive: StatusSnapshot['proactive'] = {
+        enabled: proactiveEnabled,
+        ...(liveProactive && typeof liveProactive['running'] === 'boolean'
+            ? { running: liveProactive['running'] as boolean }
+            : {}),
+        heartbeats: {
+            count: liveHb ?? heartbeats.length,
+            enabled: liveHb ?? heartbeats.filter((h) => h?.enabled !== false).length,
+            ...(typeof liveProactive?.['lastHeartbeatAt'] === 'number'
+                ? { lastFireAgoMs: Date.now() - (liveProactive['lastHeartbeatAt'] as number) }
+                : {}),
+        },
+        cron: {
+            count: liveCron ?? jobs.length,
+            enabled: liveCron ?? jobs.filter((j) => j?.enabled !== false).length,
+            ...(typeof liveProactive?.['lastCronAt'] === 'number'
+                ? { lastFireAgoMs: Date.now() - (liveProactive['lastCronAt'] as number) }
+                : {}),
+        },
+        webhooks: {
+            count: liveWh ?? webhookRoutes.length,
+            enabled: webhookServerEnabled,
+            ...(typeof liveProactive?.['lastWebhookAt'] === 'number'
+                ? { lastReceiveAgoMs: Date.now() - (liveProactive['lastWebhookAt'] as number) }
+                : {}),
+        },
+        ...(liveProactive?.['funnel24h'] && typeof liveProactive['funnel24h'] === 'object'
+            ? {
+                  stats24h: (() => {
+                      const f = liveProactive['funnel24h'] as {
+                          delivered?: number;
+                          suppressed?: number;
+                          errors?: number;
+                          queued?: number;
+                          retryQueue?: number;
+                      };
+                      return {
+                          delivered: f.delivered ?? 0,
+                          suppressed: f.suppressed ?? 0,
+                          errors: f.errors ?? 0,
+                          retryPending: f.retryQueue ?? 0,
+                      };
+                  })(),
+              }
+            : liveProactive?.['stats24h'] && typeof liveProactive['stats24h'] === 'object'
+              ? { stats24h: liveProactive['stats24h'] as StatusSnapshot['proactive']['stats24h'] }
+              : {}),
     };
 
-    const memory = {
-        enabled: config.memory?.enabled !== false,
-        ...(config.memory?.embedder?.model ? { embedder: config.memory.embedder.model } : {}),
+    const gateway: StatusSnapshot['gateway'] = {
+        running: gw.running,
+        ...(gw.pid !== undefined ? { pid: gw.pid } : {}),
+        ...(gw.uptime ? { uptimeMs: parseUptime(gw.uptime) } : {}),
+        host,
+        port,
+        ...(live && typeof live['activeThreads'] === 'number'
+            ? { activeThreads: live['activeThreads'] as number }
+            : {}),
+        ...(live && typeof live['version'] === 'string' ? { version: live['version'] as string } : {}),
     };
 
     return {
-        gateway: {
-            running: gateway.running,
-            ...(gateway.pid !== undefined ? { pid: gateway.pid } : {}),
-            ...(gateway.uptime ? { uptime: gateway.uptime } : {}),
-            host,
-            port,
-        },
+        gateway,
         channels,
-        auth,
-        mcp: {
-            enabled: config.mcp?.enabled !== false,
-            configured: mcpConfigured,
-            enabledCount: mcpEnabledCount,
-        },
         team,
-        memory,
         proactive,
-        webhook,
-        configPath,
+        integrations: {
+            auth,
+            mcp: {
+                enabled: config.mcp?.enabled !== false,
+                configured: mcpConfigured,
+                active: mcpActive,
+            },
+            memory: {
+                enabled: config.memory?.enabled !== false,
+                ...(config.memory?.embedder?.model ? { embedder: config.memory.embedder.model } : {}),
+            },
+        },
+        paths: {
+            config: configPath,
+            state: configPath.replace(/\/[^/]+$/, '') + '/.flopsy',
+        },
     };
-}
-
-/**
- * Optional shape of per-agent activity pulled from `/mgmt/status`.
- * The gateway's snapshot may or may not include this field depending on
- * version; the status renderer treats it as best-effort data.
- */
-interface LiveAgentActivity {
-    readonly name: string;
-    readonly state: 'idle' | 'busy';
-    readonly currentTask?: string;
-    readonly since?: number;
 }
 
 /**
@@ -181,10 +267,7 @@ interface LiveAgentActivity {
  * `undefined` when the gateway isn't running or the endpoint is
  * unreachable — the CLI is expected to fall back to config-only data.
  */
-async function fetchLiveSnapshot(
-    host: string,
-    port: number,
-): Promise<Record<string, unknown> | undefined> {
+async function fetchLive(host: string, port: number): Promise<Record<string, unknown> | undefined> {
     const mgmtPort = port + 1;
     const url = `http://${host}:${mgmtPort}/mgmt/status`;
     const token = process.env['FLOPSY_MGMT_TOKEN'];
@@ -200,224 +283,16 @@ async function fetchLiveSnapshot(
     }
 }
 
-async function renderPlain(s: StatusSnapshot): Promise<void> {
-    const live =
-        s.gateway.running
-            ? await fetchLiveSnapshot(s.gateway.host, s.gateway.port)
-            : undefined;
-
-    const agentActivity = new Map<string, LiveAgentActivity>();
-    if (live && Array.isArray((live as { agents?: unknown }).agents)) {
-        for (const a of (live as { agents: LiveAgentActivity[] }).agents) {
-            agentActivity.set(a.name, a);
-        }
-    }
-    const activeThreads =
-        live && typeof live['activeThreads'] === 'number'
-            ? (live['activeThreads'] as number)
-            : 0;
-
-    // Gateway header — one summary line so `flopsy status` answers
-    // "is it up?" in a single glance. Vitals dot-separated and dimmed
-    // so the running/not-running verdict stands out.
-    if (s.gateway.running) {
-        const parts = [
-            ok('running'),
-            dim(`pid ${s.gateway.pid}`),
-            dim(`up ${s.gateway.uptime?.trim() ?? '?'}`),
-            dim(`${s.gateway.host}:${s.gateway.port}`),
-        ];
-        if (activeThreads > 0) parts.push(state('working', `${activeThreads} turns`));
-        console.log(`${section('Gateway').trim()}   ${parts.join(dim(' · '))}`);
-    } else {
-        console.log(
-            `${section('Gateway').trim()}   ${bad('not running')}  ${dim(`· ${s.gateway.host}:${s.gateway.port}`)}  ${dim('· run `flopsy gateway start`')}`,
-        );
-    }
-
-    // Channels — keep the two-row pill layout (enabled on one line,
-    // disabled on the next). Visually tight: header line, pills line(s),
-    // done. Count travels inline with the header.
-    {
-        const total = s.channels.enabled.length + s.channels.disabled.length;
-        console.log(
-            section(`Channels (${s.channels.enabled.length}/${total})`),
-        );
-        if (total === 0) {
-            console.log(`  ${dim('none configured')}`);
-        } else {
-            if (s.channels.enabled.length > 0) {
-                console.log(
-                    `  ${s.channels.enabled.map((n) => `${accent('●', '#2ECC71')} ${n}`).join('   ')}`,
-                );
-            }
-            if (s.channels.disabled.length > 0) {
-                console.log(
-                    `  ${s.channels.disabled.map((n) => dim(`○ ${n}`)).join('   ')}`,
-                );
-            }
-        }
-    }
-
-    // Team — still one-per-line so idle/working/held states can hang off
-    // each agent. Column-aligned via `table()` so the tag lands in the
-    // same column regardless of name length.
-    {
-        const total = s.team.enabled.length + s.team.disabled.length;
-        console.log(section(`Team (${s.team.enabled.length}/${total})`));
-        if (total === 0) {
-            console.log(`  ${dim('none configured')}`);
-        } else {
-            const rows: string[][] = [];
-            for (const name of s.team.enabled) {
-                const a = agentActivity.get(name);
-                const tag = renderAgentTag(a, name, activeThreads, s);
-                rows.push([accent('●', '#2ECC71'), name, tag.trim()]);
-            }
-            for (const name of s.team.disabled) {
-                rows.push([dim('○'), dim(name), dim('· disabled')]);
-            }
-            console.log(table(rows));
-        }
-    }
-
-    // Services — one row per subsystem. Each row always shows its
-    // current state (including "0" counts — hiding zeros makes the
-    // reader wonder if the subsystem exists at all). The proactive
-    // triad (heartbeat, cron, webhook-routes) gets one row each so
-    // each can be seen at a glance, with a master "disabled" marker
-    // when the parent `proactive.enabled` flag is off.
-    console.log(section('Services'));
-    {
-        const rows: string[][] = [];
-        const p = s.proactive;
-        const proactiveOff = !p.enabled;
-        // Each service row leads with a `- <label>` bullet so the
-        // Services block reads as a list, matching `flopsy team`.
-        const label = (name: string) => dim(`- ${name.padEnd(9)}`);
-
-        // Auth
-        if (s.auth.length === 0) {
-            rows.push([label('auth'), dim('none · run `flopsy auth <provider>`')]);
-        } else {
-            for (const a of s.auth) {
-                const name = a.email ? `${a.provider} · ${a.email}` : a.provider;
-                const remaining = `${a.expiresInMinutes}m left`;
-                let tag: string;
-                if (a.expired) tag = bad('expired');
-                else if (a.expiresInMinutes < 60) tag = warn(remaining);
-                else tag = ok(remaining);
-                rows.push([label('auth'), `${name}  ${tag}`]);
-            }
-        }
-
-        // MCP
-        rows.push([
-            label('mcp'),
-            s.mcp.enabled
-                ? ok(`${s.mcp.enabledCount}/${s.mcp.configured} servers enabled`)
-                : bad('disabled'),
-        ]);
-
-        // Memory
-        rows.push([
-            label('memory'),
-            s.memory.enabled
-                ? `${ok('enabled')}  ${dim('· ' + (s.memory.embedder ?? 'no embedder'))}`
-                : bad('disabled'),
-        ]);
-
-        // Heartbeat — always visible, count included.
-        const heartbeatCell = (() => {
-            if (proactiveOff) return dim('· proactive engine disabled');
-            if (p.heartbeats > 0) return ok(`${p.heartbeats} active`);
-            return dim('· 0 configured');
-        })();
-        rows.push([label('heartbeat'), heartbeatCell]);
-
-        // Cron — always visible, count included.
-        const cronCell = (() => {
-            if (proactiveOff) return dim('· proactive engine disabled');
-            if (p.jobs > 0) return ok(`${p.jobs} job${p.jobs > 1 ? 's' : ''}`);
-            return dim('· 0 configured');
-        })();
-        rows.push([label('cron'), cronCell]);
-
-        // Webhook — combines the HTTP server state with route count.
-        // Two concepts: `webhook.enabled` is the server that listens;
-        // `proactive.webhooks[]` is what it routes to. Shown together so
-        // the reader doesn't have to cross-reference.
-        {
-            const serverState = s.webhook.enabled
-                ? ok('listening')
-                : dim('off');
-            const addr = s.webhook.enabled
-                ? dim(`· ${s.webhook.host ?? '127.0.0.1'}:${s.webhook.port ?? '?'}`)
-                : '';
-            const routes = dim(`· ${p.webhooks} route${p.webhooks === 1 ? '' : 's'}`);
-            const parts = [serverState, addr, routes].filter((x) => x.length > 0);
-            rows.push([label('webhook'), parts.join('  ')]);
-        }
-
-        console.log(table(rows));
-    }
-
-    // Footer — paths, quietly dimmed. Clickable via OSC 8 on terminals
-    // that support it (iTerm2 / WezTerm / Kitty / Gnome).
-    console.log('');
-    const harnessDir = s.configPath.replace(/\/[^/]+$/, '') + '/.flopsy/harness';
-    const footerRows: string[][] = [
-        [dim('config'), link(s.configPath, tildePath(s.configPath))],
-        [dim('state'), link(harnessDir, tildePath(harnessDir))],
-    ];
-    console.log(table(footerRows));
-    console.log('');
-}
-
-/**
- * Collapse the user's home directory to `~` so long paths stay readable.
- * Kept local — banner.ts has a similar helper; no value in a shared util
- * just yet.
- */
-function tildePath(p: string): string {
-    const home = process.env['HOME'];
-    if (home && (p === home || p.startsWith(home + '/'))) {
-        return '~' + p.slice(home.length);
-    }
-    return p;
-}
-
-/**
- * Decide the trailing tag for an agent row. Uses live activity data when
- * available, otherwise a conservative fallback based on the gateway's
- * global `activeThreads` count.
- */
-function renderAgentTag(
-    activity: LiveAgentActivity | undefined,
-    agentName: string,
-    activeThreads: number,
-    snapshot: StatusSnapshot,
-): string {
-    // Cyan `⟳ working: <task>` for busy agents — the rotating arrow glyph
-    // reads as motion; yellow `⚠` felt wrong here since "busy" isn't a
-    // warning. Empty idle state stays dim to not compete for attention.
-    if (activity) {
-        if (activity.state === 'busy') {
-            const label = activity.currentTask
-                ? `working: ${truncate(activity.currentTask, 40)}`
-                : 'working';
-            return `  ${state('working', label)}`;
-        }
-        return `  ${dim('· idle')}`;
-    }
-    if (activeThreads > 0) {
-        const isMain = snapshot.team.enabled[0] === agentName;
-        return isMain ? `  ${state('working', 'working')}` : `  ${dim('· idle')}`;
-    }
-    return `  ${dim('· idle')}`;
-}
-
-function truncate(s: string, max: number): string {
-    if (s.length <= max) return s;
-    return s.slice(0, max - 1) + '…';
+/** Convert a human uptime string like "2h 15m" back to ms (rough). */
+function parseUptime(s: string): number {
+    let ms = 0;
+    const d = s.match(/(\d+)d/);
+    const h = s.match(/(\d+)h/);
+    const m = s.match(/(\d+)m/);
+    const sec = s.match(/(\d+)s/);
+    if (d) ms += +d[1]! * 86_400_000;
+    if (h) ms += +h[1]! * 3_600_000;
+    if (m) ms += +m[1]! * 60_000;
+    if (sec) ms += +sec[1]! * 1000;
+    return ms;
 }

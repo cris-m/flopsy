@@ -16,7 +16,7 @@ For any current event, find the closest historical precedent and check the outco
 - Evaluating business strategies, economic policies, or social movements
 - As part of critical-analysis-chain
 
-## Process
+## Workflow
 
 ### Step 1: Identify the Pattern
 Strip the current event to its structural pattern:

@@ -1,6 +1,6 @@
 import type { WASocket, ConnectionState, AnyMessageContent } from '@whiskeysockets/baileys';
 import type { Boom } from '@hapi/boom';
-import type { Peer, OutboundMessage, ReactionOptions, Message, Media } from '@gateway/types';
+import type { Peer, OutboundMessage, ReactionOptions, Media } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
 import { isSafeMediaUrl } from '@gateway/core/security';
 import type { WhatsAppChannelConfig } from './types';
@@ -91,14 +91,12 @@ export class WhatsAppChannel extends BaseChannel {
                         const media: Media[] = [];
                         let synthetic = false;
 
-                        // Location
                         if (m.locationMessage) {
                             const loc = m.locationMessage;
                             const name = (loc as { name?: string }).name;
                             body = `[Location: lat=${loc.degreesLatitude}, lon=${loc.degreesLongitude}${name ? `, "${name}"` : ''}]${body ? ' ' + body : ''}`;
                         }
 
-                        // Image
                         if (m.imageMessage) {
                             try {
                                 const { downloadMediaMessage } = await import('@whiskeysockets/baileys');
@@ -118,14 +116,12 @@ export class WhatsAppChannel extends BaseChannel {
                             if (!body) { body = '[Image]'; synthetic = true; }
                         }
 
-                        // Document
                         if (m.documentMessage) {
                             const doc = m.documentMessage;
                             media.push({ type: 'document', fileName: doc.fileName ?? undefined, mimeType: doc.mimetype ?? undefined });
                             if (!body) { body = `[Document: ${doc.fileName ?? doc.mimetype ?? 'file'}]`; synthetic = true; }
                         }
 
-                        // Video
                         if (m.videoMessage) {
                             media.push({ type: 'video', mimeType: m.videoMessage.mimetype ?? undefined });
                             if (!body) { body = '[Video]'; synthetic = true; }
