@@ -1,15 +1,3 @@
-/**
- * Central command registry. Single source of truth consumed by:
- *   - the dispatcher (name/alias → handler)
- *   - the `/help` handler (renders all descriptions)
- *   - future platform-native registration (Discord slash commands, Telegram
- *     BotCommand menus) would read from here too
- *
- * Add a new command: import its definition from `./handlers/*` and append
- * it to COMMANDS below. The command is auto-discoverable via /help on the
- * next restart.
- */
-
 import type { CommandDef } from './types';
 import { statusCommand } from './handlers/status';
 import { helpCommand } from './handlers/help';
@@ -18,29 +6,50 @@ import { teamCommand } from './handlers/team';
 import { tasksCommand } from './handlers/tasks';
 import { doctorCommand } from './handlers/doctor';
 import { dndCommand } from './handlers/dnd';
+import { insightsCommand } from './handlers/insights';
+import { branchCommand } from './handlers/branch';
 import { newCommand } from './handlers/new';
+import { compactCommand } from './handlers/compact';
+import { personalityCommand } from './handlers/personality';
 import { planCommand } from './handlers/plan';
+import { mcpCommand } from './handlers/mcp';
+import { skillsCommand } from './handlers/skills';
+import { buildSkillCommands } from './skill-commands';
 
-/**
- * All registered slash commands. Order matters only for the /help display —
- * dispatch is keyed by name/alias in a Map.
- */
-export const COMMANDS: readonly CommandDef[] = [
+const BUILTIN_COMMANDS: readonly CommandDef[] = [
     newCommand,
+    compactCommand,
+    branchCommand,
     planCommand,
+    mcpCommand,
     statusCommand,
     teamCommand,
     tasksCommand,
     doctorCommand,
     dndCommand,
+    personalityCommand,
+    insightsCommand,
     auditCommand,
+    skillsCommand,
     helpCommand,
 ];
 
+export const COMMANDS: readonly CommandDef[] = BUILTIN_COMMANDS;
+
 /**
- * Build a name→def lookup including aliases. Asserts there are no
- * collisions (would be a bug at development time).
+ * Built-ins + auto-discovered skills under `<workspace>/skills/<name>/`.
+ * Built-ins win on name collisions.
  */
+export function buildAllCommands(skillsRoot: string): readonly CommandDef[] {
+    const skillCommands = buildSkillCommands(skillsRoot);
+    const builtinNames = new Set<string>(
+        BUILTIN_COMMANDS.flatMap((c) => [c.name, ...(c.aliases ?? [])]),
+    );
+    const filteredSkills = skillCommands.filter((s) => !builtinNames.has(s.name));
+    return [...BUILTIN_COMMANDS, ...filteredSkills];
+}
+
+/** Throws on alias/name collision (development-time bug). */
 export function buildLookup(
     commands: readonly CommandDef[] = COMMANDS,
 ): Map<string, CommandDef> {

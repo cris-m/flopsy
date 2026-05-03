@@ -58,9 +58,9 @@ export interface ResolveResult {
  *     cron fires re-use the active session if fresh, but never refresh
  *     freshness — a dead session can't be kept alive by background ticks.
  *   - The peer is permanent (lifetime of the user). Sessions are bounded.
- *   - All facts/preferences attach to the peer (existing facts table is
- *     keyed by user_id which corresponds to peer_native_id) — survives
- *     rotation by design.
+ *   - All preferences attach to the peer — profile/notes/directives are
+ *     peer-keyed in `learning-store.ts`, so they survive session rotation
+ *     by design.
  */
 export class SessionResolver {
     private readonly mode: ResetMode;
@@ -158,8 +158,6 @@ export class SessionResolver {
             sessionId: threadId.slice(idx + 1),
         };
     }
-
-    // ── internals ──────────────────────────────────────────────────────
 
     private composeThreadId(peerId: string, sessionId: string): string {
         return `${peerId}${SESSION_SEPARATOR}${sessionId}`;

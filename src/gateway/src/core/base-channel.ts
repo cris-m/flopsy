@@ -13,6 +13,7 @@ import type {
     PairingRequestHandler,
     BaseChannelConfig,
 } from '@gateway/types';
+import { getPairingFacade } from '@gateway/commands/pairing-facade';
 
 const RECONNECT_BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 30_000, 60_000];
 const MAX_RECONNECT_ATTEMPTS = 6;
@@ -30,16 +31,8 @@ export abstract class BaseChannel implements Channel {
     protected reconnectAttempts = 0;
     protected reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-    /**
-     * Shared per-channel logger, scoped by the subclass's `this.name`
-     * (e.g. `{ name: 'telegram', ... }` tags every line). Exposed via a
-     * lazy getter because subclass `readonly name = '…'` field
-     * initialisers run AFTER `super()` returns — accessing `this.name`
-     * inside the base constructor would yield `undefined`. The getter
-     * defers `createLogger` until first use, when subclass initialisers
-     * have completed. Every channel gets `this.log.info/warn/error` for
-     * free without declaring a module-level logger per file.
-     */
+    // Lazy getter — subclass `readonly name` initialisers run after
+    // `super()`, so `this.name` is undefined inside the base constructor.
     private _log?: ReturnType<typeof createLogger>;
     protected get log(): ReturnType<typeof createLogger> {
         if (!this._log) this._log = createLogger(this.name || 'channel');
@@ -142,9 +135,13 @@ export abstract class BaseChannel implements Channel {
         }
 
         if (this.dmPolicy === 'pairing') {
-            if (!this.pairingRequestHandler) return false;
+            // Allowed if either config-pinned (allowFrom) or runtime-approved
+            // via the pairing facade.
             const allowed = this._config.allowFrom ?? [];
             if (allowed.includes(senderId)) return true;
+            const facade = getPairingFacade();
+            if (facade && facade.isApproved(this.name, senderId)) return true;
+            if (!this.pairingRequestHandler) return false;
             this.pairingRequestHandler({ channelName: this.name, senderId, timestamp: Date.now() });
             return false;
         }

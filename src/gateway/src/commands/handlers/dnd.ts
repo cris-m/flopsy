@@ -1,19 +1,6 @@
-/**
- * `/dnd` — Do Not Disturb toggle from chat.
- *
- * Examples:
- *   /dnd                 → show current state
- *   /dnd off             → clear DND
- *   /dnd 2h              → enable DND for 2 hours
- *   /dnd 30m focus       → 30 min with a reason/label
- *   /dnd quiet 22:00     → quiet hours until 22:00 (today or tomorrow, whichever is later)
- *
- * When DND is active, proactive fires (heartbeats, cron, webhooks) are
- * suppressed. Cleared automatically when the window expires.
- */
-
 import type { CommandDef, CommandContext } from '../types';
 import { getDndFacade } from '../dnd-facade';
+import { panel, row, STATE } from '@flopsy/shared';
 
 export const dndCommand: CommandDef = {
     name: 'dnd',
@@ -23,7 +10,7 @@ export const dndCommand: CommandDef = {
         const facade = getDndFacade();
         if (!facade) {
             return {
-                text: '_Proactive engine is not running — DND has no effect (nothing is firing anyway)._',
+                text: oneLine('DND', `${STATE.off}  proactive engine not running — DND has no effect`),
             };
         }
 
@@ -34,29 +21,36 @@ export const dndCommand: CommandDef = {
 
         if (raw === 'off' || raw === 'clear') {
             await facade.clearDnd();
-            return { text: '✅ DND cleared. Proactive messages will arrive normally.' };
+            return { text: oneLine('DND', `${STATE.ok}  cleared · proactive messages arrive normally`) };
         }
 
         if (raw.startsWith('quiet ')) {
             const timeStr = raw.slice(6).trim();
             const untilMs = parseClockTime(timeStr);
             if (untilMs === null) {
-                return { text: `⚠️ Couldn't parse "${timeStr}". Try \`/dnd quiet 22:00\`.` };
+                return { text: oneLine('DND', `${STATE.warn}  couldn't parse "${timeStr}" — try /dnd quiet 22:00`) };
             }
             const snap = await facade.setQuietHours(untilMs);
-            return { text: `✅ Quiet hours set until ${fmtTime(snap.untilMs!)}.` };
+            return { text: oneLine('DND', `${STATE.ok}  quiet hours until ${fmtTime(snap.untilMs!)}`) };
         }
 
-        // Duration form — `2h`, `30m focus`, `45m` etc.
         const match = raw.match(/^(\d+)\s*(s|m|h|d)\b(.*)$/);
         if (!match) {
             return {
-                text:
-                    `⚠️ Couldn't parse "${raw}". Try:\n` +
-                    `• \`/dnd 2h\` — 2 hours\n` +
-                    `• \`/dnd 30m focus\` — with reason\n` +
-                    `• \`/dnd off\` — clear\n` +
-                    `• \`/dnd quiet 22:00\` — quiet hours`,
+                text: panel(
+                    [
+                        {
+                            title: 'usage',
+                            lines: [
+                                row('/dnd 2h', '2-hour DND', 18),
+                                row('/dnd 30m focus', 'with a reason label', 18),
+                                row('/dnd off', 'clear', 18),
+                                row('/dnd quiet 22:00', 'quiet until time', 18),
+                            ],
+                        },
+                    ],
+                    { header: `DND · couldn't parse "${raw}"` },
+                ),
             };
         }
         const value = parseInt(match[1]!, 10);
@@ -70,7 +64,7 @@ export const dndCommand: CommandDef = {
         const snap = await facade.setDnd(ms, reason);
         const reasonBit = snap.label ? ` (${snap.label})` : '';
         return {
-            text: `✅ DND on for ${match[1]}${unit}${reasonBit}. Ends at ${fmtTime(snap.untilMs!)}.`,
+            text: oneLine('DND', `${STATE.ok}  on for ${match[1]}${unit}${reasonBit} · ends ${fmtTime(snap.untilMs!)}`),
         };
     },
 };
@@ -82,12 +76,16 @@ function renderStatus(s: {
     label?: string;
 }): string {
     if (!s.active) {
-        return '🟢 *DND off* — proactive messages arrive normally.';
+        return oneLine('DND', `${STATE.off}  off · proactive messages arrive normally`);
     }
-    const tag = s.reason === 'quiet hours' ? 'Quiet hours' : 'DND';
+    const tag = s.reason === 'quiet hours' ? 'quiet hours' : 'DND';
     const labelBit = s.label ? ` (${s.label})` : '';
     const untilBit = s.untilMs ? ` until ${fmtTime(s.untilMs)}` : '';
-    return `🔕 *${tag} on*${labelBit}${untilBit}.`;
+    return oneLine('DND', `${STATE.on}  ${tag} on${labelBit}${untilBit}`);
+}
+
+function oneLine(title: string, value: string): string {
+    return panel([{ title: '', lines: [row(title.toLowerCase(), value, 8)] }]);
 }
 
 function fmtTime(ms: number): string {
@@ -99,9 +97,7 @@ function fmtTime(ms: number): string {
     });
 }
 
-/**
- * Parse "22:00" → epoch-ms at that time today (or tomorrow if already past).
- */
+/** Parse "22:00" → epoch-ms today (or tomorrow if already past). */
 function parseClockTime(s: string): number | null {
     const m = s.match(/^(\d{1,2}):(\d{2})$/);
     if (!m) return null;
@@ -111,7 +107,7 @@ function parseClockTime(s: string): number | null {
     const target = new Date();
     target.setHours(hh, mm, 0, 0);
     if (target.getTime() <= Date.now()) {
-        target.setDate(target.getDate() + 1); // tomorrow
+        target.setDate(target.getDate() + 1);
     }
     return target.getTime();
 }

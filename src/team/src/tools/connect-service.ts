@@ -1,36 +1,17 @@
-/**
- * connect_service — in-chat OAuth onboarding via device flow.
- *
- * USAGE: agent calls this when the user says "connect my gmail" / "link
- * my Google account" / "I want to use Gmail tools". The tool:
- *   1. Initiates Google's device authorization flow (RFC 8628)
- *   2. Sends the user a chat message with the user_code + URL
- *   3. Spawns a background poller that hits Google's token endpoint
- *      every few seconds until the user completes the flow on their phone
- *   4. On completion, fires a chat message back to the same thread
- *      ("✓ Connected user@gmail.com — Gmail tools available next turn")
- *
- * Why device flow (not magic-link callback)?
- *   The user is on their phone in Telegram. A localhost callback link
- *   wouldn't reach the gateway. Device flow has the user authorize on
- *   Google's existing site (which they're already logged into) — works
- *   on any device, any network.
- *
- * Wiring contract (from ctx.configurable):
- *   - onReply: send the user_code + URL message
- *   - threadId: where to deliver the success notification
- *   - peer: user identity (logged for diagnostics)
- *   - eventQueue: where success notification lands as a task_complete event
- *   - registry: TaskRegistry — used to track the "connecting..." task in /status
- */
-
 import { z } from 'zod';
 import { defineTool } from 'flopsygraph';
 import { googleDeviceFlow, type StoredCredential } from '@flopsy/cli';
 import type { IEventQueue } from '@flopsy/gateway';
-import { startDevicePolling } from '../auth/device-poller';
+import { startDevicePolling, type DevicePollerHandle } from '../auth/device-poller';
 import type { TaskRegistry } from '../state/task-registry';
 import { createBackgroundJobTask, toTerminal, toRunning } from '../state/task-state';
+
+// Per-(provider, threadId) lock prevents concurrent pollers double-firing task_complete.
+const ACTIVE_DEVICE_POLLS = new Map<string, DevicePollerHandle>();
+
+function pollKey(provider: string, threadId: string): string {
+    return `${provider}:${threadId}`;
+}
 
 interface ConnectServiceConfigurable {
     readonly onReply?: (
@@ -69,16 +50,20 @@ export const connectServiceTool = defineTool({
             .describe('Service to authorize. Today: only "google".'),
         scopes: z
             .array(z.string())
+            .nullable()
             .optional()
             .describe(
-                'Optional scope override. Default = device-flow-safe set: ' +
-                'gmail.readonly, gmail.send, calendar, drive.file, openid, email, profile. ' +
-                'Any extra scope you pass MUST be (a) on Google\'s device-flow ' +
-                'allowlist and (b) registered on the OAuth consent screen, or ' +
-                'Google rejects with `invalid_scope`.',
+                'Optional. OMIT THIS FIELD — the default scope set is correct. ' +
+                'Defaults to device-flow-safe set: gmail.readonly, gmail.send, ' +
+                'calendar, drive.file, openid, email, profile. ' +
+                'Only override if you have a specific narrower or wider need. ' +
+                'Any extra scope MUST be (a) on Google\'s device-flow allowlist ' +
+                'and (b) registered on the OAuth consent screen, or Google ' +
+                'rejects with `invalid_scope`. Passing `null` is treated as omit.',
             ),
     }),
-    execute: async ({ provider, scopes }, ctx) => {
+    execute: async ({ provider, scopes: rawScopes }, ctx) => {
+        const scopes = rawScopes ?? undefined;
         const cfg = (ctx.configurable ?? {}) as ConnectServiceConfigurable;
         const onReply = cfg.onReply;
         const threadId = cfg.threadId;
@@ -93,13 +78,20 @@ export const connectServiceTool = defineTool({
             return `connect_service: provider "${provider}" not supported yet.`;
         }
 
+        const key = pollKey(provider, threadId);
+        if (ACTIVE_DEVICE_POLLS.has(key)) {
+            return [
+                `connect_service: a ${provider} authorization is already in progress for this thread.`,
+                `Check the verification code I sent earlier and complete the flow on your phone.`,
+                `If you want to start over, ignore the old code — once it expires (~15 min), call connect_service again.`,
+            ].join('\n');
+        }
+
         let start: Awaited<ReturnType<typeof googleDeviceFlow.start>>;
         try {
             start = await googleDeviceFlow.start(scopes);
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
-            // invalid_scope means the OAuth consent screen is missing scopes —
-            // give the user a direct fix instead of exposing RFC error text.
             if (msg.includes('invalid_scope')) {
                 return [
                     'connect_service: Google rejected the scope request (invalid_scope).',
@@ -114,10 +106,6 @@ export const connectServiceTool = defineTool({
             return `connect_service: ${msg}`;
         }
 
-        // Register a task in the per-thread registry so /status shows
-        // "connecting..." until completion. Reuses the background_job
-        // shape — connect_service is morally similar to a long-running
-        // background job (waits on user input, then settles).
         const taskId = registry ? registry.nextId('background_job') : `auth_${Date.now()}`;
         if (registry) {
             const task = createBackgroundJobTask({
@@ -131,7 +119,6 @@ export const connectServiceTool = defineTool({
             if (running.ok) registry.replace(running.task);
         }
 
-        // Tell the user how to complete on their phone.
         const expiresMins = Math.max(1, Math.round((start.expiresAt - Date.now()) / 60_000));
         const verifyUrl = start.verificationUrlComplete ?? start.verificationUrl;
         const message = [
@@ -149,16 +136,14 @@ export const connectServiceTool = defineTool({
             return `connect_service: failed to send instructions: ${err instanceof Error ? err.message : String(err)}`;
         }
 
-        // Kick off the poller in the background. It uses the eventQueue
-        // to push a task_complete back to the channel-worker — gandalf
-        // wakes up on the next turn and tells the user.
-        startDevicePolling({
+        const handle = startDevicePolling({
             provider: 'google',
             deviceCode: start.deviceCode,
             intervalSeconds: start.intervalSeconds,
             expiresAt: start.expiresAt,
             ...(scopes ? { scopes } : {}),
             onSuccess: async (cred: StoredCredential) => {
+                ACTIVE_DEVICE_POLLS.delete(key);
                 if (registry) {
                     const t = registry.get(taskId);
                     if (t) {
@@ -168,8 +153,6 @@ export const connectServiceTool = defineTool({
                         if (done.ok) registry.replace(done.task);
                     }
                 }
-                // Restart MCP servers that use this provider so they pick up
-                // the new credentials immediately — no gateway restart needed.
                 if (onAuthSuccess) {
                     try { await onAuthSuccess(provider); } catch { /* logged inside */ }
                 }
@@ -185,6 +168,7 @@ export const connectServiceTool = defineTool({
                 });
             },
             onFailure: (reason, detail) => {
+                ACTIVE_DEVICE_POLLS.delete(key);
                 if (registry) {
                     const t = registry.get(taskId);
                     if (t) {
@@ -200,6 +184,8 @@ export const connectServiceTool = defineTool({
                 });
             },
         });
+
+        ACTIVE_DEVICE_POLLS.set(key, handle);
 
         return `Sent device-flow instructions to user (task ${taskId}). Poller running; no further action this turn.`;
     },

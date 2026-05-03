@@ -13,7 +13,10 @@
     "format": "prettier --write \"src/**/*.ts\"",
     "format:check": "prettier --check \"src/**/*.ts\"",
     "lint": "prettier --check \"src/**/*.ts\"",
-    "test": "npm run test --workspace=src/team",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:ui": "vitest --ui",
+    "test:workspace": "npm run test --workspace=src/team",
     "flopsy": "tsx src/cli/src/index.ts"
   },
   "keywords": [],

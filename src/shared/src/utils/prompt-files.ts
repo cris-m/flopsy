@@ -15,7 +15,7 @@ export const PROMPT_KIND_DIR: Record<PromptKind, string> = {
  * Always inside FLOPSY_HOME — no cwd fallback.
  */
 export function promptDir(kind: PromptKind): string {
-    return resolveWorkspacePath('proactive', PROMPT_KIND_DIR[kind]);
+    return resolveWorkspacePath('content', 'prompts', PROMPT_KIND_DIR[kind]);
 }
 
 /**

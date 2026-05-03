@@ -12,7 +12,6 @@ export type {
     InboundMedia,
     ITaskStore,
     InvokeRole,
-    StreamingCallbacks,
     TaskListFilter,
     TaskStatus,
     TaskStatusSummary,

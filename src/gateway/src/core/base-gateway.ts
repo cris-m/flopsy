@@ -20,19 +20,13 @@ import {
     extractToken,
     isLoopbackIp,
 } from './security';
+import { getPairingFacade } from '@gateway/commands/pairing-facade';
 
 const DEFAULT_DEDUP_TTL_MS = 30_000;
 const DEFAULT_MAX_DEDUP_ENTRIES = 10_000;
 const DEDUP_SWEEP_INTERVAL_MS = 60_000;
 const MAX_PAYLOAD = 1 * 1024 * 1024;
 
-/**
- * Resolve the build identity at module-load time. Prefers git short-sha
- * (`1a2b3c4`) so the user can tell which build answered their message;
- * falls back to `dev` when git isn't available (CI builds, npm-installed
- * package, etc). Uses execFileSync (no shell) with a fixed argv and a
- * 500ms timeout — cached in module scope so every snapshot read is free.
- */
 const BUILD_VERSION: string = (() => {
     try {
         const sha = execFileSync('git', ['rev-parse', '--short', 'HEAD'], {
@@ -43,7 +37,7 @@ const BUILD_VERSION: string = (() => {
             .trim();
         if (sha.length > 0) return sha;
     } catch {
-        // git missing, not a repo, or subprocess denied — fall through.
+        // git missing or subprocess denied — fall back to 'dev'.
     }
     return 'dev';
 })();
@@ -79,9 +73,6 @@ export abstract class BaseGateway implements Gateway {
     private readonly clients = new Map<string, WsClient>();
     private readonly _channels = new Map<string, Channel>();
     private readonly dedup = new Map<string, number>();
-    /** Channel+peer of the most recent inbound message. Used by proactive
-     * delivery when `followActiveChannel: true` — proactive messages without
-     * an explicit `delivery` route to wherever the user is chatting now. */
     private lastActivePeer: { channelName: string; peer: import('@gateway/types').Peer; at: number } | null = null;
     private dedupSweep: ReturnType<typeof setInterval> | null = null;
     private readonly startedAt = Date.now();
@@ -107,21 +98,14 @@ export abstract class BaseGateway implements Gateway {
         return this._channels;
     }
 
-    /**
-     * Channel+peer of the most-recent inbound message, or null if no message
-     * has been received this session. Consumers: proactive engine's
-     * `followActiveChannel` routing.
-     */
+    /** Channel+peer of the most-recent inbound message, or null. */
     getLastActivePeer(): { channelName: string; peer: import('@gateway/types').Peer; at: number } | null {
         return this.lastActivePeer;
     }
 
     /**
-     * Build a user-safe snapshot for the `/status` slash command. Deliberately
-     * excludes tokens, peer ids, webhook URLs, and anything else that might
-     * leak across users. Subclasses can override to add more context
-     * (webhook / proactive engine state) — they should spread the baseline
-     * and then add their extras.
+     * User-safe snapshot for `/status`. Excludes tokens, peer ids, webhook
+     * URLs. Subclasses spread the baseline and add their extras.
      */
     getStatusSnapshot(): {
         uptimeMs: number;
@@ -162,10 +146,8 @@ export abstract class BaseGateway implements Gateway {
         const handlers = {
             onMessage: (msg: Message) => this.handleInbound(msg),
             // Button taps / select choices become synthesized user messages
-            // with body = callback.value. This lets the rest of the stack
-            // (router, worker, interceptors) treat a tap identically to
-            // the user typing "go" / "edit" / "no" — no separate interaction
-            // pipeline needed. The id is derived so dedup still works.
+            // with body = callback.value, so the rest of the stack treats a
+            // tap identically to the user typing the value.
             onInteraction: async (cb: InteractionCallback) => {
                 const synthesized: Message = {
                     id: `interact:${channel.name}:${cb.messageId}:${cb.value}:${Date.now()}`,
@@ -201,6 +183,67 @@ export abstract class BaseGateway implements Gateway {
         channel.on('onStatusChange', handlers.onStatusChange);
         channel.on('onError', handlers.onError);
         channel.on('onQR', handlers.onQR);
+
+        // Pairing-request handler: mint or reuse a code and send it to the
+        // requester. The operator approves via `flopsy pairing approve`.
+        channel.pairingRequestHandler = ({ channelName, senderId, timestamp: _ts }) => {
+            const facade = getPairingFacade();
+            if (!facade) {
+                this.log.warn(
+                    { channel: channelName, senderId },
+                    'pairing request fired but no facade is bound — dropping',
+                );
+                return;
+            }
+            const result = facade.requestCode(channelName, senderId);
+            if (!result) {
+                // Cap reached — silent drop prevents code-spam from sweeping unknown senders.
+                return;
+            }
+            // Markdown syntax varies per channel. Discord uses CommonMark
+            // (**bold**); Telegram/Slack/WhatsApp/GoogleChat use *bold*;
+            // LINE/iMessage/Signal are plain text only.
+            const bold = (s: string): string => {
+                if (channelName === 'discord') return `**${s}**`;
+                if (
+                    channelName === 'telegram' ||
+                    channelName === 'slack' ||
+                    channelName === 'whatsapp' ||
+                    channelName === 'googlechat'
+                ) {
+                    return `*${s}*`;
+                }
+                return s;
+            };
+            const codeBlock = (s: string): string => {
+                if (
+                    channelName === 'discord' ||
+                    channelName === 'telegram' ||
+                    channelName === 'slack' ||
+                    channelName === 'whatsapp'
+                ) {
+                    return `\`\`\`\n${s}\n\`\`\``;
+                }
+                return bold(s);
+            };
+            const command = `flopsy pairing approve ${channelName} ${result.code}`;
+            const message = result.isNew
+                ? `Pairing request received. Your code is: ${bold(result.code)}\n\nShare this with the operator. They'll approve it on the host with:\n\n${codeBlock(command)}\n\nCode expires in 60 minutes.`
+                : `Your existing pairing code: ${bold(result.code)}\n\nGive it to the operator. Code expires in 60 minutes.`;
+
+            channel
+                .send({
+                    peer: { id: senderId, type: 'user' },
+                    body: message,
+                })
+                .catch((err: unknown) => {
+                    this.log.warn(
+                        { channel: channelName, senderId, err: (err as Error)?.message },
+                        'pairing code send failed',
+                    );
+                });
+        };
+
         this.log.info(
             `channel registered - ${channel.name} (auth=${channel.authType}, dm=${channel.dmPolicy})`,
         );
@@ -249,20 +292,15 @@ export abstract class BaseGateway implements Gateway {
         this.wss.on('connection', (ws, req) => this.handleConnection(ws, req));
         this.wss.on('error', (err) => this.log.error({ err }, 'websocket server error'));
 
-        // Track connect results directly. Can't derive from `channel.status`
-        // at summary time because several channels set their status async
-        // (via onStatusChange) after `connect()` returns — status would
-        // still say 'connecting' here and discord/telegram would look
-        // falsely failed in the summary.
+        // Track connect results directly. `channel.status` can be 'connecting'
+        // here because several channels finalise status asynchronously via
+        // onStatusChange after `connect()` returns.
         const connected: string[] = [];
         const failed: string[] = [];
         for (const channel of this._channels.values()) {
             if (!channel.enabled) continue;
             try {
                 await channel.connect();
-                // User-observable state change — a channel going live is
-                // the kind of thing an operator wants to see without
-                // enabling DEBUG logs.
                 this.log.info({ channel: channel.name }, 'channel connected');
                 connected.push(channel.name);
             } catch (err) {
@@ -657,9 +695,7 @@ export abstract class BaseGateway implements Gateway {
 
         const sanitized: Message = { ...message, ...clean };
 
-        // Track the most-recent inbound peer so proactive `followActiveChannel`
-        // routing can send to wherever the user just chatted. Stamped AFTER
-        // the dedup check so replayed duplicates don't stomp a newer value.
+        // Stamped AFTER dedup so replayed duplicates don't stomp a newer value.
         this.lastActivePeer = {
             channelName: sanitized.channelName,
             peer: sanitized.peer,
@@ -674,11 +710,7 @@ export abstract class BaseGateway implements Gateway {
             messageId: sanitized.id,
         });
 
-        // Subclass hook — fires once per dedup-clean inbound. The concrete
-        // FlopsyGateway uses this to tick the proactive PresenceManager so
-        // activityWindow reflects reality, and to drain the held-while-away
-        // queue when the user transitions back to active. Safe best-effort;
-        // errors must never break routing.
+        // Best-effort — errors must never break routing.
         this.onUserActivity(sanitized).catch((err) => {
             this.log.warn(
                 { err: err instanceof Error ? err.message : String(err), channel: sanitized.channelName },
@@ -716,14 +748,7 @@ export abstract class BaseGateway implements Gateway {
     protected abstract route(message: Message): Promise<void>;
     protected async onStart(): Promise<void> {}
     protected async onStop(): Promise<void> {}
-    /**
-     * Subclass hook fired on each inbound message that passes dedup. The
-     * concrete `FlopsyGateway` override updates the proactive
-     * PresenceManager (so `activityWindow` reflects live reality) and
-     * drains the held-while-away queue when the user transitions back to
-     * active. BaseGateway default is a no-op — tests and minimal gateways
-     * don't need it.
-     */
+    /** Subclass hook fired on each dedup-clean inbound. Default is a no-op. */
     protected async onUserActivity(_message: Message): Promise<void> {}
     protected getProactiveHealth(): Record<string, unknown> {
         return {};

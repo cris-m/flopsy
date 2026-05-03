@@ -97,10 +97,8 @@ export function coalesce(batch: readonly QueuedMessage[]): CoalescedTurn {
 
     const allMedia: Media[] = batch.flatMap((m) => (m.media ? [...m.media] : []));
 
-    // Prefer messages with real user text over channel-generated placeholders.
-    // When a photo arrives without a caption, the adapter marks it synthetic=true
-    // and sets body="[Image]". If the user then sends the caption as a follow-up
-    // message, the coalesce window captures both — we keep only the caption.
+    // Prefer real user text over channel-generated synthetic placeholders
+    // (e.g. body="[Image]" when a photo arrives without a caption).
     const realItems = batch.filter((m) => !m.synthetic);
 
     let text: string;
@@ -109,8 +107,6 @@ export function coalesce(batch: readonly QueuedMessage[]): CoalescedTurn {
     } else if (realItems.length > 1) {
         text = realItems.map((m, i) => `[${i + 1}] ${m.text}`).join('\n');
     } else {
-        // All items are synthetic (e.g. photo with no caption, or 3 images).
-        // The LLM will see the image blocks; a single label is sufficient.
         text = batch[0].text;
     }
 

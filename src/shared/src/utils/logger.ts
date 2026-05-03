@@ -111,11 +111,26 @@ export interface LoggerOptions {
     redact?: boolean;
 }
 
-export function createLogger(service: string, options?: LoggerOptions): pino.Logger {
-    const level = options?.level ?? resolveLevel();
-    const enableRedact = options?.redact ?? true;
+/**
+ * Pino's worker-thread transport adds one `exit` listener to `process` per
+ * call. Building a fresh transport on every `createLogger()` invocation
+ * piles up listeners (Node warns past 10) and spawns redundant workers.
+ *
+ * We cache transports keyed by the config that distinguishes them
+ * (pretty/file). Every logger with matching config shares one worker.
+ * Per-logger level filtering happens on the pino instance itself, so the
+ * transport accepts everything (`level: 'trace'`) and the logger's own
+ * level gate filters outbound records.
+ */
+let cachedTransport: ReturnType<typeof pino.transport> | undefined;
+let cachedTransportKey: string | undefined;
+
+function getTransport(): ReturnType<typeof pino.transport> {
     const pretty = resolvePretty();
     const file = resolveFile();
+    const key = `pretty=${pretty}|file=${file.enabled ? file.path : ''}`;
+
+    if (cachedTransport && cachedTransportKey === key) return cachedTransport;
 
     const targets: pino.TransportTargetOptions[] = [
         {
@@ -123,7 +138,7 @@ export function createLogger(service: string, options?: LoggerOptions): pino.Log
             options: pretty
                 ? { colorize: true, translateTime: 'SYS:standard' }
                 : { destination: 2 },
-            level,
+            level: 'trace',
         },
     ];
 
@@ -131,9 +146,18 @@ export function createLogger(service: string, options?: LoggerOptions): pino.Log
         targets.push({
             target: 'pino/file',
             options: { destination: file.path, mkdir: true },
-            level,
+            level: 'trace',
         });
     }
+
+    cachedTransport = pino.transport({ targets });
+    cachedTransportKey = key;
+    return cachedTransport;
+}
+
+export function createLogger(service: string, options?: LoggerOptions): pino.Logger {
+    const level = options?.level ?? resolveLevel();
+    const enableRedact = options?.redact ?? true;
 
     return pino(
         {
@@ -147,6 +171,6 @@ export function createLogger(service: string, options?: LoggerOptions): pino.Log
                 },
             }),
         },
-        pino.transport({ targets }),
+        getTransport(),
     );
 }

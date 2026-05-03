@@ -73,8 +73,6 @@ function buildTheme(): CliTheme {
     };
 }
 
-// ── Scan phase ───────────────────────────────────────────────────────────
-
 /**
  * Gather the full StatusSnapshot by reading flopsy.json5 + probing the
  * running gateway's mgmt endpoint (best-effort — config view if gateway is

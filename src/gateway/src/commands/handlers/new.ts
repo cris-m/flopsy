@@ -1,14 +1,6 @@
-/**
- * `/new` — Start a fresh conversation session.
- *
- * Force-closes the current session for this peer and opens a new one.
- * The next agent turn lands in the fresh session with a clean slate.
- * Long-term facts and preferences (from the learning harness) persist —
- * only the conversational context is reset.
- */
-
 import type { CommandDef, CommandContext } from '../types';
 import { getSessionFacade } from '../session-facade';
+import { panel, row, STATE } from '@flopsy/shared';
 
 export const newCommand: CommandDef = {
     name: 'new',
@@ -18,21 +10,35 @@ export const newCommand: CommandDef = {
         const facade = getSessionFacade();
         if (!facade) {
             return {
-                text: '_Session management is not active. Send any message to continue your current session._',
+                text: panel(
+                    [{ title: '', lines: [row('session', `${STATE.warn}  not active — send any message to continue current session`, 8)] }],
+                ),
             };
         }
 
-        const newSessionId = facade.forceNewSession(ctx.threadId);
-        if (!newSessionId) {
+        const result = await facade.forceNewSession(ctx.threadId);
+        if (!result) {
             return {
-                text: '_Could not open a new session right now. Please try again._',
+                text: panel(
+                    [{ title: '', lines: [row('session', `${STATE.fail}  could not open a new session right now`, 8)] }],
+                ),
             };
+        }
+
+        const lines = [
+            row('status', `${STATE.ok}  new session started`, 12),
+            row('id', result.sessionId, 12),
+            row('memory', 'profile + notes + directives kept', 12),
+        ];
+        if (result.summary) {
+            lines.push(row('last', result.summary, 12));
         }
 
         return {
-            text:
-                `✅ *New session started* (\`${newSessionId}\`).\n\n` +
-                `Your conversation context has been reset. Facts and preferences are preserved — I still know who you are.`,
+            text: panel(
+                [{ title: 'session', lines }],
+                { header: 'NEW SESSION' },
+            ),
         };
     },
 };

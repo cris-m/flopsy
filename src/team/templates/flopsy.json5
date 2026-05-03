@@ -34,7 +34,7 @@
                     "${MCP_ROOT}/obsidian.ts"
                 ],
                 "env": {
-                    "OBSIDIAN_VAULT_PATH": "/Users/munzihirwa/Documents/Obsidian Vault"
+                    "OBSIDIAN_VAULT_PATH": "${OBSIDIAN_VAULT_PATH}"
                 },
                 "assignTo": [
                     "gimli",
@@ -335,20 +335,31 @@
                 "web",
                 "finance"
             ],
-            "model": "nvidia:mistralai/mistral-large-3-675b-instruct-2512",
-            // "model": "openai:gpt-4o-mini",
+            // Default voice overlay applied when no per-turn override and no
+            // session-set /personality value exists. Must match a key in
+            // .flopsy/personalities.yaml. Uncomment to start sessions in a
+            // specific voice instead of plain SOUL.md. Per-session
+            // /personality choices still win over this default.
+            // "defaultPersonality": "concise",
+            // 70B is fast enough to compose post-delegation replies (worker brief
+            // + conversation + 33 tools) inside the 45s modelCallTimeoutMs.
+            // The 675B mistral was timing out every turn — kept as last-ditch
+            // fallback for hard problems where 70B might struggle, but only
+            // after the local gemma so we don't waste 45s by default.
+            //"model": "nvidia:meta/llama-3.3-70b-instruct",
+            "model": "openai:gpt-5.4",  // fastest paid option
             "model_config": {
                 "temperature": 0,
                 "maxTokens": 4096
             },
             "fallback_models": [
                 {
-                    "provider": "nvidia",
-                    "name": "meta/llama-3.3-70b-instruct"
-                },
-                {
                     "provider": "ollama",
                     "name": "gemma4:e4b"
+                },
+                {
+                    "provider": "nvidia",
+                    "name": "mistralai/mistral-large-3-675b-instruct-2512"
                 }
             ],
             "cost_tier": "medium",
@@ -369,16 +380,41 @@
                     }
                 }
             },
-            // Sandbox — gives gandalf `execute_code` + `execute_code_with_tools`.
-            // Programmatic tool calling lets the model write Python that calls
-            // status/tasks/team/doctor/MCP tools as functions and only prints
-            // the summary, saving thousands of tokens on multi-tool queries.
+            // Sandbox — gives gandalf `execute_code` (foreground + background).
+            // Programmatic tool calling lets the model pass `use_tools: true`
+            // so its code can call status/tasks/team/doctor/MCP tools as
+            // functions and only print the summary, saving thousands of tokens
+            // on multi-tool queries.
+            //
+            // backend: "local" | "docker" | "kubernetes" | <custom-name>.
+            // Custom names work after calling registerSandboxBackend(name, ...)
+            // at boot — see flopsygraph's sandbox docs.
+            //
+            // Production checklist (multi-tenant or LLM-vs-adversarial-user):
+            //   1. backend = "docker" (or "kubernetes")
+            //   2. untrusted = true   — refuses local backend; forces isolation
+            //   3. hardened  = true   — adds custom seccomp profile + metadata-IP block
+            //   4. image     = pinned digest (e.g. "python:3.12-slim@sha256:...")
+            //                  prevents supply-chain attacks via tag re-pointing
             "sandbox": {
                 "enabled": true,
-                "backend": "local",
+                "backend": "docker",
                 "language": "python",
-                "timeout": 30000,
-                "programmaticToolCalling": true
+                "timeout": 120000,  // 2 min default; per-call override up to 600000 (10 min)
+                "programmaticToolCalling": true,
+                // Tier-2 hardening: seccomp profile blocking unshare/bpf/ptrace/
+                // mount/kernel-module/reboot syscalls, plus 169.254.169.254 cloud
+                // metadata IP block on top of the Tier-1 defaults (CapDrop ALL,
+                // no-new-privileges, read-only rootfs, non-root user, PidsLimit).
+                "hardened": true,
+                // Refuse the local backend entirely — forces docker/k8s isolation
+                // for any LLM-generated code. Pair with backend="docker".
+                "untrusted": true
+                // Pin the container image by digest for supply-chain integrity.
+                // Tag-only pulls (e.g. "python:3.12-slim") trust Docker Hub to
+                // not re-point the tag — fine for dev, NOT for production.
+                // Example:
+                //   "image": "python:3.12-slim@sha256:0123456789abcdef..."
             }
         },
         {
@@ -448,7 +484,30 @@
                     "name": "gemma4:e4b"
                 }
             ],
-            "cost_tier": "high"
+            "cost_tier": "high",
+            // Tier-based routing for the deep-research pipeline.
+            //   fast      → query expansion + cheap pre-filter steps
+            //   balanced  → most research stages (default working model)
+            //   powerful  → final synthesis where token + reasoning quality matter
+            // The deep-research graph doesn't pick tiers per-stage today —
+            // the router is built so workers can opt in when they want.
+            "routing": {
+                "enabled": true,
+                "tiers": {
+                    "fast": {
+                        "provider": "ollama",
+                        "name": "gemma4:e4b"
+                    },
+                    "balanced": {
+                        "provider": "nvidia",
+                        "name": "meta/llama-3.3-70b-instruct"
+                    },
+                    "powerful": {
+                        "provider": "nvidia",
+                        "name": "qwen/qwen2.5-72b-instruct"
+                    }
+                }
+            }
         },
         {
             "name": "gimli",
@@ -649,7 +708,7 @@
             "token": "${TELEGRAM_BOT_TOKEN}",
             "botUsername": "",
             "dm": {
-                "policy": "open",
+                "policy": "pairing",
                 "allowFrom": [],
                 "blockedFrom": []
             },
@@ -779,58 +838,22 @@
         }
     },
     "proactive": {
-        // Runs the heartbeat/cron/webhook subsystem. Master off switch.
+        // Master switch for heartbeats / cron / webhooks.
+        // Schedules live in <workspace>/state/proactive.db — manage via
+        // `flopsy schedule ...` or by asking the agent.
         "enabled": true,
 
-        // Persistent engine state (presence, queue, retry backoff).
-        "statePath": "state/proactive.json",
-        "retryQueuePath": "state/retry-queue.json",
-
-        // ────────────────────────────────────────────────────────────────
-        // Delivery routing — where proactive messages land
-        // ────────────────────────────────────────────────────────────────
-        // Per-schedule `delivery` always wins. If a schedule omits `delivery`,
-        // resolution is:
-        //   1. followActiveChannel = true → the channel+peer of the user's
-        //      most recent inbound message (auto-routes to wherever they're
-        //      chatting right now)
-        //   2. fall back to proactive.delivery below
-        //   3. otherwise the job is skipped with "No delivery target"
-        // Auto-route proactive messages to wherever the user last chatted.
-        // No need to hardcode chat_id; the engine derives it from the most
-        // recent inbound message. The static `delivery` below becomes a
-        // fallback that fires only if no recent peer is known (e.g. after
-        // a fresh restart with no inbound traffic).
+        // followActiveChannel routes proactive messages to wherever the
+        // user last chatted. The static `delivery` below is the fallback
+        // when no recent peer is known (e.g. after a fresh restart).
         "followActiveChannel": true,
         "delivery": {
             "channelName": "telegram",
             "peer": { "id": "YOUR_CHAT_ID", "type": "user" }
         },
 
-        // ────────────────────────────────────────────────────────────────
-        // Subsystem toggles — enable the whole engine above, then flip
-        // individual subsystems off here to pause them without deleting.
-        // ────────────────────────────────────────────────────────────────
         "heartbeats": { "enabled": true },
         "scheduler":  { "enabled": true },
-
-        // ────────────────────────────────────────────────────────────────
-        // Schedules live in ~/.flopsy/state/proactive.db — NOT in this file.
-        //
-        // Manage them with:
-        //     flopsy schedule list
-        //     flopsy schedule add heartbeat --name triage --interval 30m --prompt "..."
-        //     flopsy schedule add cron --id weekly --cron "0 9 * * MON" --message "..."
-        //     flopsy schedule disable <id>
-        //     flopsy schedule remove <id>
-        //
-        // Or ask the agent: "remind me at 4pm to call mom",
-        //                   "check my inbox every 30 min".
-        //
-        // On first boot, any heartbeats/cron in this file are imported into
-        // the DB one time (see `configSeededAt` in proactive.json). After
-        // that, edits here are advisory — edit via CLI or the agent tool.
-        // ────────────────────────────────────────────────────────────────
         "webhooks": [],
 
         "healthMonitor": {

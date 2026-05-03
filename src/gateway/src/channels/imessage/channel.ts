@@ -79,6 +79,20 @@ export class IMessageChannel extends BaseChannel {
 
     async sendTyping(_peer: Peer): Promise<void> {}
 
+    /**
+     * iMessage tapbacks are not exposed by the `imsg` CLI this adapter uses,
+     * and the alternative — UI automation via osascript — is fragile across
+     * macOS versions (Apple has removed/restricted the AutomatedTapbackEvent
+     * APIs multiple times since macOS 13). Rather than ship a sometimes-works
+     * implementation that silently drops on minor macOS updates, this stub
+     * stays a no-op. The channel doesn't advertise 'reactions' in
+     * capabilities, so beginTaskPresence falls through to typing-only (which
+     * is also unsupported here, so iMessage gets no async-progress signal —
+     * the final reply is the only user feedback). If you need progress
+     * signals on iMessage, the cleanest path is an ephemeral status message
+     * pattern (send "⏳ working…" then edit/delete on completion) — but
+     * iMessage edit/delete via CLI is also platform-limited as of this writing.
+     */
     async react(_options: ReactionOptions): Promise<void> {}
 
     private async poll(): Promise<void> {

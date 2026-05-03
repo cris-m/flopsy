@@ -1,19 +1,7 @@
-/**
- * /audit — static security scan of the local setup.
- *
- * Runs fast, deterministic checks with no LLM call. Looks at the same
- * ground truth a human auditor would: file permissions on secrets,
- * plaintext keys in config, gateway binding surface, workspace hygiene.
- *
- * Zero tokens. Always available even when the agent's model is down.
- * For a full LLM-driven audit that cross-references external threat
- * intel (shodan, virustotal), delegate to aragorn in chat instead.
- */
-
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { workspace } from '@flopsy/shared';
-import type { CommandContext, CommandDef } from '../types';
+import { workspace, panel, row, STATE, type PanelSection } from '@flopsy/shared';
+import type { CommandDef } from '../types';
 
 type Severity = 'ok' | 'info' | 'warn' | 'fail';
 
@@ -28,7 +16,7 @@ const SECRETLIKE_KEYS = /(api_?key|secret|token|password|bearer)/i;
 export const auditCommand: CommandDef = {
     name: 'audit',
     description: 'Static security scan of the local setup (no LLM).',
-    handler: async (_ctx: CommandContext) => {
+    handler: async () => {
         const findings: Finding[] = [];
         findings.push(...checkEnvFile());
         findings.push(...checkWorkspacePerms());
@@ -190,35 +178,44 @@ function renderReport(findings: readonly Finding[]): string {
     const counts = { ok: 0, info: 0, warn: 0, fail: 0 };
     for (const f of findings) counts[f.severity]++;
 
-    const lines: string[] = [];
-    const headerBits: string[] = [];
+    const headerBits: string[] = ['SECURITY AUDIT'];
     if (counts.fail > 0) headerBits.push(`${counts.fail} fail`);
     if (counts.warn > 0) headerBits.push(`${counts.warn} warn`);
     if (counts.ok > 0) headerBits.push(`${counts.ok} ok`);
     if (counts.info > 0) headerBits.push(`${counts.info} info`);
-    const verdict = counts.fail > 0 ? '❌' : counts.warn > 0 ? '⚠️' : '✅';
-    lines.push(`*Security audit* ${verdict} — ${headerBits.join(' · ')}`);
 
     const order: Severity[] = ['fail', 'warn', 'ok', 'info'];
+    const sections: PanelSection[] = [];
     for (const sev of order) {
         const group = findings.filter((f) => f.severity === sev);
         if (group.length === 0) continue;
-        for (const f of group) {
-            lines.push(`  ${iconFor(f.severity)} *${f.check}* — ${f.detail}`);
-        }
+        sections.push({
+            title: severityTitle(sev),
+            lines: group.map((f) => row(f.check, `${glyphFor(f.severity)}  ${f.detail}`, 28)),
+        });
     }
 
-    lines.push('');
-    lines.push('_Static scan. For a threat-intel audit, ask aragorn in chat._');
-    return lines.join('\n');
+    return panel(sections, {
+        header: headerBits.join(' · '),
+        footer: 'Static scan only — for a threat-intel audit, ask aragorn in chat.',
+    });
 }
 
-function iconFor(s: Severity): string {
+function glyphFor(s: Severity): string {
     switch (s) {
-        case 'ok':   return '✅';
-        case 'info': return 'ℹ️';
-        case 'warn': return '⚠️';
-        case 'fail': return '❌';
+        case 'ok':   return STATE.ok;
+        case 'info': return STATE.bullet;
+        case 'warn': return STATE.warn;
+        case 'fail': return STATE.fail;
+    }
+}
+
+function severityTitle(s: Severity): string {
+    switch (s) {
+        case 'ok':   return 'ok';
+        case 'info': return 'info';
+        case 'warn': return 'warnings';
+        case 'fail': return 'failures';
     }
 }
 

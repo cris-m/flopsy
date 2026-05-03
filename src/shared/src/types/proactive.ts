@@ -73,6 +73,15 @@ export interface ExecutionJob {
     deliveryMode: DeliveryMode;
     context?: Record<string, unknown>;
     threadId?: string;
+    /**
+     * Optional voice overlay name for this fire (matches a key in
+     * personalities.yaml — e.g. "playful", "concise"). When set and the
+     * agent has no session-bound personality (proactive fires never do
+     * after the ephemeral-thread fix), the harness applies this overlay
+     * for THIS fire only. Used by smart-pulse mode picker → mode-specific
+     * voice mapping.
+     */
+    personality?: string;
 }
 
 export interface ExecutionResult {

@@ -34,6 +34,19 @@ export interface BridgedTool extends BaseTool {
 }
 
 function namespacedName(server: string, original: string): string {
+    // Skip the server prefix when the upstream tool name already starts
+    // with it — many MCP servers (gmail, slack, github) name tools like
+    // `gmail_search`, `slack_post`, etc. Adding `gmail__gmail_search`
+    // creates a redundant doubled prefix that confuses LLMs (they guess
+    // the natural `gmail_search` and miss the actual tool). The collision
+    // detection in bridgeAllTools still catches genuine cross-server
+    // conflicts. Match is case-insensitive and tolerant of single
+    // underscore vs double — "gmail_search" or "gmail__search" both pass.
+    const normalized = original.toLowerCase();
+    const prefix = server.toLowerCase();
+    if (normalized.startsWith(prefix + '_') || normalized.startsWith(prefix + NAME_DELIMITER)) {
+        return original;
+    }
     return `${server}${NAME_DELIMITER}${original}`;
 }
 

@@ -78,7 +78,18 @@ export function startDevicePolling(opts: DevicePollOptions): DevicePollerHandle 
                 return;
             }
             if (result.status === 'pending') {
-                intervalSec = result.intervalSeconds;
+                // RFC 8628 §3.5: on `slow_down`, ADD 5s to the running
+                // interval — don't overwrite. Without this, repeated
+                // slow_downs never accumulate and we keep polling at a
+                // rate the server is explicitly asking us to slow.
+                // `result.slowDown` is the signal from google.ts; for
+                // plain `authorization_pending` we honour the server's
+                // suggested interval (Google may bump it on its own).
+                if ((result as { slowDown?: boolean }).slowDown) {
+                    intervalSec = intervalSec + 5;
+                } else {
+                    intervalSec = result.intervalSeconds;
+                }
                 timer = setTimeout(() => void tick(), intervalSec * 1000);
                 return;
             }

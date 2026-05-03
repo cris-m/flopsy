@@ -7,13 +7,16 @@ import type {
     ReactionOptions,
     Message,
     WebhookChannel,
+    InteractiveCapability,
 } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
 import type { GoogleChatChannelConfig, ServiceAccountKey, GoogleChatEvent } from './types';
 
 const CHAT_API = 'https://chat.googleapis.com/v1';
 const TOKEN_URI = 'https://oauth2.googleapis.com/token';
-const SCOPE = 'https://www.googleapis.com/auth/chat.bot';
+// chat.bot covers send/receive; chat.messages.reactions is for reactions
+// (2023+). Missing reaction scope only fails react() calls, not auth.
+const SCOPE = 'https://www.googleapis.com/auth/chat.bot https://www.googleapis.com/auth/chat.messages.reactions';
 const TOKEN_REFRESH_MARGIN_MS = 60_000;
 
 interface CachedToken {
@@ -25,6 +28,8 @@ export class GoogleChatChannel extends BaseChannel implements WebhookChannel {
     readonly name = 'googlechat';
     readonly authType = 'token';
     readonly webhookPath: string;
+
+    readonly capabilities: readonly InteractiveCapability[] = ['reactions'];
 
     private readonly channelConfig: GoogleChatChannelConfig;
     private credentials: ServiceAccountKey | null = null;
@@ -75,7 +80,6 @@ export class GoogleChatChannel extends BaseChannel implements WebhookChannel {
         this.setStatus('disconnected');
     }
 
-    /** Called from gateway.ts webhook route handler. */
     async handleWebhookEvent(event: GoogleChatEvent): Promise<void> {
         if (event.type !== 'MESSAGE') return;
 
@@ -140,11 +144,50 @@ export class GoogleChatChannel extends BaseChannel implements WebhookChannel {
     }
 
     async sendTyping(_peer: Peer): Promise<void> {
-        // Google Chat does not support typing indicators via API
+        // No typing indicator API.
     }
 
-    async react(_options: ReactionOptions): Promise<void> {
-        // Google Chat does not support emoji reactions via API
+    async react(options: ReactionOptions): Promise<void> {
+        // POST /v1/{message}/reactions; DELETE per-reaction subresource.
+        // remove: list-and-delete by emoji match (we don't track resource names).
+        if (!options.messageId) return;
+        const token = await this.getAccessToken();
+        const baseUrl = `${CHAT_API}/${options.messageId}/reactions`;
+
+        if (options.remove) {
+            try {
+                const listUrl = `${baseUrl}?filter=${encodeURIComponent(`emoji.unicode = "${options.emoji}"`)}`;
+                const listRes = await fetch(listUrl, {
+                    headers: { Authorization: `Bearer ${token}` },
+                });
+                if (!listRes.ok) return;
+                const data = (await listRes.json()) as {
+                    reactions?: Array<{ name?: string }>;
+                };
+                for (const r of data.reactions ?? []) {
+                    if (!r.name) continue;
+                    await fetch(`${CHAT_API}/${r.name}`, {
+                        method: 'DELETE',
+                        headers: { Authorization: `Bearer ${token}` },
+                    });
+                }
+            } catch { /* benign — ⏳ may linger alongside ✅ */ }
+            return;
+        }
+
+        try {
+            const res = await fetch(baseUrl, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${token}`,
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    emoji: { unicode: options.emoji },
+                }),
+            });
+            if (!res.ok) return;
+        } catch { /* network failure — silent */ }
     }
 
     private async resolveCredentials(): Promise<ServiceAccountKey> {

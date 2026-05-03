@@ -1,49 +1,27 @@
-/**
- * FlopsyBot bootstrap — wires gateway ⇄ harness-enabled agent.
- *
- * Flow:
- *   1. Load the `main` agent definition from flopsy config
- *   2. Use flopsygraph's ModelLoader to preload the model (+ fallbacks, tiers)
- *   3. Construct a TeamHandler that creates per-thread agents on demand
- *   4. Hand the handler to FlopsyGateway via setAgentHandler()
- *   5. Start the gateway (it will route inbound channel messages to the handler)
- *
- * Returns a teardown callable that flushes per-thread harnesses and closes
- * SQLite on shutdown.
- */
-
 import { createLogger } from '@flopsy/shared';
 import type { FlopsyConfig, AgentDefinition } from '@flopsy/shared';
-import { ModelLoader, registerBuiltInProviders } from 'flopsygraph';
+import type { BaseChatModel, Observability } from 'flopsygraph';
+import { ModelLoader, ModelRouter, registerBuiltInProviders, ensureMultiLanguageImage, probeMultiLanguageImage, createObservability, OTelExporter, detectSpanKindFormat } from 'flopsygraph';
+import type { RoutingTable } from 'flopsygraph';
 import type { FlopsyGateway } from '@flopsy/gateway';
 
 import { TeamHandler } from './handler';
 import type { ThreadIdentity } from './handler';
-import { closeSharedLearningStore } from './harness';
+import { closeSharedLearningStore, getSharedLearningStore } from './harness';
+import { SessionExtractor } from './harness/review';
+import { loadPersonalities } from './personalities';
+import { seedWorkspaceTemplates } from './seed-workspace';
 import { setScheduleFacade } from './tools/schedule-registry';
 
 const log = createLogger('bootstrap');
 
 export interface BootstrapOptions {
-    /**
-     * Override the thread resolver. Default: threadId → userId (single tenant).
-     *
-     * For multi-tenant setups parse the threadId yourself — e.g. if channel
-     * messages were keyed by `channel:peerId`, extract peerId as userId so each
-     * user gets isolated learning state.
-     */
+    /** Override the thread resolver. Default: threadId → userId (single tenant). */
     resolveThread?: (threadId: string) => Promise<ThreadIdentity> | ThreadIdentity;
-
-    /**
-     * Pick a specific agent by `name` as the gateway entry point. By default we
-     * find the one enabled agent with `type: 'main'`.
-     */
+    /** Pick a specific agent by `name` as the gateway entry point. */
     entryAgentName?: string;
 }
 
-/**
- * Wire the harness-enabled entry agent into the gateway and start routing.
- */
 export async function startFlopsyBot(
     gateway: FlopsyGateway,
     config: FlopsyConfig,
@@ -89,13 +67,22 @@ export async function startFlopsyBot(
     const loader = ModelLoader.getInstance();
     registerBuiltInProviders(loader);
 
-    // Convert AgentDefinition's string `model` field into a ModelRef that
-    // flopsygraph's ModelLoader expects. Without this the preloader reads
-    // `.provider` on the raw string and gets `undefined` — leading to
-    // "No factory registered for provider 'undefined'" and a permanent
-    // fallback-mode bot that sits on a slow cloud model.
-    const source = buildModelSource(definition);
-    const { loaded, failed } = await loader.preload(source);
+    const otherAgents = config.agents.filter((a) => a.enabled && a.name !== definition.name);
+    const allSources = [
+        buildModelSource(definition),
+        ...otherAgents.map(buildModelSource),
+    ];
+    const preloadResults = await Promise.all(allSources.map((s) => loader.preload(s)));
+    const loaded = preloadResults.flatMap((r) => r.loaded);
+    const failed = preloadResults.flatMap((r) => r.failed);
+    log.info(
+        {
+            agents: allSources.length,
+            loaded: loaded.length,
+            failed: failed.length,
+        },
+        'team-wide model preload complete',
+    );
 
     if (failed.length > 0) {
         const details = failed.map((f: { ref: unknown; error?: unknown }) => ({
@@ -115,9 +102,7 @@ export async function startFlopsyBot(
         );
     }
 
-    // Preload returns loaded models in an unspecified order. If the primary
-    // model string matches a loaded entry, prefer it — otherwise we're running
-    // on a fallback (already logged via `failed` above).
+    // preload's loaded order is unspecified — match primary string explicitly.
     const primaryRef = definition.model
         ? loaded.find((ref) => `${ref.provider}:${ref.name}` === definition.model)
         : undefined;
@@ -136,6 +121,62 @@ export async function startFlopsyBot(
             : 'Primary model ready',
     );
 
+    const modelRouters = new Map<string, ModelRouter>();
+    for (const agent of config.agents) {
+        if (!agent.enabled) continue;
+        const router = buildModelRouter(loader, agent);
+        if (router) {
+            modelRouters.set(agent.name, router);
+            log.debug(
+                { agent: agent.name, tiers: router.summary() },
+                'model router constructed for agent',
+            );
+        }
+    }
+    log.info({ routerCount: modelRouters.size }, 'per-agent model routers built');
+
+    const modelRouter = modelRouters.get(definition.name);
+
+    // Run extraction on the fast tier; fall back to primary when unavailable.
+    let extractorModel: BaseChatModel = model;
+    if (modelRouter) {
+        try {
+            const fast = await modelRouter.route('fast');
+            extractorModel = fast.model;
+            log.info(
+                { model: `${fast.candidate.ref.provider}:${fast.candidate.ref.name}` },
+                'extractor: using fast tier',
+            );
+        } catch (err) {
+            log.warn(
+                { err: (err as Error).message },
+                'extractor: fast tier unavailable; falling back to primary',
+            );
+        }
+    }
+    const sessionExtractor = new SessionExtractor({
+        model: extractorModel,
+        store: getSharedLearningStore(),
+    });
+
+    const seedStats = seedWorkspaceTemplates();
+    log.info(seedStats, 'workspace template seed complete');
+
+    const personalities = loadPersonalities();
+
+    await ensureSandboxImageIfNeeded(config);
+
+    const observability = buildObservability();
+    if (observability?.enabled) {
+        log.info(
+            {
+                endpoint: process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
+                hasLangSmith: !!process.env.LANGSMITH_API_KEY,
+            },
+            'observability tracer wired',
+        );
+    }
+
     const handler = new TeamHandler({
         team: config.agents,
         entryAgentName: definition.name,
@@ -144,22 +185,21 @@ export async function startFlopsyBot(
         maxThreads: 100,
         memory: config.memory,
         mcp: config.mcp,
+        sessionExtractor,
+        modelRouter: modelRouter ?? undefined,
+        modelRouters,
+        personalities,
+        ...(observability ? { observability } : {}),
     });
 
     gateway.setAgentHandler(handler);
-    // Expose the raw BaseChatModel so the proactive engine can run flopsygraph's
-    // StructuredLLM reformatter on conditional-mode replies. Reusing the main
-    // agent's model keeps it in-cache and avoids loading a second provider.
     gateway.setStructuredOutputModel(model);
     log.info({ activeThreads: handler.activeThreadCount }, 'Agent handler attached to gateway');
 
     await gateway.start();
     log.info('Gateway started; awaiting channel traffic');
 
-    // Wire the manage_schedule agent tool to the live proactive engine. Must
-    // happen AFTER gateway.start() — that's when the engine is constructed.
-    // If proactive is disabled, getProactiveEngine() returns null and the
-    // tool responds with "Scheduler is not running".
+    // Engine is constructed inside gateway.start(), so this MUST run after.
     const engine = gateway.getProactiveEngine();
     if (engine) {
         setScheduleFacade({
@@ -168,6 +208,7 @@ export async function startFlopsyBot(
             addRuntimeWebhook: (cfg, createdBy) => engine.addRuntimeWebhook(cfg, createdBy),
             removeRuntimeSchedule: (id) => engine.removeRuntimeSchedule(id),
             setRuntimeScheduleEnabled: (id, enabled) => engine.setRuntimeScheduleEnabled(id, enabled),
+            replaceRuntimeSchedule: (id, newConfig) => engine.replaceRuntimeSchedule(id, newConfig),
             listSchedules: () => engine.listSchedules(),
         });
         log.info('manage_schedule tool wired to proactive engine');
@@ -187,37 +228,89 @@ function findAgentDefinition(config: FlopsyConfig, name: string): AgentDefinitio
 }
 
 /**
- * Extract a clean user identifier from a routing key.
- *
- * Routing key formats (from src/gateway/src/core/routing-key.ts):
- *   {channel}:dm:{peerId}
- *   {channel}:group:{peerId}
- *   {channel}:channel:{peerId}
- *   {channel}:group:{peerId}:user:{senderId}     ← per-participant
- *
- * For DMs the peerId IS the user. For group/channel per-participant keys the
- * trailing `:user:{id}` segment carries the sender — prefer that. For group
- * default (no per-participant), fall back to the peerId which identifies the
- * group itself (shared context, no single user).
+ * Build an Observability instance from env. Triggers: OTEL_EXPORTER_OTLP_ENDPOINT,
+ * LANGSMITH_API_KEY, or FLOPSY_OBSERVABILITY=1. Returns undefined otherwise.
+ * OTel exporter requires @opentelemetry/{api,sdk-trace-base} as peer deps.
  */
-function defaultResolveThread(threadId: string): ThreadIdentity {
-    const parts = threadId.split(':');
-    // Per-participant: last two parts are `user`, <id>
-    const userIdx = parts.lastIndexOf('user');
-    if (userIdx !== -1 && userIdx < parts.length - 1) {
-        return { userId: parts[userIdx + 1]! };
+function buildObservability(): Observability | undefined {
+    const otlpEndpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
+    const langsmithKey = process.env.LANGSMITH_API_KEY;
+    const explicitOptIn = process.env.FLOPSY_OBSERVABILITY === '1';
+    if (!explicitOptIn && !otlpEndpoint && !langsmithKey) return undefined;
+
+    const serviceName = process.env.OTEL_SERVICE_NAME ?? 'flopsybot';
+
+    try {
+        if (otlpEndpoint || langsmithKey) {
+            const endpoint =
+                otlpEndpoint ?? 'https://api.smith.langchain.com/otel/v1/traces';
+            const exporter = new OTelExporter(serviceName, {
+                spanKindFormat: detectSpanKindFormat(endpoint),
+            });
+            return createObservability({ tracing: true, exporters: [exporter] });
+        }
+        return createObservability({ tracing: true, verbose: true });
+    } catch (err) {
+        log.warn(
+            { err: err instanceof Error ? err.message : String(err) },
+            'observability wiring failed — continuing without traces',
+        );
+        return undefined;
     }
-    // Default: peerId is the last segment (or the whole key if malformed)
-    const peerId = parts[parts.length - 1] ?? threadId;
-    return { userId: peerId };
 }
 
 /**
- * Split a flopsy-config model string (`"ollama:glm-4.7-flash:latest"`,
- * `"anthropic:claude-sonnet-4-5"`) into the ModelRef shape flopsygraph's
- * ModelLoader expects. The second split is done on the FIRST `:` only, so
- * Ollama tags like `name:latest` stay attached to the model name.
+ * Probe for flopsy-sandbox:latest. If missing, kick off a background build so
+ * gateway start doesn't trip the CLI's ~15s health-check (build takes 2-5 min).
  */
+async function ensureSandboxImageIfNeeded(config: FlopsyConfig): Promise<void> {
+    const needsImage = config.agents.some((a) => {
+        const sb = (a as { sandbox?: Record<string, unknown> }).sandbox;
+        if (!sb || sb['enabled'] !== true) return false;
+        const backend = sb['backend'];
+        return backend === 'docker' || backend === 'kubernetes';
+    });
+    if (!needsImage) return;
+
+    const present = await probeMultiLanguageImage();
+    if (present) {
+        log.info('sandbox: flopsy-sandbox:latest already built');
+        return;
+    }
+
+    log.warn(
+        'sandbox: flopsy-sandbox:latest not found — starting BACKGROUND build ' +
+        '(2-5 min). Gateway boot continues; first sandbox calls fall back to ' +
+        'per-language images until the build finishes.',
+    );
+
+    void (async () => {
+        const result = await ensureMultiLanguageImage({
+            onLog: (line) => log.info({ build: 'sandbox' }, line),
+        });
+        if (result.ready) {
+            log.info(
+                { durationMs: result.durationMs },
+                'sandbox: background build complete; future sessions will use flopsy-sandbox:latest',
+            );
+        } else {
+            log.warn(
+                { error: result.error, durationMs: result.durationMs },
+                'sandbox: background build failed; daemon keeps falling back to per-language images. ' +
+                'Run `flopsy sandbox build` manually to retry.',
+            );
+        }
+    })();
+}
+
+function defaultResolveThread(threadId: string): ThreadIdentity {
+    // userId is the full peer routing key (`channel:scope:nativeId[:user:senderId]`)
+    // so HarnessInterceptor and SessionExtractor land on the same peer_id row.
+    const peerId = threadId.split('#')[0] ?? threadId;
+    return { userId: peerId };
+}
+
+// Split on the FIRST `:` only so Ollama tags like `name:latest` stay attached.
 export function parseModelString(s: string): { provider: string; name: string } {
     const i = s.indexOf(':');
     if (i <= 0) {
@@ -228,11 +321,18 @@ export function parseModelString(s: string): { provider: string; name: string } 
     return { provider: s.slice(0, i), name: s.slice(i + 1) };
 }
 
-/**
- * Build the ModelSource object ModelLoader.preload needs from an
- * AgentDefinition. Parses the primary `model` string, carries through
- * already-typed fallback and tier refs.
- */
+function buildModelRouter(loader: ModelLoader, def: AgentDefinition): ModelRouter | null {
+    if (!def.routing?.enabled || !def.routing.tiers) return null;
+    const t = def.routing.tiers;
+    const table: RoutingTable = {
+        fast:     [{ ref: t.fast }],
+        balanced: [{ ref: t.balanced }],
+        powerful: [{ ref: t.powerful }],
+    };
+    if (!table.fast.length && !table.balanced.length && !table.powerful.length) return null;
+    return new ModelRouter(loader, table);
+}
+
 function buildModelSource(def: AgentDefinition): Parameters<ModelLoader['preload']>[0] {
     if (!def.model) {
         throw new Error(
@@ -253,11 +353,6 @@ function buildModelSource(def: AgentDefinition): Parameters<ModelLoader['preload
     } as unknown as Parameters<ModelLoader['preload']>[0];
 }
 
-/**
- * The entry agent is the enabled one with `type: 'main'`. If there's
- * more than one, we take the first and warn. If there's none but exactly
- * one agent is enabled, we use that as a fallback.
- */
 function findEntryAgent(config: FlopsyConfig): AgentDefinition | undefined {
     const enabled = config.agents.filter((a) => a.enabled);
     const mains = enabled.filter((a) => a.type === 'main');

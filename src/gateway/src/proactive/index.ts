@@ -4,7 +4,7 @@ export { StateStore } from './state/store';
 export { PresenceManager } from './state/presence';
 export { RetryQueue } from './state/retry-queue';
 export { ChannelRouter } from './delivery/router';
-export { JobExecutor } from './pipeline/executor';
+export { JobExecutor, parseConditionalResponse } from './pipeline/executor';
 export { HeartbeatTrigger } from './triggers/heartbeat';
 export { CronTrigger } from './triggers/cron';
 export { ChannelHealthMonitor } from './health/monitor';

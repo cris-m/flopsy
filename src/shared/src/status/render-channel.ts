@@ -21,7 +21,6 @@ export function renderChannelMarkdown(s: StatusSnapshot): string {
         lines.push('');
     }
 
-    // ── Gateway ──────────────────────────────────────────────────────────
     {
         const parts: string[] = [];
         parts.push(s.gateway.running ? `${EMOJI.run} running` : `${EMOJI.stop} stopped`);
@@ -32,7 +31,6 @@ export function renderChannelMarkdown(s: StatusSnapshot): string {
         lines.push(`*Gateway* ${parts.join(' · ')}`);
     }
 
-    // ── Channels ─────────────────────────────────────────────────────────
     {
         const enabled = s.channels.filter((c) => c.enabled);
         const disabled = s.channels.filter((c) => !c.enabled);
@@ -47,7 +45,6 @@ export function renderChannelMarkdown(s: StatusSnapshot): string {
         }
     }
 
-    // ── Team ─────────────────────────────────────────────────────────────
     if (s.team.length > 0) {
         const enabled = s.team.filter((m) => m.enabled);
         const working = enabled.filter((m) => m.status === 'working');
@@ -63,7 +60,6 @@ export function renderChannelMarkdown(s: StatusSnapshot): string {
         }
     }
 
-    // ── Proactive ────────────────────────────────────────────────────────
     {
         const p = s.proactive;
         lines.push('');
@@ -106,10 +102,9 @@ export function renderChannelMarkdown(s: StatusSnapshot): string {
         }
     }
 
-    // ── Integrations ─────────────────────────────────────────────────────
-    // Skip when nothing interesting is set — slash /status in chat cares
-    // less about this than the CLI does. Shown only when auth OR MCP
-    // servers are configured.
+    // Integrations: skip when nothing interesting is set — slash /status in
+    // chat cares less about this than the CLI does. Shown only when auth OR
+    // MCP servers are configured.
     {
         const i = s.integrations;
         const hasContent = i.auth.length > 0 || i.mcp.configured > 0;
@@ -132,7 +127,7 @@ export function renderChannelMarkdown(s: StatusSnapshot): string {
         }
     }
 
-    // ── Current thread (slash-only context) ──────────────────────────────
+    // Current thread — slash-only context.
     if (s.thread) {
         const t = s.thread;
         lines.push('');

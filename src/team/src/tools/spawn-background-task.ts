@@ -1,23 +1,3 @@
-/**
- * spawn_background_task — fire-and-forget delegation.
- *
- * The leader agent (gandalf) calls this tool to hand a task to a named
- * teammate (legolas, gimli) that runs in the background. The tool:
- *   1. Creates a TaskState in the TaskRegistry.
- *   2. Fires a detached Promise that runs the teammate's sub-agent.
- *   3. Returns immediately with `#<taskId> started → <worker>`.
- *   4. On completion (or failure), pushes a ChannelEvent to the gateway's
- *      event queue. The gateway's ChannelWorker picks that up and calls
- *      handler.invoke() again with a task-notification as a system message —
- *      the leader sees it, and decides what to do next.
- *
- * The leader's turn ENDS after this tool returns. It should follow up with
- * `send_message("On it...")` to acknowledge, then let the turn close.
- *
- * Depth limit: sub-agents cannot spawn sub-agents (MAX_DEPTH = 1). The tool
- * reads ctx.configurable.depth; if already >= MAX_DEPTH, it refuses.
- */
-
 import { z } from 'zod';
 import { defineTool } from 'flopsygraph';
 import {
@@ -28,27 +8,40 @@ import {
 } from '../state/task-state';
 import type { TaskRegistry } from '../state/task-registry';
 
-// ---------------------------------------------------------------------------
-// Public contract
-// ---------------------------------------------------------------------------
-
 export const MAX_DELEGATION_DEPTH = 1;
 
-// Background tasks run detached — no parent turn to bound them. Without a
-// ceiling a stuck worker would sit forever consuming a model slot, and
-// unrelated cleanup (channel restart, process signal) would be the only
-// way to free it. Defaults balance "research can take a while" vs "don't
-// leak workers".
 export const DEFAULT_SPAWN_TIMEOUT_MS = 1_800_000; // 30 min
 export const MAX_SPAWN_TIMEOUT_MS = 7_200_000; // 2 hours
 
-/**
- * Minimal shape of the gateway's event queue. Matches
- * `@flopsy/gateway` IEventQueue but is declared here so this file doesn't
- * drag in gateway types (tools live inside the team package).
- */
 export interface BackgroundEventSink {
     push(event: BackgroundTaskEvent): void;
+}
+
+export interface BackgroundTaskStore {
+    recordBackgroundTask(row: {
+        taskId: string;
+        threadId: string;
+        workerName: string;
+        taskPrompt: string;
+        toolAllowlist: readonly string[] | null;
+        timeoutMs: number | null;
+        deliveryMode: string | null;
+        status: 'running';
+        createdAt: number;
+        endedAt: null;
+        result: null;
+        error: null;
+        description: string | null;
+    }): void;
+    updateBackgroundTaskStatus(
+        taskId: string,
+        patch: {
+            status: 'running' | 'completed' | 'delivered' | 'failed' | 'killed';
+            result?: string;
+            error?: string;
+            endedAt?: number;
+        },
+    ): void;
 }
 
 export interface BackgroundTaskEvent {
@@ -61,14 +54,7 @@ export interface BackgroundTaskEvent {
     readonly completedAt: number;
 }
 
-/**
- * The factory TeamHandler injects so the tool can build a sub-agent on
- * demand. TeamHandler owns the teammate definitions and the shared model;
- * the tool only knows "give me a runner for worker `name`."
- *
- * The returned function runs the sub-agent turn and returns its final text.
- * Implementations should honour `signal` for cancellation.
- */
+/** Implementations MUST honour `signal` for cancellation. */
 export type SubAgentRunner = (args: {
     workerName: string;
     task: string;
@@ -84,6 +70,10 @@ export interface SpawnBackgroundTaskConfigurable {
     buildSubAgent: SubAgentFactory;
     /** Main agent is depth 0; a teammate spawned by the main is depth 1. */
     depth?: number;
+    /** When omitted, spawns run memory-only and don't survive a gateway restart. */
+    taskStore?: BackgroundTaskStore;
+    /** Parent thread for the task (gateway routing key). Required when taskStore is set. */
+    threadId?: string;
     /** Optional logger for diagnostics — tool gracefully tolerates missing. */
     logger?: {
         info?: (payload: Record<string, unknown>, msg?: string) => void;
@@ -91,10 +81,6 @@ export interface SpawnBackgroundTaskConfigurable {
         error?: (payload: Record<string, unknown>, msg?: string) => void;
     };
 }
-
-// ---------------------------------------------------------------------------
-// Schema
-// ---------------------------------------------------------------------------
 
 const schema = z.object({
     worker: z
@@ -113,7 +99,10 @@ const schema = z.object({
         .array(z.string())
         .optional()
         .describe(
-            'Optional allowlist of tool names the teammate may use. Defaults to the teammate\'s configured toolsets.',
+            'Optional ARRAY of tool-name strings the teammate may use. ' +
+            'Always pass a JSON array, never a bare string. ' +
+            'Examples: ["web_search"], ["web_search", "web_extract"]. ' +
+            'Defaults to the teammate\'s configured toolsets.',
         ),
     description: z
         .string()
@@ -134,10 +123,6 @@ const schema = z.object({
 
 type SpawnArgs = z.infer<typeof schema>;
 
-// ---------------------------------------------------------------------------
-// Tool
-// ---------------------------------------------------------------------------
-
 export const spawnBackgroundTaskTool = defineTool({
     name: 'spawn_background_task',
     description: [
@@ -146,13 +131,19 @@ export const spawnBackgroundTaskTool = defineTool({
         'You can call this multiple times — tasks run in parallel.',
         '',
         'Workers:',
-        '  - "legolas"  — quick web scout (<30s). Use only for spawn when you\'re stacking many lookups in parallel.',
-        '  - "saruman"  — deep researcher. Multi-round plan → search → summarise → reflect, with inline citations. USE THIS for landscape briefs, "state of X", multi-angle research, contradiction-surfacing. Takes 3-15 min.',
+        '  - "legolas"  — quick web scout (<30s). Great when stacking many independent lookups in parallel.',
+        '  - "saruman"  — deep researcher. Multi-round plan → search → summarise → reflect with inline citations. USE THIS for landscape briefs, "state of X", multi-angle research, contradiction-surfacing. Takes 3-15 min. Multiple sarumanis on different angles in parallel is normal and encouraged.',
         '  - "gimli"    — analysis of large inputs.',
+        '',
+        'PARALLELISM — spawn multiple in the same turn when topics are INDEPENDENT:',
+        '  Independent = "research X for plan A AND check Y for plan B" — two unrelated reports.',
+        '  Not independent = "compare X vs Y" — that\'s ONE worker covering all angles, not three.',
+        '  Bad:  spawn(saruman, "research X") → wait → spawn(saruman, "research Y")  [serial when independent]',
+        '  Good: emit BOTH spawn() calls in the SAME assistant turn.',
         '',
         'Decision rule — bias to saruman over legolas for anything research-shaped:',
         '  - "state of post-quantum crypto adoption"       → saruman (landscape)',
-        '  - "compare LangGraph vs CrewAI vs AutoGen"       → saruman (multi-angle)',
+        '  - "compare LangGraph vs CrewAI vs AutoGen"       → saruman (multi-angle, one worker)',
         '  - "what\'s the consensus on topic X"             → saruman (surfaces disagreement)',
         '  - "what changed in the Rust 2027 edition?"       → legolas (single topic)',
         '',
@@ -164,6 +155,15 @@ export const spawnBackgroundTaskTool = defineTool({
         '',
         'IMMEDIATELY after calling this, call send_message to tell the user it has started.',
         'Do NOT use this when you need the result before you can reply — use delegate_task instead.',
+        '',
+        'Example call shape (note: tools is an ARRAY of strings):',
+        '  {',
+        '    "worker": "saruman",',
+        '    "task": "Brief on the post-quantum crypto landscape, 5 angles, primary sources only.",',
+        '    "tools": ["web_search", "web_extract"],',
+        '    "description": "PQ crypto landscape brief",',
+        '    "timeoutMs": 600000',
+        '  }',
     ].join('\n'),
     schema,
     execute: async (args, ctx) => {
@@ -172,11 +172,8 @@ export const spawnBackgroundTaskTool = defineTool({
         const wiring = validateWiring(cfg);
         if (typeof wiring === 'string') return wiring;
 
-        const { registry, eventQueue, buildSubAgent, depth, logger } = wiring;
+        const { registry, eventQueue, buildSubAgent, depth, logger, taskStore, threadId } = wiring;
 
-        // Lifecycle INFO — matches delegate_task. Operators want to see
-        // async spawns in logs with the decision context; the detached
-        // runner doesn't otherwise announce itself at INFO level.
         const taskPreview = args.task.length > 160
             ? args.task.slice(0, 157) + '…'
             : args.task;
@@ -201,13 +198,9 @@ export const spawnBackgroundTaskTool = defineTool({
         }
 
         const timeoutMs = args.timeoutMs ?? DEFAULT_SPAWN_TIMEOUT_MS;
-        return launch(args, { registry, eventQueue, runner, depth, logger, timeoutMs });
+        return launch(args, { registry, eventQueue, runner, depth, logger, timeoutMs, taskStore, threadId });
     },
 });
-
-// ---------------------------------------------------------------------------
-// Internals
-// ---------------------------------------------------------------------------
 
 interface Wiring {
     registry: TaskRegistry;
@@ -215,13 +208,10 @@ interface Wiring {
     buildSubAgent: SubAgentFactory;
     depth: number;
     logger: SpawnBackgroundTaskConfigurable['logger'];
+    taskStore: BackgroundTaskStore | undefined;
+    threadId: string | undefined;
 }
 
-/**
- * Validate ctx.configurable. Returns the typed wiring on success, or an
- * LLM-friendly error string on failure — the tool returns that string so
- * the agent sees the problem in the tool result rather than crashing the turn.
- */
 function validateWiring(
     cfg: Partial<SpawnBackgroundTaskConfigurable>,
 ): Wiring | string {
@@ -240,6 +230,8 @@ function validateWiring(
         buildSubAgent: cfg.buildSubAgent,
         depth: cfg.depth ?? 0,
         logger: cfg.logger,
+        taskStore: cfg.taskStore,
+        threadId: cfg.threadId,
     };
 }
 
@@ -252,16 +244,15 @@ function launch(
         depth: number;
         logger: SpawnBackgroundTaskConfigurable['logger'];
         timeoutMs: number;
+        taskStore: BackgroundTaskStore | undefined;
+        threadId: string | undefined;
     },
 ): string {
-    const { registry, eventQueue, runner, depth, logger, timeoutMs } = deps;
+    const { registry, eventQueue, runner, depth, logger, timeoutMs, taskStore, threadId } = deps;
 
     const descriptionLabel =
         args.description ?? truncate(args.task, 80);
 
-    // Prefer the teammate record — a named worker the leader may send
-    // follow-up messages to once idle. This is the "persistent role"
-    // model; a nameless background_job would be more ephemeral.
     const task = createTeammateTask({
         id: registry.nextId('teammate'),
         workerName: args.worker,
@@ -273,19 +264,43 @@ function launch(
     const running = toRunning(task);
     if (running.ok) registry.replace(running.task);
 
-    // Signal the ChannelWorker that a task has started so it can drop a
-    // ⏳ reaction on the user's triggering message and begin the typing
-    // indicator loop. Zero chat-message noise — the channel's native
-    // presence signals ARE the progress UX while the task runs.
+    // Persist BEFORE the detached promise fires so a crash mid-spawn leaves a recoverable trail.
+    if (taskStore && threadId) {
+        try {
+            taskStore.recordBackgroundTask({
+                taskId: task.id,
+                threadId,
+                workerName: args.worker,
+                taskPrompt: args.task,
+                toolAllowlist: args.tools ?? null,
+                timeoutMs,
+                deliveryMode: null, // delivery_mode is determined at the receiving channel-worker, not the spawn site
+                status: 'running',
+                createdAt: Date.now(),
+                endedAt: null,
+                result: null,
+                error: null,
+                description: descriptionLabel,
+            });
+        } catch (err) {
+            logger?.warn?.(
+                {
+                    op: 'spawn_background_task',
+                    taskId: task.id,
+                    err: err instanceof Error ? err.message : String(err),
+                },
+                'failed to persist background_task row — task will run in memory-only mode',
+            );
+        }
+    }
+
     eventQueue.push({
         type: 'task_start',
         taskId: task.id,
         completedAt: Date.now(),
     });
 
-    // Arm the ceiling timer. Fires the task's WHOLE abort controller so the
-    // runner's LLM call sees signal.aborted and throws. The `finally` in
-    // runInBackground clears the timer on natural completion.
+    // Aborts the WHOLE abort controller so the runner's LLM call sees signal.aborted.
     const timeoutTimer = setTimeout(() => {
         logger?.warn?.(
             { taskId: task.id, worker: args.worker, timeoutMs },
@@ -294,8 +309,6 @@ function launch(
         task.abortPair?.whole.abort();
     }, timeoutMs);
 
-    // Detached — void Promise handle. We catch internally so we never
-    // produce an unhandled rejection.
     void runInBackground({
         taskId: task.id,
         workerName: args.worker,
@@ -307,6 +320,7 @@ function launch(
         runner,
         logger,
         timeoutTimer,
+        taskStore,
     });
 
     logger?.info?.(
@@ -334,9 +348,29 @@ async function runInBackground(args: {
     runner: SubAgentRunner;
     logger: SpawnBackgroundTaskConfigurable['logger'];
     timeoutTimer: NodeJS.Timeout;
+    taskStore: BackgroundTaskStore | undefined;
 }): Promise<void> {
-    const { taskId, registry, eventQueue, runner, logger, timeoutTimer } = args;
+    const { taskId, registry, eventQueue, runner, logger, timeoutTimer, taskStore } = args;
     const startedAt = Date.now();
+
+    const persistStatus = (
+        status: 'completed' | 'failed' | 'killed',
+        patch: { result?: string; error?: string },
+    ): void => {
+        if (!taskStore) return;
+        try {
+            taskStore.updateBackgroundTaskStatus(taskId, { status, ...patch });
+        } catch (err) {
+            logger?.warn?.(
+                {
+                    taskId,
+                    err: err instanceof Error ? err.message : String(err),
+                    op: 'persistStatus',
+                },
+                'failed to persist background_task terminal status — row may be stranded as running',
+            );
+        }
+    };
 
     try {
         const result = await runner({
@@ -351,6 +385,9 @@ async function runInBackground(args: {
             const done = toTerminal(current, 'completed', { result });
             if (done.ok) registry.replace(done.task);
         }
+
+        // Persist BEFORE eventQueue.push so a crash between the two doesn't strand the row as `running`.
+        persistStatus('completed', { result });
 
         eventQueue.push({
             type: 'task_complete',
@@ -370,6 +407,8 @@ async function runInBackground(args: {
             if (terminal.ok) registry.replace(terminal.task);
         }
 
+        persistStatus(status, { error: message });
+
         eventQueue.push({
             type: 'task_error',
             taskId,
@@ -381,8 +420,6 @@ async function runInBackground(args: {
             'spawn: failed',
         );
     } finally {
-        // Always clear the ceiling timer — whether the task finished naturally,
-        // failed, or was already aborted by the timer itself.
         clearTimeout(timeoutTimer);
     }
 }
@@ -393,7 +430,4 @@ function truncate(s: string, max: number): string {
     return oneLine.slice(0, max - 1).trimEnd() + '…';
 }
 
-// Re-export also for background_job variant if/when we add it — the
-// ephemeral one-shot path wouldn't register as a teammate. Leaving as a
-// signal for a future split.
 export { createBackgroundJobTask };

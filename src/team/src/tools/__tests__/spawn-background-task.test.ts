@@ -16,8 +16,17 @@ import {
 
 function makeHarness(overrides: Partial<SpawnBackgroundTaskConfigurable> = {}) {
     const registry = new TaskRegistry();
+    // We capture only terminal events (task_complete / task_error). The
+    // synchronous `task_start` signal that fires the gateway's typing /
+    // reaction loop is auxiliary and not under test here — filtering it
+    // keeps these tests focused on runner-result wiring.
     const events: BackgroundTaskEvent[] = [];
-    const eventQueue = { push: (e: BackgroundTaskEvent) => events.push(e) };
+    const eventQueue = {
+        push: (e: BackgroundTaskEvent) => {
+            if (e.type === 'task_start' || e.type === 'task_progress') return;
+            events.push(e);
+        },
+    };
 
     let runnerFn: SubAgentRunner = async ({ task }) => `ran: ${task}`;
     const workerNames = new Set<string>(['legolas', 'gimli']);

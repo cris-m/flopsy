@@ -95,8 +95,6 @@ export async function renderFires(id: string, limit: number): Promise<void> {
     }
 }
 
-// ── Shared list / show helpers ───────────────────────────────────────────
-
 export interface ListOptions {
     /** Section header (e.g. "Heartbeats"). */
     readonly title: string;

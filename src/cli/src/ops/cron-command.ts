@@ -7,6 +7,8 @@
  * or `--cron "<expr>" --tz <IANA>` (5-field cron expression).
  */
 
+import { existsSync } from 'node:fs';
+import { resolve as resolvePath } from 'node:path';
 import { Command } from 'commander';
 import { truncate } from '@flopsy/shared';
 import { bad, detail, dim } from '../ui/pretty';
@@ -54,6 +56,20 @@ export function registerCronCommands(root: Command): void {
                 console.log(bad(schedule));
                 process.exit(1);
             }
+            // Resolve --prompt-file to absolute against the user's CWD before
+            // sending to the daemon. The daemon runs in its own cwd (workspace
+            // root) so a relative path like `./prompts/...` would otherwise be
+            // resolved server-side against the WRONG directory and ENOENT.
+            // We also fail-fast here with a friendly message if the file is
+            // missing — better UX than the daemon's bare copyfile ENOENT.
+            let absPromptFile: string | undefined;
+            if (opts.promptFile) {
+                absPromptFile = resolvePath(opts.promptFile);
+                if (!existsSync(absPromptFile)) {
+                    console.log(bad(`prompt-file not found: ${absPromptFile}`));
+                    process.exit(1);
+                }
+            }
             const scheduleId: string =
                 opts.id ??
                 `runtime-cron-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -63,7 +79,7 @@ export function registerCronCommands(root: Command): void {
                 name: opts.name,
                 schedule,
                 message: opts.message,
-                promptFile: opts.promptFile,
+                promptFile: absPromptFile,
                 deliveryMode: opts.deliveryMode,
                 oneshot: opts.oneshot,
                 threadId: opts.threadId,

@@ -15,10 +15,6 @@
 
 import { randomBytes } from 'crypto';
 
-// ---------------------------------------------------------------------------
-// Identity
-// ---------------------------------------------------------------------------
-
 export type TaskType =
     | 'teammate' // persistent named worker (legolas, gimli) the leader can talk to again
     | 'background_job' // ephemeral fire-and-forget unit (research scrape, file crawl)
@@ -76,9 +72,7 @@ export function generateTaskId(type: TaskType): string {
     return id;
 }
 
-// ---------------------------------------------------------------------------
 // Abort pair — the Claude-Code two-controller pattern.
-// ---------------------------------------------------------------------------
 
 export interface AbortPair {
     /** Kills the task permanently — it will NOT accept more work afterward. */
@@ -102,10 +96,6 @@ export function createAbortPair(): AbortPair {
 export function rotateCurrentTurnController(pair: AbortPair): AbortPair {
     return { whole: pair.whole, currentTurn: new AbortController() };
 }
-
-// ---------------------------------------------------------------------------
-// State shapes
-// ---------------------------------------------------------------------------
 
 export interface TaskStateBase {
     readonly id: string;
@@ -181,10 +171,6 @@ export interface ShellTaskState extends TaskStateBase {
 
 export type TaskState = TeammateTaskState | BackgroundJobTaskState | ShellTaskState;
 
-// ---------------------------------------------------------------------------
-// Type guards
-// ---------------------------------------------------------------------------
-
 export function isTeammateTask(t: TaskState | undefined): t is TeammateTaskState {
     return t?.type === 'teammate';
 }
@@ -198,10 +184,6 @@ export function isBackgroundJobTask(
 export function isShellTask(t: TaskState | undefined): t is ShellTaskState {
     return t?.type === 'shell';
 }
-
-// ---------------------------------------------------------------------------
-// Factory helpers
-// ---------------------------------------------------------------------------
 
 export function createTeammateTask(
     args: Pick<TeammateTaskState, 'workerName' | 'description' | 'depth'> & {
@@ -268,9 +250,7 @@ export function createShellTask(
     };
 }
 
-// ---------------------------------------------------------------------------
 // Transitions — centralized so the status graph is enforced in one place.
-// ---------------------------------------------------------------------------
 
 export type TransitionResult<T extends TaskState> =
     | { ok: true; task: T }

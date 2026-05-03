@@ -1,24 +1,3 @@
-/**
- * Google OAuth 2.0 + PKCE — Gmail, Calendar, Drive, Contacts, Tasks.
- *
- * Flow:
- *   1. Generate PKCE verifier/challenge + state nonce
- *   2. Spin up a localhost callback listener on a random port
- *   3. Open the browser to the Google consent screen
- *   4. User approves → Google redirects to our callback with `code`
- *   5. Exchange code + verifier for tokens
- *   6. Fetch userinfo for email display
- *   7. Save credential to `<FLOPSY_HOME>/auth/google.json`
- *
- * Client credentials:
- *   Google's "Desktop app" OAuth client type issues a client_id AND a
- *   client_secret, but the secret is NOT confidential — any shipped CLI
- *   can extract it. PKCE is what secures the flow. We require the user
- *   to provide a client_id via env var (see README for a 5-minute setup
- *   in Google Cloud Console) to avoid policy ambiguity around
- *   redistributing OAuth client IDs we didn't register.
- */
-
 import {
     awaitOauthCallback,
     type CallbackResult,
@@ -36,18 +15,11 @@ const AUTHORIZE_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const REVOKE_URL = 'https://oauth2.googleapis.com/revoke';
 const USERINFO_URL = 'https://www.googleapis.com/oauth2/v3/userinfo';
-// Device flow (RFC 8628) — separate Google client type "TV/Limited Input".
-// Distinct from the Desktop client used for CLI's localhost callback flow.
+// Device flow (RFC 8628) — uses Google's "TV/Limited Input" OAuth client type.
 const DEVICE_CODE_URL = 'https://oauth2.googleapis.com/device/code';
 const DEVICE_VERIFICATION_URL = 'https://www.google.com/device';
 
-/**
- * DEFAULT_SCOPES — the broad set for the CLI OAuth flow (Desktop OAuth
- * client type). Includes `gmail.modify` (trash/delete), `drive.readonly`
- * (list user's existing files). These require the user's OAuth consent
- * screen in Google Cloud Console to have those scopes added under
- * "Scopes for Google APIs", otherwise Google returns `invalid_scope`.
- */
+// Google rejects with `invalid_scope` if any of these aren't on the consent screen.
 const DEFAULT_SCOPES: readonly string[] = [
     'openid',
     'email',
@@ -60,17 +32,7 @@ const DEFAULT_SCOPES: readonly string[] = [
     'https://www.googleapis.com/auth/drive.file',
 ];
 
-/**
- * DEVICE_FLOW_SCOPES — the narrow set the in-chat `connect_service` uses
- * by default. Matches what has been proven to work with Google's
- * "TVs and Limited Input devices" OAuth client type + the user's current
- * consent-screen registration. DO NOT add scopes here without confirming
- * they are (a) on Google's device-flow allowlist AND (b) added to the
- * consent screen — otherwise device flow fails with `invalid_scope` and
- * the user sees a cryptic "scope settings issue" message. If the user
- * wants broader scopes (delete, list existing Drive files), they should
- * run `flopsy auth google` from the CLI (Desktop client, broader allowlist).
- */
+// Every scope here MUST be on Google's device-flow allowlist AND on the consent screen.
 const DEVICE_FLOW_SCOPES: readonly string[] = [
     'openid',
     'email',
@@ -102,20 +64,7 @@ function optionalClientSecret(): string | undefined {
     return sec && sec.length > 0 ? sec : undefined;
 }
 
-/**
- * MUST be a "TVs and Limited Input devices" OAuth client type — NOT the
- * Desktop App client in GOOGLE_CLIENT_ID.
- *
- * Despite the "Limited Input" name, Google DOES issue and require a
- * client_secret for these clients at the token exchange step. Download
- * the client JSON from Google Cloud Console — it contains both fields.
- *
- * Setup (one-time, ~3 minutes):
- *   1. https://console.cloud.google.com/apis/credentials
- *   2. Create OAuth client ID → Application type: "TVs and Limited Input devices"
- *   3. Download the JSON → set GOOGLE_DEVICE_CLIENT_ID and GOOGLE_DEVICE_CLIENT_SECRET
- *   (Do NOT reuse GOOGLE_CLIENT_ID/SECRET — separate credential pair.)
- */
+// Must be a "TVs and Limited Input devices" client; the Desktop client_id is rejected by /device/code.
 function requireDeviceClientId(): string {
     const id = process.env['GOOGLE_DEVICE_CLIENT_ID']?.trim();
     if (!id) {
@@ -178,6 +127,8 @@ export interface DeviceFlowPollPending {
     readonly status: 'pending';
     /** Caller should retry after this many seconds (Google may bump it). */
     readonly intervalSeconds: number;
+    /** True for RFC 8628 §3.5 `slow_down` — caller MUST add 5s to its current interval, not overwrite. */
+    readonly slowDown?: boolean;
 }
 export interface DeviceFlowPollExpired {
     readonly status: 'expired';
@@ -185,13 +136,7 @@ export interface DeviceFlowPollExpired {
 export interface DeviceFlowPollDenied {
     readonly status: 'denied';
 }
-/**
- * Non-terminal OAuth-level error with actionable detail. Distinct from
- * `denied` (user explicitly refused on the phone) — this is for
- * invalid_grant / invalid_client / invalid_scope / unauthorized_client
- * and other config-level errors where the user may have done their part
- * correctly but our OAuth client setup is wrong.
- */
+/** Non-terminal OAuth error (invalid_grant/client/scope) — distinct from `denied`. */
 export interface DeviceFlowPollError {
     readonly status: 'error';
     readonly errorDetail: string;
@@ -277,18 +222,13 @@ export const googleProvider: AuthProvider = {
         authorizeUrl.searchParams.set('state', state);
         authorizeUrl.searchParams.set('code_challenge', pkce.codeChallenge);
         authorizeUrl.searchParams.set('code_challenge_method', pkce.codeChallengeMethod);
-        // access_type=offline tells Google to return a refresh_token; without
-        // this we only get a 1-hour access_token and have to re-prompt.
+        // access_type=offline → refresh_token; without it Google issues only a 1h access_token.
         authorizeUrl.searchParams.set('access_type', 'offline');
-        // prompt=consent forces the consent screen on every authorization so
-        // scopes get reviewed cleanly on re-auth (otherwise Google silently
-        // returns the old scope set).
+        // prompt=consent forces re-display so scope changes on re-auth aren't silently dropped.
         authorizeUrl.searchParams.set('prompt', 'consent');
 
         const authorizeUrlStr = authorizeUrl.toString();
 
-        // Print the URL FIRST so the user can copy/paste if the browser
-        // doesn't open automatically (headless server, WSL, etc.).
         console.log(`\nOpen the following URL to authorize Google:\n\n  ${authorizeUrlStr}\n`);
         if (!opts.noOpen) {
             openInBrowser(authorizeUrlStr);
@@ -368,20 +308,11 @@ export const googleProvider: AuthProvider = {
     },
 
     async revoke(current: StoredCredential): Promise<void> {
-        // (revoke implementation below)
         await revokeImpl(current);
     },
 };
 
-// Device flow exported separately so the in-chat connect_service tool can
-// reach for it without going through the full AuthProvider interface
-// (which is shaped for callback-based flows).
 export const googleDeviceFlow = {
-    /**
-     * Initiate device flow: ask Google for a user_code + device_code.
-     * Caller shows the user_code to the user; they enter it at
-     * https://www.google.com/device on any device. Caller polls below.
-     */
     async start(scopes: readonly string[] = DEVICE_FLOW_SCOPES): Promise<DeviceFlowStart> {
         const clientId = requireDeviceClientId();
         const params = new URLSearchParams({
@@ -395,10 +326,6 @@ export const googleDeviceFlow = {
         });
         if (!res.ok) {
             const detail = await res.text();
-            // Parse invalid_scope to give the caller an actionable message
-            // instead of raw RFC-6749 JSON. The most common cause is a scope
-            // not being registered on the OAuth consent screen OR not being
-            // on Google's device-flow allowlist.
             let humanDetail = detail.slice(0, 500);
             try {
                 const parsed = JSON.parse(detail) as { error?: string; error_description?: string };
@@ -425,14 +352,6 @@ export const googleDeviceFlow = {
         };
     },
 
-    /**
-     * Poll the token endpoint ONCE. Returns 'pending' while the user
-     * hasn't entered the code yet, 'expired' / 'denied' on terminal
-     * failure, 'success' with the saved credential on completion.
-     *
-     * Caller should sleep for `result.intervalSeconds` between pending
-     * polls — Google may bump the interval via slow_down errors.
-     */
     async poll(deviceCode: string, scopes: readonly string[] = DEVICE_FLOW_SCOPES): Promise<DeviceFlowPoll> {
         const clientId = requireDeviceClientId();
         const clientSecret = requireDeviceClientSecret();
@@ -479,18 +398,12 @@ export const googleDeviceFlow = {
             return { status: 'pending', intervalSeconds: 5 };
         }
         if (error === 'slow_down') {
-            // Google asking us to back off — bump interval by 5s next time.
-            return { status: 'pending', intervalSeconds: 10 };
+            // RFC 8628 §3.5: caller MUST add 5s to its running interval (we don't track it here).
+            return { status: 'pending', intervalSeconds: 5, slowDown: true };
         }
         if (error === 'expired_token') return { status: 'expired' };
         if (error === 'access_denied') return { status: 'denied' };
 
-        // Any other OAuth error (invalid_grant, invalid_client, invalid_scope,
-        // unauthorized_client, ...). Previously ALL mapped to `denied` which
-        // lost the information — a user who completed auth on their phone but
-        // hit a client-config error would see "Authorization denied" with no
-        // way to diagnose. Return `error` status with real text so the caller
-        // can relay the exact OAuth error back to logs + user.
         const detail = errDesc ? `${error}: ${errDesc}` : error;
         return { status: 'error', errorDetail: detail };
     },
@@ -503,8 +416,7 @@ async function revokeImpl(current: StoredCredential): Promise<void> {
             method: 'POST',
         });
     } catch (err) {
-        // Best-effort — local credential deletion is the source of truth
-        // for our side. Remote revoke failure shouldn't block cleanup.
+        // Best-effort — local credential deletion is what guarantees cleanup on our side.
         console.warn(
             `Remote revoke failed (local credential still deleted): ${
                 err instanceof Error ? err.message : String(err)

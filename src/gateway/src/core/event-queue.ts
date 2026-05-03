@@ -2,7 +2,6 @@ import type { ChannelEvent, IEventQueue } from '../types/agent';
 
 const MAX_QUEUED_EVENTS = 1_000;
 
-/** Internal waiter record — timer + settle function kept together so we can always clear both. */
 interface Waiter {
     settle: (notified: boolean) => void;
     timer: ReturnType<typeof setTimeout>;
@@ -31,18 +30,23 @@ export class EventQueue implements IEventQueue {
     /**
      * Resolves `true` when an event is pushed (or one is already queued),
      * or `false` on timeout. Multiple concurrent waiters are supported —
-     * every caller is notified on the next push. This matters because
-     * ChannelWorker.loop races this wait against a stop signal and can
-     * start overlapping waits during shutdown.
+     * every caller is notified on the next push.
      */
     waitForEvent(timeoutMs: number): Promise<boolean> {
         if (this.queue.length > 0) return Promise.resolve(true);
 
         return new Promise<boolean>((resolve) => {
+            // `notifyAll` clears the set BEFORE invoking settle, so we
+            // can't gate on `waiters.delete` alone — track `settled`
+            // explicitly to avoid double-call between timeout and notify.
+            let settled = false;
             const waiter: Waiter = {
                 settle: (notified) => {
+                    if (settled) return;
+                    settled = true;
                     clearTimeout(waiter.timer);
-                    if (this.waiters.delete(waiter)) resolve(notified);
+                    this.waiters.delete(waiter);
+                    resolve(notified);
                 },
                 timer: setTimeout(() => waiter.settle(false), timeoutMs),
             };

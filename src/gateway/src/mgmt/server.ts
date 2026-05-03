@@ -1,38 +1,20 @@
 /**
- * Minimal management HTTP server — exposes read-only live state from
- * the running gateway so the CLI can ask questions without restarting.
- *
- * Endpoints:
- *   GET  /mgmt/ping              — {ok, version, uptimeMs}
- *   GET  /mgmt/status            — live status snapshot (the same data
- *                                   the status slash command returns)
- *
- * Bind policy: 127.0.0.1 only — never exposed to the LAN. Auth is via
- * bearer token from env `FLOPSY_MGMT_TOKEN` (optional: when unset the
- * server accepts any localhost request, which is fine for single-user
- * dev since the socket isn't reachable off-box).
- *
- * Keeping this thin on purpose — richer control (start/stop jobs,
- * reconnect channels) lands in Phase 2 once we've validated the auth
- * model + wire format.
+ * Read-only management HTTP server bound to 127.0.0.1 only. Auth via
+ * `FLOPSY_MGMT_TOKEN`; unset = accept any loopback request.
  */
 
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { createLogger } from '@flopsy/shared';
+import type { ChatHandler } from './chat-handler';
 
 const log = createLogger('mgmt-server');
 
-/**
- * Bound handlers for mutating proactive schedules from the CLI. The gateway
- * wires these to ProactiveEngine methods; when unset the schedule routes
- * return 501 (feature-not-wired) so the CLI can distinguish "gateway doesn't
- * support this" from "not authorized" / "server not running".
- */
+/** Unset → schedule routes return 501. */
 export interface ScheduleMgmtHandlers {
     create(
         body: unknown,
-    ): { ok: true; id: string; message: string } | { ok: false; error: string };
+    ): Promise<{ ok: true; id: string; message: string } | { ok: false; error: string }>;
     remove(id: string): { ok: boolean; message?: string };
     setEnabled(id: string, enabled: boolean): { ok: boolean; message?: string };
     list(): Array<Record<string, unknown>>;
@@ -42,38 +24,21 @@ export interface MgmtServerOptions {
     readonly host?: string;
     readonly port: number;
     readonly token?: string;
-    /** Called on GET /mgmt/status. Returns a JSON-serializable value. */
     readonly snapshotFn: () => unknown;
-    /** Called on GET /mgmt/ping; defaults to process uptime. */
     readonly pingFn?: () => Record<string, unknown>;
-    /** Optional schedule handlers; when absent, the schedule routes 501. */
     readonly scheduleHandlers?: ScheduleMgmtHandlers;
-    /**
-     * Called on GET /mgmt/tasks. Receives the parsed query params
-     * (thread, status, limit) and returns a JSON-serializable payload
-     * (usually `{ tasks: [...] }`). When absent, /mgmt/tasks responds 501.
-     */
     readonly tasksFn?: (query: URLSearchParams) => unknown;
-    /**
-     * DND handlers. GET /mgmt/dnd → status. POST /mgmt/dnd/on
-     * { durationMs, reason? } → enable DND. POST /mgmt/dnd/off → clear.
-     * POST /mgmt/dnd/quiet { untilMs } → set quiet hours.
-     */
     readonly dndHandlers?: {
         status(): Promise<unknown>;
         setDnd(body: { durationMs: number; reason?: string }): Promise<unknown>;
         clearDnd(): Promise<void>;
         setQuietHours(body: { untilMs: number }): Promise<unknown>;
     };
-    /**
-     * Proactive stats + fires. GET /mgmt/proactive/stats?windowMs=N returns
-     * aggregate counters + per-schedule JobState snapshots. GET
-     * /mgmt/proactive/fires/:id?limit=N returns newest-first delivery rows.
-     */
     readonly proactiveStatsHandlers?: {
         getStats(windowMs: number): Promise<unknown>;
         getFires(id: string, limit: number): unknown;
     };
+    readonly chatHandler?: ChatHandler;
 }
 
 export class MgmtServer {
@@ -89,9 +54,6 @@ export class MgmtServer {
         const { host = '127.0.0.1', port } = this.opts;
         this.startedAt = Date.now();
         this.server = createServer((req, res) => {
-            // Fire-and-forget on the async handler; any unhandled rejection
-            // lands on the node:http default error handler (501), never
-            // crashes the server.
             this.onRequest(req, res).catch((err) => {
                 log.error({ err }, 'mgmt request handler threw');
                 if (!res.headersSent) {
@@ -101,11 +63,17 @@ export class MgmtServer {
                 }
             });
         });
+        if (this.opts.chatHandler) {
+            const ch = this.opts.chatHandler;
+            this.server.on('upgrade', (req, socket, head) => {
+                ch.handleUpgrade(req, socket as import('node:net').Socket, head as Buffer);
+            });
+        }
         await new Promise<void>((resolve, reject) => {
             this.server!.once('error', reject);
             this.server!.listen(port, host, () => resolve());
         });
-        log.info({ host, port, auth: this.opts.token ? 'bearer' : 'open' }, 'mgmt server listening');
+        log.info({ host, port, auth: this.opts.token ? 'bearer' : 'open', chat: !!this.opts.chatHandler }, 'mgmt server listening');
     }
 
     async stop(): Promise<void> {
@@ -155,8 +123,6 @@ export class MgmtServer {
             }
         }
 
-        // DND routes — thin passthrough to the engine facade. Same
-        // auth / token rules as the rest of /mgmt.
         const dnd = this.opts.dndHandlers;
         if (dnd && path.startsWith('/mgmt/dnd')) {
             try {
@@ -192,7 +158,6 @@ export class MgmtServer {
             return this.reply(res, 405, { error: 'method not allowed', path });
         }
 
-        // Proactive stats / fires — read-only observability for CLI+chat.
         const proactive = this.opts.proactiveStatsHandlers;
         if (proactive && path.startsWith('/mgmt/proactive')) {
             if (req.method === 'GET' && path === '/mgmt/proactive/stats') {
@@ -221,7 +186,6 @@ export class MgmtServer {
             }
         }
 
-        // ── Schedule routes (CLI mutations via manage_schedule handlers) ─
         const handlers = this.opts.scheduleHandlers;
         if (path === '/mgmt/schedule' || path.startsWith('/mgmt/schedule/')) {
             if (!handlers) {
@@ -239,11 +203,9 @@ export class MgmtServer {
         path: string,
         h: ScheduleMgmtHandlers,
     ): Promise<void> {
-        // GET /mgmt/schedule — list
         if (req.method === 'GET' && path === '/mgmt/schedule') {
             return this.reply(res, 200, { schedules: h.list() });
         }
-        // POST /mgmt/schedule — create. Body: full manage_schedule args blob.
         if (req.method === 'POST' && path === '/mgmt/schedule') {
             const body = await readJsonBody(req).catch((err: unknown) => {
                 this.reply(res, 400, {
@@ -252,12 +214,11 @@ export class MgmtServer {
                 return null;
             });
             if (body === null) return;
-            const result = h.create(body);
+            const result = await h.create(body);
             return result.ok
                 ? this.reply(res, 201, result)
                 : this.reply(res, 400, result);
         }
-        // /mgmt/schedule/:id — remove / disable / enable
         const match = path.match(/^\/mgmt\/schedule\/([^/]+)(?:\/(disable|enable))?$/);
         if (match) {
             const id = decodeURIComponent(match[1]!);
@@ -285,14 +246,6 @@ export class MgmtServer {
     }
 }
 
-/**
- * Constant-time bearer-token comparison. Returns true iff the Authorization
- * header exactly matches "Bearer <token>". We short-circuit on length
- * mismatch to avoid allocating a timingSafeEqual buffer when there's no
- * chance of a match — this does leak token length, but that's a fixed
- * property of the deployed server (not per-request), so it's not a new
- * signal for the attacker.
- */
 const MAX_BODY_BYTES = 256 * 1024;
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {

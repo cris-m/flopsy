@@ -1,25 +1,3 @@
-/**
- * send_message — agent-driven outbound delivery.
- *
- * Instead of relying on the final `messages.at(-1)` being sent to the user,
- * the agent can call this tool to push text immediately. Used for:
- *   - Progress updates during long tasks ("scaffolding done, writing routes…")
- *   - Partial results before the turn ends
- *   - Mid-turn clarifying questions
- *   - The final answer (when the agent wants control over timing)
- *
- * When this tool fires, it calls `callbacks.setDidSendViaTool()` — the
- * handler then drops the final `messages.at(-1)` so the agent's private
- * "I have replied" closing isn't echoed to the user.
- *
- * Wiring contract:
- *   The tool reads from `ctx.configurable`:
- *     - onReply(text): (text: string) => Promise<void> | void
- *     - setDidSendViaTool(): () => void
- *   Both come from the gateway's `AgentCallbacks`. TeamHandler must forward
- *   them through `configurable` when invoking the agent.
- */
-
 import { z } from 'zod';
 import { defineTool } from 'flopsygraph';
 
@@ -114,10 +92,6 @@ export const sendMessageTool = defineTool({
         const setDidSendViaTool = cfg.setDidSendViaTool;
 
         if (typeof onReply !== 'function') {
-            // No delivery callback wired — the agent is running outside a
-            // platform context (e.g. a standalone eval). Return a no-op
-            // success so the model doesn't loop; callers who need delivery
-            // must wire the callbacks.
             return 'send_message: no onReply configured; message dropped';
         }
 
@@ -128,10 +102,7 @@ export const sendMessageTool = defineTool({
             return `send_message: delivery failed: ${err instanceof Error ? err.message : String(err)}`;
         }
 
-        // Flag AFTER successful delivery. If the send throws, the caller
-        // still wants to fall back to messages.at(-1) — never silently lose
-        // the user's final answer because a network blip dropped our only
-        // tool-driven send.
+        // Set AFTER successful delivery so a throw still lets messages.at(-1) ship as the reply.
         if (typeof setDidSendViaTool === 'function') {
             setDidSendViaTool();
         }

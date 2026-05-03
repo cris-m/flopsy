@@ -73,8 +73,6 @@ export function registerTeamCommands(root: Command): void {
     });
 }
 
-// ── Live probe ───────────────────────────────────────────────────────────
-
 type LiveAgentMap = Map<string, { state: 'idle' | 'busy'; currentTask?: string }>;
 
 async function fetchLiveAgents(): Promise<LiveAgentMap> {
@@ -99,8 +97,6 @@ async function fetchLiveAgents(): Promise<LiveAgentMap> {
     }
     return out;
 }
-
-// ── Writes ───────────────────────────────────────────────────────────────
 
 function writeAgentField(name: string, field: string, value: unknown): void {
     const { path: file, config } = readFlopsyConfig();

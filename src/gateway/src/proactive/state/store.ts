@@ -10,7 +10,7 @@ const MAX_RECENT_DELIVERIES = 50;
 const MAX_RECENT_TOPICS = 100;
 const MAX_REPORTED_PER_TYPE = 500;
 
-export function getDefaultPresence(): UserPresence {
+function getDefaultPresence(): UserPresence {
     return {
         lastMessageAt: 0,
         activityWindow: 'away',
@@ -52,9 +52,8 @@ export class StateStore {
     constructor(filePath: string) {
         this.filePath = filePath;
         this.state = this.load();
-        // Clear any `isExecuting` flags left set by a crash/SIGKILL — otherwise
-        // a single bad shutdown permanently suppresses the job on every fire.
-        // Process-local mutual exclusion (not persisted) is the intended design.
+        // Clear `isExecuting` flags left by SIGKILL — process-local mutex
+        // shouldn't persist; otherwise jobs are permanently suppressed.
         let cleared = 0;
         for (const js of Object.values(this.state.jobs)) {
             if (js.isExecuting) {
@@ -131,11 +130,7 @@ export class StateStore {
         return this.state.jobs[jobId] ? { ...this.state.jobs[jobId] } : getDefaultJobState();
     }
 
-    /**
-     * Synchronous read for callers on the hot status path — data is all
-     * in-memory (loaded into `this.state` on construction). Returns null
-     * when the job has no recorded state yet (never fired).
-     */
+    /** Sync read for the hot status path. Null when never fired. */
     getJobStateSync(jobId: string): JobState | null {
         const js = this.state.jobs[jobId];
         return js ? { ...js } : null;
@@ -146,12 +141,6 @@ export class StateStore {
         this.dirty = true;
     }
 
-    /**
-     * Drop the cached stats for a deleted schedule. Without this, every
-     * removed heartbeat/cron leaves an orphan record in `jobs[]` that
-     * accumulates forever and shows up in `flopsy status` as a ghost
-     * schedule.
-     */
     deleteJobState(jobId: string): boolean {
         if (!(jobId in this.state.jobs)) return false;
         delete this.state.jobs[jobId];
@@ -228,8 +217,6 @@ export class StateStore {
         this.dirty = true;
         return true;
     }
-
-    // ── Config seed marker (one-time import from flopsy.json5) ────────────
 
     getConfigSeededAt(): number | null {
         return this.state.configSeededAt ?? null;

@@ -1,13 +1,8 @@
-/**
- * Command dispatcher — given a parsed command and base context, looks up the
- * handler, invokes it, and returns the result (or `null` if the command is
- * unknown, so the caller can fall through to normal agent dispatch).
- */
-
 import { createLogger } from '@flopsy/shared';
 import type { CommandContext, CommandDef, CommandResult } from './types';
 import type { ParsedCommand } from './parser';
-import { COMMANDS, buildLookup } from './registry';
+import { COMMANDS, buildAllCommands, buildLookup } from './registry';
+import { resolveWorkspacePath } from '@flopsy/shared';
 
 const log = createLogger('commands');
 
@@ -18,9 +13,8 @@ export class CommandDispatcher {
         this.lookup = buildLookup(commands);
     }
 
-    /** Exposed for `/help` so handlers can enumerate commands without circular imports. */
+    /** Exposed for `/help`. */
     listCommands(): readonly CommandDef[] {
-        // Dedup aliases: each def appears once regardless of how many keys alias to it.
         const seen = new Set<CommandDef>();
         const out: CommandDef[] = [];
         for (const def of this.lookup.values()) {
@@ -32,12 +26,6 @@ export class CommandDispatcher {
         return out;
     }
 
-    /**
-     * Find the handler for this command name. Returns null when unknown so the
-     * ChannelWorker can decide whether to fall through to the agent or reply
-     * with a "command not found" message (we fall through — unknown slashes
-     * may be meaningful to the agent, e.g. "/summarise this document please").
-     */
     resolve(name: string): CommandDef | undefined {
         return this.lookup.get(name.toLowerCase());
     }
@@ -67,8 +55,6 @@ export class CommandDispatcher {
                     threadId: ctx.threadId,
                     peer: ctx.peer.id,
                     hasReply: !!result,
-                    // Truncated so the log line stays scannable but operators
-                    // can audit what the user saw without replaying the turn.
                     replyPreview: result?.text
                         ? result.text.slice(0, 120) + (result.text.length > 120 ? '…' : '')
                         : undefined,
@@ -86,10 +72,23 @@ export class CommandDispatcher {
     }
 }
 
-// Shared singleton — all channel workers use the same instance.
 let sharedDispatcher: CommandDispatcher | undefined;
 
 export function getSharedDispatcher(): CommandDispatcher {
-    if (!sharedDispatcher) sharedDispatcher = new CommandDispatcher();
+    if (!sharedDispatcher) {
+        // Built-ins + one command per discovered skill. Discovery happens
+        // once at first access; restart to pick up new skills.
+        const skillsRoot = resolveWorkspacePath('skills');
+        const allCommands = buildAllCommands(skillsRoot);
+        log.info(
+            {
+                builtin: COMMANDS.length,
+                skills: allCommands.length - COMMANDS.length,
+                total: allCommands.length,
+            },
+            'command dispatcher initialized',
+        );
+        sharedDispatcher = new CommandDispatcher(allCommands);
+    }
     return sharedDispatcher;
 }

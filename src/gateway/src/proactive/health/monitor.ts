@@ -103,7 +103,12 @@ export class ChannelHealthMonitor {
                 .disconnect()
                 .then(() => channel.connect())
                 .then(() => {
-                    state.connectedAt = Date.now();
+                    const restartedAt = Date.now();
+                    state.connectedAt = restartedAt;
+                    // Bump lastEventAt to prevent a tick post-cooldown
+                    // immediately re-flagging the channel and producing a
+                    // restart loop on idle bots.
+                    state.lastEventAt = restartedAt;
                     state.restarting = false;
                     log.info({ channel: name }, 'Channel restarted successfully');
                 })

@@ -53,3 +53,14 @@ tmp/
 
 # LangGraph API
 .langgraph_api
+
+# Proactive runtime output (per-day operational artifacts, not source)
+.flopsy/proactive/pulse-decisions/
+.flopsy/harness/reflections/
+.flopsy/state/pulse-tuning.json
+.flopsy/state/initiatives-proposed.jsonl
+.flopsy/state/callbacks-surfaced.jsonl
+.flopsy/state/emails-surfaced.jsonl
+.claude/
+flopsy-server/
+test-project/

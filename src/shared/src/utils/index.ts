@@ -20,3 +20,9 @@ export {
     PROMPT_KIND_DIR,
     type PromptKind,
 } from './prompt-files';
+export {
+    seedWorkspaceTemplates,
+    TEMPLATE_FILES,
+    TEMPLATE_FOLDERS,
+    type SeedStats,
+} from './seed-workspace';

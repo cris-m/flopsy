@@ -1,4 +1,10 @@
-import type { WASocket, ConnectionState, AnyMessageContent } from '@whiskeysockets/baileys';
+import type {
+    WASocket,
+    ConnectionState,
+    AnyMessageContent,
+    WAMessage,
+    MiscMessageGenerationOptions,
+} from '@whiskeysockets/baileys';
 import type { Boom } from '@hapi/boom';
 import type { Peer, OutboundMessage, ReactionOptions, Media } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
@@ -7,6 +13,10 @@ import type { WhatsAppChannelConfig } from './types';
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 
+// Baileys' `quoted` option needs the full WAMessage (signed with the
+// original message context) — cache inbounds to resolve replyTo on send.
+const REPLY_CACHE_MAX = 200;
+
 export class WhatsAppChannel extends BaseChannel {
     readonly name = 'whatsapp';
     readonly authType = 'qr';
@@ -14,6 +24,7 @@ export class WhatsAppChannel extends BaseChannel {
     private socket: WASocket | null = null;
     private readonly channelConfig: WhatsAppChannelConfig;
     private connecting = false;
+    private readonly replyCache = new Map<string, WAMessage>();
 
     constructor(config: WhatsAppChannelConfig) {
         super(config);
@@ -80,6 +91,15 @@ export class WhatsAppChannel extends BaseChannel {
                         const peerType = isGroup ? ('group' as const) : ('user' as const);
 
                         if (!this.isAllowed(senderId, peerType)) continue;
+
+                        // Map insertion-order eviction → LRU-ish.
+                        if (msg.key.id) {
+                            this.replyCache.set(msg.key.id, msg);
+                            if (this.replyCache.size > REPLY_CACHE_MAX) {
+                                const oldest = this.replyCache.keys().next().value;
+                                if (oldest) this.replyCache.delete(oldest);
+                            }
+                        }
 
                         const m = msg.message;
                         let body =
@@ -181,6 +201,10 @@ export class WhatsAppChannel extends BaseChannel {
 
         const jid = message.peer.id;
 
+        // Cache miss drops the quote silently; message still delivers plain.
+        const quoted = message.replyTo ? this.replyCache.get(message.replyTo) : undefined;
+        const sendOpts: MiscMessageGenerationOptions = quoted ? { quoted } : {};
+
         if (message.media?.length) {
             let lastId = '';
             for (let i = 0; i < message.media.length; i++) {
@@ -214,13 +238,17 @@ export class WhatsAppChannel extends BaseChannel {
                         content = { text: message.body ?? '' };
                 }
 
-                const sent = await this.socket.sendMessage(jid, content);
+                const sent = await this.socket.sendMessage(
+                    jid,
+                    content,
+                    i === 0 ? sendOpts : {},
+                );
                 lastId = sent?.key?.id ?? '';
             }
             return lastId;
         }
 
-        const sent = await this.socket.sendMessage(jid, { text: message.body ?? '' });
+        const sent = await this.socket.sendMessage(jid, { text: message.body ?? '' }, sendOpts);
         return sent?.key?.id ?? '';
     }
 

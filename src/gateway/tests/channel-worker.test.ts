@@ -86,16 +86,19 @@ describe('ChannelWorker', () => {
 
         await sleep(200);
 
-        expect(handler.invoke).toHaveBeenCalledWith(
-            'hello',
-            'test',
+        // invoke signature: (text, threadId, callbacks, role, media?)
+        // The 5th arg (media) is undefined for text-only dispatches.
+        const call = (handler.invoke as ReturnType<typeof vi.fn>).mock.calls[0]!;
+        expect(call[0]).toBe('hello');
+        expect(call[1]).toBe('test');
+        expect(call[2]).toEqual(
             expect.objectContaining({
                 onReply: expect.any(Function),
                 setDidSendViaTool: expect.any(Function),
                 signal: expect.any(AbortSignal),
             }),
-            'user',
         );
+        expect(call[3]).toBe('user');
     });
 
     it('should send reply when agent returns text', async () => {

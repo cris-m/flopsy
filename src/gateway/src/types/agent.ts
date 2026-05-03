@@ -2,20 +2,26 @@ export type InvokeRole = 'user' | 'system';
 
 export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
 
+/**
+ * Background-task lifecycle event:
+ *   task_start    — typing + ⏳ reaction begin
+ *   task_progress — refreshes typing only
+ *   task_complete — ⏳ → ✅ + agent wake-up turn
+ *   task_error    — ⏳ → ❌ + short error push
+ */
 export interface ChannelEvent {
-    /**
-     * Lifecycle events for background tasks.
-     *   - task_start      — task accepted; typing + ⏳ reaction begin
-     *   - task_progress   — optional mid-task signal (refreshes typing only)
-     *   - task_complete   — success; ⏳ → ✅ + agent wake-up turn
-     *   - task_error      — failure; ⏳ → ❌ + short error push
-     */
     readonly type: 'task_start' | 'task_complete' | 'task_error' | 'task_progress';
     readonly taskId: string;
     readonly result?: string;
     readonly error?: string;
     readonly progress?: string;
     readonly completedAt: number;
+    /**
+     *   always      — agent always calls send_message (default)
+     *   conditional — agent decides based on newsworthiness
+     *   silent      — no agent turn (side-effect only)
+     */
+    readonly deliveryMode?: 'always' | 'conditional' | 'silent';
 }
 
 export interface BackgroundTask {
@@ -58,24 +64,14 @@ export interface ITaskStore {
     markDelivered(id: string): Promise<void>;
 }
 
-/**
- * Optional interactive + media elements to attach to an outbound reply.
- * Channel adapters translate these into native rendering (Telegram inline
- * keyboard + sendPhoto, Discord components + attachment uploads, etc.);
- * channels without a capability drop silently.
- */
+/** Channel adapters translate these to native rendering or drop silently. */
 export interface ReplyOptions {
     readonly buttons?: ReadonlyArray<{
         readonly label: string;
         readonly value: string;
         readonly style?: 'primary' | 'secondary' | 'success' | 'danger';
     }>;
-    /**
-     * File attachments to send alongside the text. Each item must specify
-     * either `url` (http/https or local file path) OR `data` (base64). The
-     * adapter picks native upload paths per type (sendPhoto/sendVideo/etc.
-     * on Telegram, Attachment on Discord, etc.).
-     */
+    /** Each item must specify either `url` or `data` (base64). */
     readonly media?: ReadonlyArray<{
         readonly type: 'image' | 'video' | 'audio' | 'document' | 'sticker';
         readonly url?: string;
@@ -86,10 +82,7 @@ export interface ReplyOptions {
     }>;
 }
 
-/**
- * Options for native polls. Only honoured by channels with native poll
- * support (Telegram, Discord); others render a numbered text fallback.
- */
+/** Channels without native polls render a numbered text fallback. */
 export interface SendPollOptions {
     readonly anonymous?: boolean;
     readonly allowMultiple?: boolean;
@@ -103,13 +96,7 @@ export interface AgentCallbacks {
         options: readonly string[],
         pollOptions?: SendPollOptions,
     ) => Promise<void>;
-    /**
-     * Atomically returns and clears the queue of user messages received
-     * during this turn. Used by the `messageQueue` interceptor to inject
-     * mid-turn input so long tool loops react without the user having to
-     * wait for the turn to finish. Must be safe to call from any interceptor
-     * hook; returns [] when nothing queued.
-     */
+    /** Atomic read+clear of mid-turn user input. Returns [] when empty. */
     readonly drainPending: () => string[];
     readonly onProgress: (taskId: string, message: string) => void;
     readonly setDidSendViaTool: () => void;
@@ -117,65 +104,49 @@ export interface AgentCallbacks {
     readonly taskStore?: ITaskStore;
     readonly pending: ReadonlyArray<string>;
     readonly signal: AbortSignal;
-    /**
-     * Drop an emoji reaction on the user's last message (or on a specific
-     * message by id). Optional — platforms that don't support reactions
-     * no-op silently. Does NOT count as a reply, does NOT flip
-     * didSendViaTool.
-     */
+    /** Reaction does not count as a reply; does not flip didSendViaTool. */
     readonly reactToUserMessage?: (
         emoji: string,
         messageId?: string,
     ) => Promise<void>;
 
-    // --- Message context the gateway already has; passed explicitly so the
-    //     handler and agent don't have to re-parse the threadId. ---
-
-    /** Platform the message arrived on — e.g. 'telegram', 'discord'. */
+    /** Platform name — e.g. 'telegram', 'discord'. */
     readonly channelName: string;
 
-    /**
-     * Interactive surfaces this channel renders natively: 'buttons', 'polls',
-     * 'select', 'components'. Plumbed straight from `Channel.capabilities` so
-     * the agent's runtime block can tell the model what's available on THIS
-     * turn's channel. Empty/undefined means text-only — the agent should
-     * fall back to numbered prompts instead of button-shaped tools.
-     */
+    /** Native interactive surfaces this channel supports. Empty = text-only. */
     readonly channelCapabilities: readonly string[];
 
-    /**
-     * The conversation peer. For DMs this IS the user. For groups/channels
-     * this is the shared space, and `sender` carries the individual speaker.
-     */
+    /** For group/channel peers, this is the shared space; `sender` is the speaker. */
     readonly peer: {
         readonly id: string;
         readonly type: 'user' | 'group' | 'channel';
         readonly name?: string;
     };
 
-    /**
-     * Individual speaker (only meaningful for group/channel peers).
-     * For DMs this is typically the same as `peer`.
-     */
+    /** Meaningful only for group/channel peers. */
     readonly sender?: {
         readonly id: string;
         readonly name?: string;
     };
 
-    /** Platform-native id of the message that triggered this turn. */
     readonly messageId?: string;
+
+    /** Per-turn voice overlay (matches personalities.yaml key). */
+    readonly personality?: string;
+
+    /** Lines rendered verbatim in the system prompt's `<runtime>` block. */
+    readonly runtimeHints?: readonly string[];
+
+    /** Wired only when the channel supports edit-based streaming. */
+    readonly onChunk?: (chunk: AgentChunk) => void;
 }
 
-export interface AgentChunk {
-    readonly type: 'text_delta' | 'tool_start' | 'tool_result' | 'done';
-    readonly text?: string;
-    readonly toolName?: string;
-    readonly toolResult?: string;
-}
-
-export interface StreamingCallbacks extends AgentCallbacks {
-    readonly onChunk: (chunk: AgentChunk) => void;
-}
+/** Streaming events the agent emits during a turn. */
+export type AgentChunk =
+    | { readonly type: 'text_delta'; readonly text: string }
+    | { readonly type: 'thinking'; readonly text: string }
+    | { readonly type: 'tool_start'; readonly toolName: string; readonly args?: string }
+    | { readonly type: 'tool_result'; readonly toolName: string; readonly result?: string };
 
 export interface AgentResult {
     readonly reply: string | null;
@@ -199,12 +170,6 @@ export interface AgentHandler {
         role?: InvokeRole,
         media?: ReadonlyArray<InboundMedia>,
     ): Promise<AgentResult>;
-    stream?(
-        text: string,
-        threadId: string,
-        callbacks: StreamingCallbacks,
-        role?: InvokeRole,
-    ): AsyncIterable<AgentChunk>;
     /**
      * Optional status snapshot for this thread — what workers are running,
      * what's recently completed. Consumed by the gateway's slash-command
@@ -212,20 +177,9 @@ export interface AgentHandler {
      * instantiated yet.
      */
     queryStatus?(threadId: string): ThreadStatusSnapshot | undefined;
-    /**
-     * Aggregate task list across ALL threads — for `flopsy tasks` and the
-     * top-level `flopsy status` work surface. Returns undefined when the
-     * agent layer doesn't track tasks (tests, minimal stubs).
-     */
+    /** Cross-thread task list for `flopsy tasks`. */
     queryAllTasks?(filter?: TaskListFilter): AggregateTaskSummary[];
-    /**
-     * Resolve the effective threadId for a proactive fire targeting a known
-     * peer. Maps `channelName + peer` → the peer's active session threadId
-     * (`<peerId>#<sessionId>`). Returns undefined when the session layer is
-     * not available (tests, stubs, or before the first inbound message).
-     *
-     * Sources: 'heartbeat' or 'cron' — never extends lastUserMessageAt.
-     */
+    /** Maps a proactive fire to the peer's active session threadId. */
     resolveProactiveThreadId?(
         channelName: string,
         peer: { id: string; type: 'user' | 'group' | 'channel' },
@@ -233,23 +187,52 @@ export interface AgentHandler {
     ): string | undefined;
 
     /**
-     * Force-close the peer's current session and open a fresh one. Used by
-     * the `/new` slash command. The `rawKey` is the peer routing key
-     * (`channel:scope:nativeId`). Returns the new sessionId for display,
-     * or undefined if the session layer is not available.
+     * Force-close the current session and open a fresh one. Awaits a single
+     * LLM extraction to compress + persist profile/notes/directives.
      */
-    forceNewSession?(rawKey: string): string | undefined;
+    forceNewSession?(
+        rawKey: string,
+    ): Promise<{ sessionId: string; summary: string | null } | undefined>;
+
+    /**
+     * Summarise message history into a synthetic system message that
+     * replaces the checkpoint state. Frees context without losing continuity.
+     */
+    compactSession?(rawKey: string): Promise<
+        { messageCount: number; summary: string } | undefined
+    >;
+
+    /**
+     * Drop any active plan (drafting or approved). Implementations must
+     * clear all matching cached threads for this peer (multiple sessions
+     * may co-exist after a /new rotation).
+     */
+    cancelPlan?(rawKey: string): boolean;
+
+    /** Read-only `/plan` diagnostic. Returns null when no plan exists. */
+    getPlanState?(rawKey: string): { mode: 'idle' | 'drafting' | 'approved'; hasPlan: boolean; objective?: string } | null;
+
+    listMcpServers?(): ReadonlyArray<{
+        readonly name: string;
+        readonly status: 'connected' | 'skipped' | 'failed' | 'disabled';
+        readonly reason?: string;
+        readonly toolCount?: number;
+    }>;
+    reloadMcp?(opts?: { evictCachedThreads?: boolean }): Promise<{
+        readonly connected: readonly string[];
+        readonly skipped: ReadonlyArray<{ name: string; reason: string }>;
+        readonly failed: ReadonlyArray<{ name: string; reason: string }>;
+        readonly evictedCachedThreads: boolean;
+    }>;
 }
 
-/** Filter options for `queryAllTasks`. All fields narrow the result set. */
 export interface TaskListFilter {
     readonly threadId?: string;
     readonly status?: ReadonlyArray<TaskStatusSummary['status']>;
-    /** Cap on the number of results (applied after sorting newest-first). */
+    /** Cap applied after sorting newest-first. */
     readonly limit?: number;
 }
 
-/** `TaskStatusSummary` plus the thread it ran in. */
 export interface AggregateTaskSummary extends TaskStatusSummary {
     readonly threadId: string;
 }
@@ -259,12 +242,7 @@ export interface ThreadStatusSnapshot {
     readonly entryAgent: string;
     readonly activeTasks: ReadonlyArray<TaskStatusSummary>;
     readonly recentTasks: ReadonlyArray<TaskStatusSummary>;
-    /**
-     * TODAY's token totals for this thread, drawn from state.db. Undefined
-     * when the agent layer hasn't wired token persistence or there's been
-     * no LLM activity yet today. `byModel` is the per-(provider, model)
-     * breakdown sorted heaviest first — capped so /status stays readable.
-     */
+    /** Today's token totals; `byModel` sorted heaviest first. */
     readonly tokens?: {
         readonly input: number;
         readonly output: number;
@@ -277,18 +255,12 @@ export interface ThreadStatusSnapshot {
             readonly calls: number;
         }>;
     };
-    /**
-     * Team roster — one entry per configured non-main agent. Lets /status
-     * show each worker at a glance (idle / running / disabled) and the
-     * task description when running. Main agent excluded — its state is
-     * the thread header.
-     */
+    /** One entry per non-main agent. Main agent excluded. */
     readonly team?: ReadonlyArray<TeamMemberStatus>;
 }
 
 export interface TeamMemberStatus {
     readonly name: string;
-    /** Static agent config mirrored so `/team` matches `flopsy team show`. */
     readonly role?: 'main' | 'worker' | string;
     readonly domain?: string;
     readonly model?: string;
@@ -300,9 +272,7 @@ export interface TeamMemberStatus {
         readonly language?: string;
         readonly programmaticToolCalling?: boolean;
     };
-    /** Domain/type from config — 'research', 'deep-research', 'analysis', etc. */
     readonly type: string;
-    /** From flopsy.json5: configured-off workers show as 'disabled'. */
     readonly enabled: boolean;
     readonly status: 'idle' | 'running' | 'disabled';
     /** Populated only when status === 'running'. */
@@ -311,11 +281,7 @@ export interface TeamMemberStatus {
         readonly description: string;
         readonly runningMs: number;
     };
-    /**
-     * Timestamp (ms epoch) of this worker's most recent task completion
-     * or failure. Undefined before the first delegation. /status uses it
-     * to render "idle · last active 43s ago" alongside bare "idle".
-     */
+    /** Timestamp of the most recent task completion or failure. */
     readonly lastActiveAt?: number;
 }
 

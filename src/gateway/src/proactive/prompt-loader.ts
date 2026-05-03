@@ -1,5 +1,4 @@
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
 import { resolvePromptPath, type PromptKind } from '@flopsy/shared';
 
 export type { PromptKind };
@@ -10,15 +9,9 @@ interface CacheEntry {
 }
 
 /**
- * Reads prompt files from the workspace, namespaced by schedule kind:
- *   heartbeat → <FLOPSY_HOME>/proactive/heartbeats/<file>
- *   cron      → <FLOPSY_HOME>/proactive/cron/<file>
- * Absolute paths bypass namespacing entirely (escape hatch).
- * Results are cached with a 60s TTL so edits propagate without restart.
- *
- * `baseDir` is retained for legacy callers that pass relative (un-kinded)
- * paths — new code should always pass `kind` and let the workspace util
- * resolve the path.
+ * Reads prompt files namespaced by schedule kind under
+ * `<FLOPSY_HOME>/proactive/<kind>/`. Absolute paths bypass namespacing.
+ * 60s TTL cache so edits propagate without restart.
  */
 export class PromptLoader {
     private readonly cache = new Map<string, CacheEntry>();
@@ -36,11 +29,16 @@ export class PromptLoader {
     }
 
     private async loadFile(filePath: string, kind?: PromptKind): Promise<string> {
+        // Relative paths require a kind to resolve under .flopsy/proactive/<kind>/.
+        if (!kind && !filePath.startsWith('/')) {
+            throw new Error(
+                `PromptLoader.loadFile: relative filePath "${filePath}" requires a PromptKind ` +
+                    `("heartbeat" or "cron") to resolve under .flopsy/proactive/<kind>/.`,
+            );
+        }
         const absPath = kind
             ? resolvePromptPath(filePath, kind)
-            : filePath.startsWith('/')
-              ? filePath
-              : join(this.baseDir, filePath);
+            : filePath;
 
         const cached = this.cache.get(absPath);
         if (cached && Date.now() - cached.loadedAt < this.ttlMs) {

@@ -26,9 +26,7 @@ const SCHEMA_STATEMENTS = [
     )`,
     `CREATE INDEX IF NOT EXISTS idx_proactive_reported_at
         ON proactive_reported(reported_at DESC)`,
-    // Runtime schedules — heartbeats + cron jobs created by the agent via the
-    // manage_schedule tool (vs. config-defined ones in flopsy.json5). Stored
-    // separately so editing flopsy.json5 doesn't blow them away.
+    // Schedules created at runtime, kept distinct from config-defined ones.
     `CREATE TABLE IF NOT EXISTS proactive_runtime_schedules (
         id TEXT PRIMARY KEY,
         kind TEXT NOT NULL,
@@ -60,13 +58,8 @@ export interface SimilarMatch {
 }
 
 /**
- * SQLite-backed store for proactive delivery history + reported-item tracking.
- * Separate from the JSON `StateStore` because deliveries carry binary embedding
- * vectors (3 KB each) that would balloon JSON rewrites, and because we want
- * ad-hoc queries ("what did we deliver for job X last month") without loading
- * the entire state into memory.
- *
- * Path: `<FLOPSY_HOME>/state/proactive.db` (separate from harness state.db).
+ * SQLite store for proactive delivery history + reported-item tracking.
+ * Path: `<FLOPSY_HOME>/state/proactive.db`.
  */
 export class ProactiveDedupStore {
     private readonly db: Database.Database;
@@ -81,6 +74,7 @@ export class ProactiveDedupStore {
     private readonly stmtListSchedules: Database.Statement;
     private readonly stmtGetSchedule: Database.Statement;
     private readonly stmtUpdateSchedule: Database.Statement;
+    private readonly stmtUpdateScheduleConfig: Database.Statement;
     private readonly stmtDeleteSchedule: Database.Statement;
     private closed = false;
 
@@ -123,7 +117,7 @@ export class ProactiveDedupStore {
         );
 
         this.stmtInsertSchedule = this.db.prepare(
-            `INSERT INTO proactive_runtime_schedules
+            `INSERT OR IGNORE INTO proactive_runtime_schedules
                 (id, kind, config_json, enabled, created_at, created_by_thread, created_by_agent)
              VALUES (?, ?, ?, ?, ?, ?, ?)`,
         );
@@ -142,14 +136,16 @@ export class ProactiveDedupStore {
             `UPDATE proactive_runtime_schedules
              SET enabled = ?, config_json = ? WHERE id = ?`,
         );
+        this.stmtUpdateScheduleConfig = this.db.prepare(
+            `UPDATE proactive_runtime_schedules
+             SET config_json = ? WHERE id = ?`,
+        );
         this.stmtDeleteSchedule = this.db.prepare(
             `DELETE FROM proactive_runtime_schedules WHERE id = ?`,
         );
 
         log.info({ path: dbPath }, 'proactive dedup store ready');
     }
-
-    // ── Runtime schedules ────────────────────────────────────────────────
 
     insertRuntimeSchedule(row: {
         id: string;
@@ -221,6 +217,14 @@ export class ProactiveDedupStore {
         return true;
     }
 
+    /** Preserves enabled / created_at / created_by_*. */
+    updateRuntimeScheduleConfig(id: string, config: unknown): boolean {
+        const existing = this.getRuntimeSchedule(id);
+        if (!existing) return false;
+        this.stmtUpdateScheduleConfig.run(JSON.stringify(config), id);
+        return true;
+    }
+
     deleteRuntimeSchedule(id: string): boolean {
         return this.stmtDeleteSchedule.run(id).changes > 0;
     }
@@ -230,10 +234,7 @@ export class ProactiveDedupStore {
         this.stmtInsertDelivery.run(source, content.slice(0, 4000), blob, Date.now());
     }
 
-    /**
-     * Fetch delivery history for one schedule (by source id). Newest-first.
-     * Backs `flopsy heartbeat|cron|webhook fires <id>`.
-     */
+    /** Newest-first. */
     listDeliveriesBySource(source: string, limit = 20): Array<{
         deliveredAt: number;
         content: string;
@@ -249,10 +250,6 @@ export class ProactiveDedupStore {
         return rows.map((r) => ({ deliveredAt: r.delivered_at, content: r.content }));
     }
 
-    /**
-     * Count deliveries since a cutoff, grouped by source. Backs the
-     * "24h funnel" numbers in `/status` + `flopsy status`.
-     */
     countDeliveriesSince(sinceMs: number): { total: number; bySource: Record<string, number> } {
         const stmt = this.db.prepare(
             `SELECT source, COUNT(*) as n FROM proactive_deliveries
@@ -268,10 +265,6 @@ export class ProactiveDedupStore {
         return { total, bySource };
     }
 
-    /**
-     * Scan deliveries within `windowMs` and return the best match whose cosine
-     * similarity exceeds `threshold`, or null if nothing qualifies.
-     */
     findSimilar(
         embedding: number[],
         threshold: number,
@@ -358,9 +351,8 @@ function floatsToBuffer(vec: number[]): Buffer {
 }
 
 function bufferToFloats(buf: Buffer): number[] {
-    // better-sqlite3 BLOB buffers aren't guaranteed to be 4-byte aligned, and
-    // Float32Array construction on an unaligned ArrayBuffer throws RangeError.
-    // Copy into a fresh buffer (whose ArrayBuffer is aligned) before reading.
+    // Float32Array on an unaligned ArrayBuffer throws RangeError; better-sqlite3
+    // BLOB buffers aren't guaranteed aligned, so copy into a fresh buffer first.
     const copy = Buffer.from(buf);
     const f32 = new Float32Array(copy.buffer, copy.byteOffset, copy.byteLength / 4);
     return Array.from(f32);

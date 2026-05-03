@@ -122,6 +122,7 @@ export class LineChannel extends BaseChannel implements WebhookChannel {
 
     async sendTyping(_peer: Peer): Promise<void> {}
 
+    // LINE has no bot-side reactions API (@line/bot-sdk 10.x).
     async react(_options: ReactionOptions): Promise<void> {}
 
     async handleWebhookEvent(event: {

@@ -1,6 +1,9 @@
-import { loadConfig, type FlopsyConfig, workspace } from '@flopsy/shared';
+import { loadConfig, type FlopsyConfig, workspace, copyPromptFile } from '@flopsy/shared';
 import { setDndFacade } from './commands/dnd-facade';
+import { setMcpFacade } from './commands/mcp-facade';
+import { setPlanFacade } from './commands/plan-facade';
 import { setSessionFacade } from './commands/session-facade';
+import { setCompactFacade } from './commands/compact-facade';
 import { runCleanup } from '@flopsy/shared';
 import type { Channel, Message, WebhookChannel } from '@gateway/types';
 import { isWebhookChannel } from '@gateway/types';
@@ -13,6 +16,7 @@ import { ProactiveEngine, type ProactiveEmbedder } from './proactive';
 import { buildAgentCaller } from './proactive/agent-bridge';
 import { OllamaEmbedder, type BaseChatModel } from 'flopsygraph';
 import { MgmtServer } from './mgmt/server';
+import { ChatHandler } from './mgmt/chat-handler';
 import { ConfigReloader, type ReloadRule, type ReloadHandlerContext } from './config-reload';
 import { getConfigPath } from '@flopsy/shared';
 import { WhatsAppChannel } from '@gateway/channels/whatsapp';
@@ -23,6 +27,7 @@ import { SignalChannel } from '@gateway/channels/signal';
 import { IMessageChannel } from '@gateway/channels/imessage';
 import { SlackChannel } from '@gateway/channels/slack';
 import { GoogleChatChannel } from '@gateway/channels/googlechat';
+import { ChatChannel } from '@gateway/channels/chat';
 
 export class FlopsyGateway extends BaseGateway {
     private webhookServer: WebhookServer | null = null;
@@ -33,6 +38,7 @@ export class FlopsyGateway extends BaseGateway {
     private configReloader: ConfigReloader | null = null;
     private agentHandler: AgentHandler | null = null;
     private structuredOutputModel: BaseChatModel | null = null;
+    private chatChannel: ChatChannel | null = null;
     private cfg: FlopsyConfig;
 
     constructor(config?: FlopsyConfig) {
@@ -50,15 +56,27 @@ export class FlopsyGateway extends BaseGateway {
         this.cfg = cfg;
         this.registerChannels(cfg);
 
-        if (cfg.proactive.webhooks.length > 0) {
+        // Always construct the WebhookRouter when the webhook server is
+        // enabled — even with an empty `webhooks: []` array. Without this,
+        // runtime adds via `flopsy webhook add` (or the agent's tool) have
+        // no router to register on, the engine's setWebhookRouter is
+        // never called, and persisted routes from proactive.db are never
+        // restored on boot. The previous gate (`webhooks.length > 0`)
+        // assumed all webhooks came from config — which broke once we
+        // shipped runtime registration.
+        if (cfg.webhook?.enabled) {
             this.registerExternalWebhooks(cfg.proactive.webhooks);
-            this.log.info(
-                {
-                    count: cfg.proactive.webhooks.length,
-                    names: cfg.proactive.webhooks.map((w) => w.name),
-                },
-                'external webhooks registered',
-            );
+            if (cfg.proactive.webhooks.length > 0) {
+                this.log.info(
+                    {
+                        count: cfg.proactive.webhooks.length,
+                        names: cfg.proactive.webhooks.map((w) => w.name),
+                    },
+                    'external webhooks registered',
+                );
+            } else {
+                this.log.info('webhook router ready (no config-defined routes; runtime adds welcome)');
+            }
         }
 
         this.logConfigSummary(cfg);
@@ -126,6 +144,10 @@ export class FlopsyGateway extends BaseGateway {
      */
     setStructuredOutputModel(model: BaseChatModel): void {
         this.structuredOutputModel = model;
+        // Propagate to the live router (and its existing workers) — the router is
+        // created in setAgentHandler which runs before this call in bootstrap, so
+        // workers created before this call would otherwise capture null forever.
+        this.router?.setStructuredOutputModel(model);
     }
 
     setAgentHandler(handler: AgentHandler): void {
@@ -139,12 +161,46 @@ export class FlopsyGateway extends BaseGateway {
             });
         }
 
+        // Wire /plan cancel facade — manual escape hatch for stuck plan
+        // state. cancelPlan + getPlanState are both optional on the
+        // AgentHandler interface, so older handlers (tests, stubs) that
+        // don't implement them cause the slash command to fall back to
+        // its forwardToAgent-only behaviour.
+        if (handler.cancelPlan && handler.getPlanState) {
+            setPlanFacade({
+                cancel: (rawKey) => handler.cancelPlan!(rawKey),
+                getState: (rawKey) => handler.getPlanState!(rawKey),
+            });
+        }
+
+        // Wire /compact facade — compact the peer's active session history
+        // into a single summary message. Optional on AgentHandler so test
+        // stubs that don't implement it cause the slash command to reply
+        // with "not available" rather than throwing.
+        if (handler.compactSession) {
+            setCompactFacade({
+                compact: (rawKey) => handler.compactSession!(rawKey),
+            });
+        }
+
+        // Wire /mcp facade — manual MCP loader pull for when an OAuth
+        // credential or env var was provisioned AFTER daemon boot. Both
+        // methods are optional on AgentHandler, so the slash command
+        // gracefully reports "MCP facade not wired" against test stubs.
+        if (handler.listMcpServers && handler.reloadMcp) {
+            setMcpFacade({
+                listServers: () => handler.listMcpServers!(),
+                reload: (opts) => handler.reloadMcp!(opts),
+            });
+        }
+
         this.router = new MessageRouter({
             agentHandler: handler,
             coalesceDelayMs: this.cfg.gateway.coalesceDelayMs,
             // The router stamps in its own `activeThreads` count; here we
             // just hand it everything the gateway uniquely knows.
             gatewaySnapshotFn: () => this.getStatusSnapshot(),
+            ...(this.structuredOutputModel ? { structuredOutputModel: this.structuredOutputModel } : {}),
         });
 
         for (const channel of this.channels.values()) {
@@ -241,6 +297,18 @@ export class FlopsyGateway extends BaseGateway {
 
     private registerChannels(cfg: FlopsyConfig): void {
         const { channels } = cfg;
+
+        // Chat channel is always registered — it serves the local `flopsy chat` TUI
+        // and is wired to the WS adapter in MgmtServer when mgmt is enabled.
+        this.chatChannel = new ChatChannel({ enabled: true, dmPolicy: 'open' });
+        // Surface the main agent's model in the WS `ready` event so the TUI
+        // status bar shows the actual model (no hardcoded fallback).
+        this.chatChannel.getMainModel = () => {
+            const main = cfg.agents.find((a) => (a.role ?? a.type) === 'main') ?? cfg.agents[0];
+            return main?.model;
+        };
+        this.register(this.chatChannel);
+        void this.chatChannel.connect();
 
         if (channels.whatsapp.enabled) {
             this.register(
@@ -414,6 +482,18 @@ export class FlopsyGateway extends BaseGateway {
         return { tasks };
     }
 
+    /**
+     * Tick the proactive presence tracker on every dedup-clean inbound user
+     * message. Without this hook, the engine's `lastMessageAt` stays at 0
+     * forever and every fire sees `activityWindow = 'away'` regardless of
+     * how active the user is. Best-effort — failures here must never break
+     * routing; the base class already wraps this call in a catch.
+     */
+    protected async onUserActivity(_message: Message): Promise<void> {
+        if (!this.proactiveEngine) return;
+        await this.proactiveEngine.recordUserActivity(Date.now());
+    }
+
     protected getProactiveHealth(): Record<string, unknown> {
         const { proactive } = this.cfg;
         const cron = this.proactiveEngine?.getCronTrigger();
@@ -483,8 +563,12 @@ export class FlopsyGateway extends BaseGateway {
         // by setting gateway.mgmt.enabled=false.
         const mgmtEnabled = this.cfg.gateway.mgmt?.enabled !== false;
         if (mgmtEnabled) {
+            // Explicit gateway.mgmt.port wins; fallback +2 instead of +1
+            // because +1 collides with webhook.port (also default 18790).
+            // CLI mgmtUrl uses the same +2 fallback so they agree without
+            // explicit config — both end up on 18791.
             const mgmtPort =
-                this.cfg.gateway.mgmt?.port ?? this.cfg.gateway.port + 1;
+                this.cfg.gateway.mgmt?.port ?? this.cfg.gateway.port + 2;
             const mgmtHost = this.cfg.gateway.mgmt?.host ?? '127.0.0.1';
             this.mgmtServer = new MgmtServer({
                 host: mgmtHost,
@@ -505,7 +589,7 @@ export class FlopsyGateway extends BaseGateway {
                             createdByAgent: r.createdByAgent,
                             config: safeParse(r.configJson),
                         })),
-                    create: (body) => {
+                    create: async (body) => {
                         if (!this.proactiveEngine) {
                             return { ok: false as const, error: 'proactive engine not running' };
                         }
@@ -549,6 +633,9 @@ export class FlopsyGateway extends BaseGateway {
                         return this.proactiveEngine.setQuietHoursUntil(body.untilMs);
                     },
                 },
+                chatHandler: this.chatChannel
+                    ? new ChatHandler(this.chatChannel, { token: process.env['FLOPSY_MGMT_TOKEN'] })
+                    : undefined,
             });
             try {
                 await this.mgmtServer.start();
@@ -591,6 +678,8 @@ export class FlopsyGateway extends BaseGateway {
                     if (!live) return null;
                     return { channelName: live.channelName, peer: live.peer };
                 },
+                similarityThreshold: proactive.similarityThreshold,
+                similarityWindowMs: proactive.similarityWindowMs,
                 ...(embedder ? { embedder } : {}),
                 ...(this.structuredOutputModel
                     ? { structuredOutputModel: this.structuredOutputModel }
@@ -626,7 +715,7 @@ export class FlopsyGateway extends BaseGateway {
                     return ch.send({ peer, body: text });
                 },
                 agentHandler
-                    ? buildAgentCaller(agentHandler)
+                    ? buildAgentCaller(agentHandler, this.structuredOutputModel)
                     : async (message) => {
                           this.log.warn(
                               { message: message.slice(0, 80) },
@@ -677,6 +766,7 @@ export class FlopsyGateway extends BaseGateway {
             // isn't configured — runtime webhook adds then 400 gracefully.
             if (this.webhookRouter) {
                 this.proactiveEngine.setWebhookRouter(this.webhookRouter);
+                this.proactiveEngine.seedConfigWebhooks(this.cfg.proactive.webhooks);
             }
 
             // Wire DND facade so /dnd slash + `flopsy dnd` CLI can reach the
@@ -828,8 +918,8 @@ export class FlopsyGateway extends BaseGateway {
 
     protected async onStop(): Promise<void> {
         // Run all registered cleanup functions in parallel first (subsystems
-        // that called registerCleanup() during startup — FactConsolidator,
-        // awaySummary abort controller, etc.).
+        // that called registerCleanup() during startup — abort controllers,
+        // background workers, etc.).
         await runCleanup().catch((err: unknown) => {
             this.log.warn({ err }, 'one or more cleanup handlers failed');
         });
@@ -965,10 +1055,10 @@ function safeParse(s: string): unknown {
  * required fields but doesn't lock down the full zod schema here since the
  * engine already validates. Mirrors the shape of the manage_schedule tool.
  */
-function handleMgmtScheduleCreate(
+async function handleMgmtScheduleCreate(
     engine: ProactiveEngine,
     rawBody: unknown,
-): { ok: true; id: string; message: string } | { ok: false; error: string } {
+): Promise<{ ok: true; id: string; message: string } | { ok: false; error: string }> {
     const body = (rawBody ?? {}) as Record<string, unknown>;
     const kind = body['kind'] as string | undefined;
     const createdBy = (body['createdBy'] ?? {}) as {
@@ -986,13 +1076,34 @@ function handleMgmtScheduleCreate(
         if (!body['prompt'] && !body['promptFile']) {
             return { ok: false, error: 'heartbeat requires `prompt` or `promptFile`' };
         }
+        const hbId = (body['id'] as string | undefined) ?? `runtime-hb-${body['name'] as string}`;
+        // Copy the user-supplied prompt file into .flopsy/proactive/heartbeats/
+        // so the schedule owns its copy. Without this, the loader tries to
+        // resolve the source path against the workspace directory at fire
+        // time and the file isn't there. The agent's `manage_schedule` tool
+        // path already does this; the CLI/mgmt-server path was skipping it.
+        let resolvedPromptFile: string | undefined;
+        if (typeof body['promptFile'] === 'string' && body['promptFile']) {
+            try {
+                resolvedPromptFile = await copyPromptFile(
+                    body['promptFile'] as string,
+                    hbId,
+                    'heartbeat',
+                );
+            } catch (err) {
+                return {
+                    ok: false,
+                    error: `prompt-file copy failed: ${err instanceof Error ? err.message : String(err)}`,
+                };
+            }
+        }
         const hb = {
-            id: (body['id'] as string | undefined) ?? `runtime-hb-${body['name'] as string}`,
+            id: hbId,
             name: body['name'] as string,
             enabled: true,
             interval: body['interval'] as string,
             prompt: (body['prompt'] as string | undefined) ?? '',
-            promptFile: body['promptFile'] as string | undefined,
+            promptFile: resolvedPromptFile,
             deliveryMode: (body['deliveryMode'] as 'always' | 'conditional' | 'silent' | undefined) ?? 'always',
             oneshot: body['oneshot'] === true,
             activeHours: body['activeHours'] as { start: number; end: number } | undefined,
@@ -1014,6 +1125,22 @@ function handleMgmtScheduleCreate(
         const id =
             (body['id'] as string | undefined) ??
             `runtime-cron-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        // Same file-copy path as the heartbeat branch above. Same reason.
+        let resolvedCronPromptFile: string | undefined;
+        if (typeof body['promptFile'] === 'string' && body['promptFile']) {
+            try {
+                resolvedCronPromptFile = await copyPromptFile(
+                    body['promptFile'] as string,
+                    id,
+                    'cron',
+                );
+            } catch (err) {
+                return {
+                    ok: false,
+                    error: `prompt-file copy failed: ${err instanceof Error ? err.message : String(err)}`,
+                };
+            }
+        }
         const job = {
             id,
             name: (body['name'] as string | undefined) ?? id,
@@ -1023,7 +1150,7 @@ function handleMgmtScheduleCreate(
                 message:
                     (body['message'] as string | undefined) ??
                     (body['prompt'] as string | undefined),
-                promptFile: body['promptFile'] as string | undefined,
+                promptFile: resolvedCronPromptFile,
                 deliveryMode: (body['deliveryMode'] as 'always' | 'conditional' | 'silent' | undefined) ?? 'always',
                 oneshot: body['oneshot'] === true,
                 threadId: body['threadId'] as string | undefined,
@@ -1052,13 +1179,43 @@ function handleMgmtScheduleCreate(
         if (typeof body['targetChannel'] !== 'string' || !body['targetChannel']) {
             return { ok: false, error: 'webhook requires `targetChannel` (channel name that receives the event)' };
         }
+        // When the caller provides a `secret` without a `signature` config,
+        // default to GitHub's HMAC-SHA256 hex format (`sha256=<hex>` in
+        // `X-Hub-Signature-256`). Without this default, the per-route
+        // verifier in webhook-router.ts:152 skips signature checking
+        // entirely (`if (!cfg.secret || !cfg.signature) return true`),
+        // making `--secret` dead code for runtime-added webhooks.
+        // Most webhook sources we care about (GitHub, GitLab, Stripe with
+        // a translation, Linear, Sentry) use this exact shape; non-default
+        // sources can override via the agent's `manage_schedule` tool
+        // which accepts an explicit `signature` object.
+        const githubDefaultSignature = {
+            header: 'x-hub-signature-256',
+            algorithm: 'sha256' as const,
+            format: 'hex' as const,
+            prefix: 'sha256=',
+        };
         const cfg = {
             name: body['name'] as string,
             path: body['path'] as string,
             targetChannel: body['targetChannel'] as string,
-            ...(typeof body['secret'] === 'string' ? { secret: body['secret'] as string } : {}),
+            ...(typeof body['targetThread'] === 'string' && body['targetThread']
+                ? { targetThread: body['targetThread'] as string }
+                : {}),
+            ...(typeof body['secret'] === 'string'
+                ? {
+                    secret: body['secret'] as string,
+                    signature: (body['signature'] as Record<string, unknown> | undefined) ?? githubDefaultSignature,
+                }
+                : {}),
             ...(typeof body['eventTypeHeader'] === 'string'
                 ? { eventTypeHeader: body['eventTypeHeader'] as string }
+                : {}),
+            ...(Array.isArray(body['filterActions']) && (body['filterActions'] as unknown[]).length > 0
+                ? { filterActions: (body['filterActions'] as unknown[]).map(String) }
+                : {}),
+            ...(typeof body['deliveryMode'] === 'string' && body['deliveryMode'] !== 'always'
+                ? { deliveryMode: body['deliveryMode'] as 'conditional' | 'silent' }
                 : {}),
         };
         const ok = engine.addRuntimeWebhook(cfg, createdBy);

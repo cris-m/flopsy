@@ -114,28 +114,36 @@ describe('createWorkspace', () => {
         const ws = createWorkspace({ FLOPSY_HOME: '/my/home' });
 
         expect(ws.root()).toBe('/my/home');
+
+        // config/
+        expect(ws.config()).toBe('/my/home/config');
+        expect(ws.config('SOUL.md')).toBe('/my/home/config/SOUL.md');
+        expect(ws.configFile()).toBe('/my/home/config/flopsy.json5');
+
+        // content/
+        expect(ws.content()).toBe('/my/home/content');
+        expect(ws.skills()).toBe('/my/home/content/skills');
+        expect(ws.roles()).toBe('/my/home/content/roles');
+        expect(ws.prompts()).toBe('/my/home/content/prompts');
+        expect(ws.prompts('cron', 'morning.md')).toBe('/my/home/content/prompts/cron/morning.md');
+
+        // state/
         expect(ws.state()).toBe('/my/home/state');
         expect(ws.state('proactive.json')).toBe('/my/home/state/proactive.json');
-        expect(ws.sessions()).toBe('/my/home/sessions');
-        expect(ws.sessions('telegram')).toBe('/my/home/sessions/telegram');
-        expect(ws.prompts()).toBe('/my/home/prompts');
-        expect(ws.credentials()).toBe('/my/home/credentials');
-        expect(ws.credentials('key.pem')).toBe('/my/home/credentials/key.pem');
-        expect(ws.logs()).toBe('/my/home/logs');
-        expect(ws.memory()).toBe('/my/home/memory');
-        expect(ws.checkpoints()).toBe('/my/home/checkpoints');
+        expect(ws.memoryDb()).toBe('/my/home/state/memory.db');
+        expect(ws.checkpointsDb()).toBe('/my/home/state/checkpoints.db');
+        expect(ws.learningDb()).toBe('/my/home/state/learning.db');
+
+        // cache/
         expect(ws.cache()).toBe('/my/home/cache');
         expect(ws.cache('thumb.png')).toBe('/my/home/cache/thumb.png');
-        expect(ws.agents()).toBe('/my/home/agents');
-        expect(ws.skills()).toBe('/my/home/skills');
-        expect(ws.learning()).toBe('/my/home/learning');
-        expect(ws.data()).toBe('/my/home/data');
-        expect(ws.data('agent', 'state.json')).toBe('/my/home/data/agent/state.json');
-        expect(ws.dataAgent()).toBe('/my/home/data/agent');
-        expect(ws.dataCheckpoints()).toBe('/my/home/data/checkpoints');
-        expect(ws.config()).toBe('/my/home/config.json5');
-        expect(ws.storeDb()).toBe('/my/home/store.db');
-        expect(ws.checkpointsDb()).toBe('/my/home/checkpoints.db');
+        expect(ws.toolOutputs()).toBe('/my/home/cache/tool-outputs');
+        expect(ws.workerOutputs()).toBe('/my/home/cache/worker-outputs');
+
+        // auth + runtime
+        expect(ws.auth()).toBe('/my/home/auth');
+        expect(ws.auth('key.pem')).toBe('/my/home/auth/key.pem');
+        expect(ws.logs()).toBe('/my/home/logs');
         expect(ws.pidFile()).toBe('/my/home/gateway.pid');
     });
 

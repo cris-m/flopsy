@@ -1,18 +1,9 @@
-/**
- * Shared config-file reader for the ops commands. All of `status`,
- * `team`, `cron`, `heartbeat`, `webhook` need to peek at the same
- * `flopsy.json5` — this module caches + validates the read so each
- * subcommand stays tiny.
- *
- * Honours FLOPSY_CONFIG override to match `mcp/commands.ts`.
- */
-
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { dirname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { config as dotenv } from 'dotenv';
 import JSON5 from 'json5';
-import { primeFlopsyHome } from '@flopsy/shared';
+import { primeFlopsyHome, resolveFlopsyHome, seedWorkspaceTemplates } from '@flopsy/shared';
 
 export interface RawFlopsyConfig {
     agents?: ReadonlyArray<RawAgent>;
@@ -127,14 +118,8 @@ export interface RawWebhook {
     secret?: string;
 }
 
-/**
- * Walk up from `start` looking for one of the candidate filenames.
- * Mirrors how git finds the repo root — lets users run `flopsy` from any
- * subdirectory of their project.
- */
 function findUp(start: string, candidates: readonly string[]): string | null {
     let dir = start;
-    // `dirname('/')` returns '/' on POSIX and 'C:\\' on Windows — both stop here.
     for (;;) {
         for (const name of candidates) {
             const candidate = resolve(dir, name);
@@ -211,7 +196,20 @@ function warnOnDuplicateEnvKeys(envPath: string): void {
  */
 export function bootstrapCli(): void {
     try {
-        ensureEnvLoaded(dirname(configPath()));
+        // Step 1 — find the repo by a marker that doesn't depend on env
+        // vars (`src/team/templates/`), then load `.env` from there. This
+        // populates FLOPSY_HOME in process.env BEFORE any FLOPSY_HOME-aware
+        // path resolution runs. Without this, `configPath()` falls back to
+        // `~/.flopsy/flopsy.json5` and the seeder writes templates into
+        // your home directory instead of the project's `.flopsy/`.
+        if (primeFromRepoRoot()) return;
+
+        // Step 2 — fallback for environments where the CLI is not running
+        // from inside a flopsybot repo (npm-linked install elsewhere etc.).
+        // Use the legacy config-then-dirname path; `projectRootFromConfigPath`
+        // strips a trailing `/.flopsy` so a workspace that already exists is
+        // honoured.
+        ensureEnvLoaded(projectRootFromConfigPath(configPath()));
     } catch {
         /* no config discoverable — commands that need it will tell the user */
     }
@@ -234,35 +232,161 @@ function cliInstallDir(): string {
 }
 
 /**
+ * Filenames searched at every level of the upward walk. Workspace-canonical
+ * location is `.flopsy/config/flopsy.json5`; the bare `flopsy.json5`
+ * fallback at the bottom catches developer-style setups (running the tool
+ * from inside a repo dir that has its own config).
+ */
+const CONFIG_CANDIDATES = [
+    '.flopsy/config/flopsy.json5',
+    '.flopsy/config/flopsy.json',
+    'flopsy.json5',
+    'flopsy.json',
+] as const;
+
+/**
+ * Given a discovered config path return the directory that owns the project
+ * (the place `.env` lives, what `primeFlopsyHome` should anchor to, what
+ * `npm start` should be spawned from). For workspace-canonical paths we
+ * strip the trailing `/.flopsy/config` segment; for repo-local configs
+ * we just take dirname.
+ *
+ * EXPORTED — multiple CLI commands need the repo root, not the config dir.
+ */
+export function projectRootFromConfigPath(configPath: string): string {
+    let dir = dirname(configPath);
+    // <root>/.flopsy/config/flopsy.json5 → strip /config then /.flopsy
+    if (dir.endsWith(`${sep}config`) || dir === 'config' || dir.endsWith('/config')) {
+        dir = dirname(dir);
+    }
+    if (dir.endsWith(`${sep}.flopsy`) || dir === '.flopsy' || dir.endsWith('/.flopsy')) {
+        return dirname(dir);
+    }
+    return dir;
+}
+
+/**
+ * Convenience: project root for the currently-discovered config. Use this
+ * everywhere that previously did `dirname(configPath())`.
+ */
+export function projectRoot(): string {
+    return projectRootFromConfigPath(configPath());
+}
+
+/**
  * Resolve the absolute config path. Priority:
  *   1. `FLOPSY_CONFIG` env var (explicit override)
- *   2. Walk up from cwd — lets users target a specific repo by cd'ing in
- *   3. Walk up from the CLI's install location — so `flopsy` works from
+ *   2. `FLOPSY_HOME/config/flopsy.json5` (when FLOPSY_HOME is set absolutely)
+ *   3. Walk up from cwd — lets users target a specific repo by cd'ing in.
+ *   4. Walk up from the CLI's install location — so `flopsy` works from
  *      any cwd, always finding the repo it was linked from
- *   4. Fallback: `<cwd>/flopsy.json5` (so error messages stay useful)
+ *   5. Fallback: `<HOME>/config/flopsy.json5` (so error messages stay useful)
  */
 export function configPath(): string {
     const env = process.env['FLOPSY_CONFIG'];
     if (env) return resolve(env);
-    const fromCwd = findUp(process.cwd(), ['flopsy.json5', 'flopsy.json']);
+
+    const homeAbs = resolveFlopsyHome();
+    for (const name of ['flopsy.json5', 'flopsy.json']) {
+        const candidate = resolve(homeAbs, 'config', name);
+        if (existsSync(candidate)) return candidate;
+    }
+
+    const fromCwd = findUp(process.cwd(), CONFIG_CANDIDATES);
     if (fromCwd) return fromCwd;
-    const fromInstall = findUp(cliInstallDir(), ['flopsy.json5', 'flopsy.json']);
+    const fromInstall = findUp(cliInstallDir(), CONFIG_CANDIDATES);
     if (fromInstall) return fromInstall;
-    return resolve(process.cwd(), 'flopsy.json5');
+    return resolve(homeAbs, 'config', 'flopsy.json5');
+}
+
+/**
+ * Walk up from `start` looking for the FlopsyBot repo root — the directory
+ * that owns `src/team/templates/`. Used by:
+ *   1. The self-healing seed step (workspace has no flopsy.json5 yet → we
+ *      copy from this repo's bundled template).
+ *   2. Early `.env` discovery: we MUST load `.env` before reading
+ *      `FLOPSY_HOME`, but `configPath()` reads FLOPSY_HOME first, which is
+ *      circular. Finding the repo by a template marker breaks the cycle —
+ *      it doesn't need any env vars to be set.
+ */
+function findRepoRootWithTemplates(start: string): string | null {
+    let dir = start;
+    for (;;) {
+        if (existsSync(resolve(dir, 'src', 'team', 'templates', 'flopsy.json5'))) {
+            return dir;
+        }
+        const parent = dirname(dir);
+        if (parent === dir) return null;
+        dir = parent;
+    }
+}
+
+/**
+ * Discover the repo root and load its `.env` BEFORE any FLOPSY_HOME-aware
+ * lookup runs. Idempotent — safe to call from both `bootstrapCli` and
+ * `readFlopsyConfig`. Returns the repo root if found, null otherwise.
+ *
+ * Without this, `configPath()` runs with an unprimed `process.env`,
+ * `resolveFlopsyHome()` defaults to `~/.flopsy`, and the self-heal seeder
+ * writes the bundled templates into `~/.flopsy/` instead of the project's
+ * `<repo>/.flopsy/`.
+ */
+function primeFromRepoRoot(): string | null {
+    const repoRoot =
+        findRepoRootWithTemplates(process.cwd()) ??
+        findRepoRootWithTemplates(cliInstallDir());
+    if (!repoRoot) return null;
+    // ensureEnvLoaded both loads `.env` and calls `primeFlopsyHome`, so
+    // after this returns process.env.FLOPSY_HOME is the absolute path
+    // (relative `.flopsy` anchored against the repo root).
+    ensureEnvLoaded(repoRoot);
+    return repoRoot;
 }
 
 export function readFlopsyConfig(): { path: string; config: RawFlopsyConfig } {
-    const path = configPath();
+    // Always prime from the repo root first — guarantees FLOPSY_HOME is
+    // populated from `.env` before configPath() runs. Without this,
+    // resolveFlopsyHome() defaults to `~/.flopsy` and we end up looking
+    // for the config in the user's home dir even when their project's
+    // `.env` says FLOPSY_HOME=.flopsy.
+    const earlyRepoRoot = primeFromRepoRoot();
+
+    let path = configPath();
+
+    // Self-heal: a brand-new install (or a workspace someone just deleted)
+    // has no flopsy.json5. Seed from the repo's bundled templates before
+    // erroring. `npm start` does the same in main.ts; doing it here too
+    // means `flopsy run start` works on a fresh checkout.
+    if (!existsSync(path)) {
+        const repoRoot =
+            earlyRepoRoot ??
+            findRepoRootWithTemplates(process.cwd()) ??
+            findRepoRootWithTemplates(cliInstallDir());
+        if (repoRoot) {
+            const templatesDir = resolve(repoRoot, 'src', 'team', 'templates');
+            // primeFromRepoRoot above already called primeFlopsyHome —
+            // calling again is idempotent but ensures the right anchor
+            // when this branch runs without an earlyRepoRoot.
+            primeFlopsyHome(repoRoot);
+            seedWorkspaceTemplates(templatesDir);
+            // Re-resolve — the seed may have created `.flopsy/flopsy.json5`
+            // for the first time, in which case the FLOPSY_HOME-first
+            // lookup will find it now.
+            path = configPath();
+        }
+    }
+
     if (!existsSync(path)) {
         throw new Error(
-            `Cannot find flopsy.json5 (searched from ${process.cwd()} upward). ` +
-                `Set FLOPSY_CONFIG=/path/to/flopsy.json5 or cd into a FlopsyBot project.`,
+            `Cannot find flopsy.json5 (searched .flopsy/flopsy.json5 and flopsy.json5 from ${process.cwd()} upward). ` +
+                `Set FLOPSY_HOME=/path/to/.flopsy or FLOPSY_CONFIG=/path/to/flopsy.json5, or cd into a FlopsyBot project.`,
         );
     }
-    // Load sibling .env so $VAR expansion + FLOPSY_HOME etc. work the
-    // same as `npm start` does. Must happen before we parse the JSON5
-    // in case the file references env vars.
-    ensureEnvLoaded(dirname(path));
+    // Load `.env` from the PROJECT ROOT (not the config dir) — when the
+    // config lives in `.flopsy/`, `.env` still belongs to the project root.
+    // primeFlopsyHome runs against the project root too so a relative
+    // `FLOPSY_HOME=.flopsy` anchors correctly.
+    ensureEnvLoaded(projectRootFromConfigPath(path));
     const raw = readFileSync(path, 'utf-8');
     const config = JSON5.parse(raw) as RawFlopsyConfig;
     return { path, config };
