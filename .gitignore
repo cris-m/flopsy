@@ -64,3 +64,4 @@ tmp/
 .claude/
 flopsy-server/
 test-project/
+prompts/
