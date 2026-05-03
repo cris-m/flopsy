@@ -3,15 +3,10 @@ import type { BaseChatModel, ChatMessage, Interceptor } from 'flopsygraph';
 
 const log = createLogger('compactor');
 
-// Three thresholds (SpaceBot pattern). Hit any one → that tier's action.
-// Defaults match SpaceBot's CompactionConfig: 80 / 85 / 95 percent.
 const DEFAULT_BACKGROUND_THRESHOLD = 0.80;   // LLM summary, drop oldest 30%
 const DEFAULT_AGGRESSIVE_THRESHOLD = 0.85;   // no LLM, drop oldest 50%
 const DEFAULT_EMERGENCY_THRESHOLD  = 0.95;   // no LLM, hard truncate
 
-// Conservative default. Most providers we use have 200k+, but Sonnet 4.6
-// for example is 200k. The actual model's context window varies — wire
-// the real value via config when the model is known.
 const DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000;
 
 // Always preserve at least this many recent messages — the user's last

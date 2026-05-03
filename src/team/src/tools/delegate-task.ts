@@ -1,23 +1,3 @@
-/**
- * delegate_task — synchronous delegation to a named teammate.
- *
- * Blocks the leader's current turn until the teammate returns. Use for focused
- * sub-tasks that complete in under ~2 minutes and whose result you need
- * before you can answer the user ("summarise this before I reply",
- * "validate this JSON and tell me what's wrong"). For anything longer or
- * any task where the user shouldn't wait, use `spawn_background_task`.
- *
- * Returns the teammate's final text. On timeout / abort / failure, returns
- * a diagnostic string — never throws into the turn, so the leader stays
- * alive and can fall back to answering directly.
- *
- * Wiring contract (shared with spawn_background_task):
- *   ctx.configurable.registry       — TaskRegistry instance
- *   ctx.configurable.buildSubAgent  — SubAgentFactory
- *   ctx.configurable.depth          — 0 for main agent, 1 for teammate
- *   ctx.configurable.signal?        — parent turn's AbortSignal (optional)
- */
-
 import { z } from 'zod';
 import { defineTool } from 'flopsygraph';
 import {
@@ -32,12 +12,7 @@ import type {
 } from './spawn-background-task';
 import { MAX_DELEGATION_DEPTH } from './spawn-background-task';
 
-// ---------------------------------------------------------------------------
-// Public contract
-// ---------------------------------------------------------------------------
-
-// Blocks the leader's turn, so it can't exceed channel-worker's
-// BACKGROUND_TURN_TIMEOUT_MS (currently 15min). Keep a safety buffer.
+// Cap aligns with channel-worker's BACKGROUND_TURN_TIMEOUT_MS (15 min) minus jitter buffer.
 export const DEFAULT_DELEGATE_TIMEOUT_MS = 180_000; // 3 min — typical focused sub-task
 export const MAX_DELEGATE_TIMEOUT_MS = 900_000; // 15 min — cap matching retrigger turn
 
@@ -46,10 +21,6 @@ export type DelegateTaskConfigurable = Pick<
     SpawnBackgroundTaskConfigurable,
     'registry' | 'buildSubAgent' | 'depth' | 'logger'
 >;
-
-// ---------------------------------------------------------------------------
-// Schema
-// ---------------------------------------------------------------------------
 
 const schema = z.object({
     worker: z
@@ -68,7 +39,14 @@ const schema = z.object({
         .record(z.unknown())
         .optional()
         .describe(
-            'Structured key→value context block injected before the task string. Use to pass known facts (user_email, date_range, prior_findings…) without embedding them in free-form prose. Example: { user_timezone: "Europe/Paris", target_repo: "org/repo" }.',
+            'Structured key→value context block injected before the task string. ' +
+            'Values may be strings, numbers, booleans, or ARRAYS of those — use a real ' +
+            'JSON array for lists, never inline multiple bare strings. ' +
+            'Example with a single value:  { "user_timezone": "Europe/Paris" }. ' +
+            'Example with an array value:  { "focus_areas": ["AI", "startups", "dev tools"] }. ' +
+            'Example mixed:                { "date": "2026-04-28", "topics": ["x", "y"], "max_results": 5 }. ' +
+            'Use to pass known facts (user_email, date_range, prior_findings, …) without ' +
+            'embedding them in free-form prose.',
         ),
     outputFormat: z
         .string()
@@ -80,7 +58,10 @@ const schema = z.object({
         .array(z.string())
         .optional()
         .describe(
-            'Optional allowlist of tool names the teammate may use. Defaults to the teammate\'s configured toolsets.',
+            'Optional ARRAY of tool-name strings the teammate may use. ' +
+            'Always pass a JSON array, never a bare string. ' +
+            'Examples: ["web_search"], ["web_search", "web_extract"]. ' +
+            'Defaults to the teammate\'s configured toolsets.',
         ),
     timeoutMs: z
         .number()
@@ -96,10 +77,6 @@ const schema = z.object({
 });
 
 type DelegateArgs = z.infer<typeof schema>;
-
-// ---------------------------------------------------------------------------
-// Tool
-// ---------------------------------------------------------------------------
 
 export const delegateTaskTool = defineTool({
     name: 'delegate_task',
@@ -124,6 +101,27 @@ export const delegateTaskTool = defineTool({
         'The teammate has NO memory of this conversation — pack context into the task string.',
         'The teammate CANNOT delegate further (max depth = 1).',
         'If the user should not wait, OR the task could take >2 min: use spawn_background_task instead.',
+        '',
+        'PARALLELISM — call multiple delegates in one turn when tasks are independent:',
+        '  Bad:  delegate_task(legolas, "fetch X") → wait → delegate_task(legolas, "fetch Y")',
+        '  Good: emit BOTH delegate_task calls in the SAME assistant turn.',
+        '  Concrete: "validate this JSON AND look up the schema spec" → 2× delegate_task in parallel,',
+        '  not serialized.',
+        '',
+        'BIG FAN-OUT — when you have many (5+) similar items needing the same worker,',
+        'use execute_code with use_tools=true and call parallel_map() inside the sandbox:',
+        '  results = parallel_map("legolas", [f"summarise issue #{i}" for i in range(20)])',
+        'That runs up to 5 delegations concurrently and returns a list — you only see the',
+        'final array in your context, intermediate worker outputs stay isolated.',
+        '',
+        'WORKER REPLY OFFLOAD — long worker replies (>1.5KB) are auto-saved to',
+        '`.flopsy/worker-outputs/<file>.md` and folded down to a header + 800-char preview.',
+        'If you need the full reply, use read_file with the path the handoff header gives you.',
+        '',
+        'ERROR RECOVERY — first attempt failing is data, not a stop:',
+        '  - Worker timed out: spawn a SECOND worker on the same task in parallel; race them.',
+        '  - Worker returned partial / wrong: retry once with a tightened prompt that addresses the failure.',
+        '  - After 2 attempts: surface what you tried + what you got, ask the user what they want to try.',
     ].join('\n'),
     schema,
     execute: async (args, ctx) => {
@@ -133,9 +131,6 @@ export const delegateTaskTool = defineTool({
 
         const { registry, buildSubAgent, depth, logger } = wiring;
 
-        // Lifecycle INFO — an operator reading logs wants to see that the
-        // main agent decided to delegate, to whom, for what. Truncate task
-        // text to 160 chars so the log line stays scannable.
         const taskPreview = args.task.length > 160
             ? args.task.slice(0, 157) + '…'
             : args.task;
@@ -163,10 +158,6 @@ export const delegateTaskTool = defineTool({
     },
 });
 
-// ---------------------------------------------------------------------------
-// Internals
-// ---------------------------------------------------------------------------
-
 interface Wiring {
     registry: TaskRegistry;
     buildSubAgent: SubAgentFactory;
@@ -189,10 +180,6 @@ function validateWiring(cfg: Partial<DelegateTaskConfigurable>): Wiring | string
     };
 }
 
-/**
- * Merge structured `context` + `outputFormat` fields into the task string
- * so the worker receives a single clean prompt with no parsing guesswork.
- */
 function buildTaskPrompt(args: DelegateArgs): string {
     const parts: string[] = [args.task];
     if (args.context && Object.keys(args.context).length > 0) {
@@ -207,12 +194,6 @@ function buildTaskPrompt(args: DelegateArgs): string {
     return parts.join('');
 }
 
-/**
- * Run the teammate inline. The leader's current turn stays blocked until
- * either (a) the teammate resolves, (b) the timeout fires, or (c) the
- * parent turn's AbortSignal fires. In (b) or (c), we abort the teammate's
- * whole controller so its sub-work cleans up.
- */
 async function runInline(
     args: DelegateArgs,
     deps: {
@@ -224,10 +205,7 @@ async function runInline(
     },
 ): Promise<string> {
     const { registry, runner, depth, logger, parentSignal } = deps;
-    // Enforce a minimum — models sometimes pass 30s which is never enough
-    // for a worker that needs model inference + tool calls.
-    const MIN_DELEGATE_TIMEOUT_MS = 60_000;
-    const timeoutMs = Math.max(args.timeoutMs ?? DEFAULT_DELEGATE_TIMEOUT_MS, MIN_DELEGATE_TIMEOUT_MS);
+    const timeoutMs = args.timeoutMs ?? DEFAULT_DELEGATE_TIMEOUT_MS;
 
     const task = createTeammateTask({
         id: registry.nextId('teammate'),
@@ -242,13 +220,10 @@ async function runInline(
     const whole = task.abortPair!.whole;
     const startedAt = Date.now();
 
-    // Link parent turn's abort → teammate's whole controller so a user
-    // "stop" on the leader propagates to the delegate.
     const unlinkParent = parentSignal
         ? linkSignal(parentSignal, () => whole.abort())
         : undefined;
 
-    // Arm the timeout.
     const timer: NodeJS.Timeout = setTimeout(() => whole.abort(), timeoutMs);
 
     try {
@@ -305,11 +280,6 @@ async function runInline(
     }
 }
 
-/**
- * Register `onAbort` as a once-only listener on `signal`. Returns a cleanup
- * function that removes the listener (avoids leaks when the delegate
- * resolves before the parent aborts).
- */
 function linkSignal(signal: AbortSignal, onAbort: () => void): () => void {
     if (signal.aborted) {
         onAbort();

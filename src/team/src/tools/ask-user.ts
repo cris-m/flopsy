@@ -1,43 +1,3 @@
-/**
- * ask_user — pause the agent's turn and ask the user a specific question.
- *
- * Ported in spirit from Claude Code's `AskUserQuestionTool` and Hermes's
- * `clarify_tool`, adapted for multi-channel delivery:
- *
- *   - On Telegram/Discord (buttons capability): renders the options as an
- *     inline keyboard / message components. User taps one → synthesized
- *     user-message with body=value comes back next turn.
- *   - On text-only channels (SMS, WhatsApp basic, iMessage): renders as a
- *     numbered prompt ("Reply with a number: 1. Python 2. Go 3. Other").
- *     User replies with the number or text → fresh turn.
- *
- * Design choices vs. the claude-code implementation:
- *   - SINGLE question per call (not 1-4 batched) — stacking button sets on
- *     mobile hurts more than it helps. One question per turn reads better.
- *   - NO `preview` field — button UIs don't render rich artifacts.
- *   - ALWAYS-on "Other" option (unless allowOther=false) — gives the user
- *     a free-text escape hatch matching claude-code's behaviour.
- *   - STRUCTURED result string describing the pending state so the agent
- *     knows the next user message is an answer to this question.
- *
- * What makes this distinct from `send_message` with `buttons`?
- *
- *   `send_message(buttons)` is a fire-and-continue surface. The agent keeps
- *   tools ready for whatever the user does next.
- *
- *   `ask_user` is a fire-and-STOP surface. The description + role delta
- *   explicitly teach the agent: "after this, your turn ends — you will
- *   resume with the user's answer as their next message." Semantics change,
- *   not plumbing.
- *
- * Wiring contract (from ctx.configurable):
- *   - onReply(text, options)        — channel-scoped delivery (same as send_message)
- *   - setDidSendViaTool()           — so the closing .messages[-1] isn't echoed
- *   - channelName, channelCapabilities (read-only) — informational; model
- *     already sees these via runtime block. The tool uses channelCapabilities
- *     to decide whether to attach buttons or fall back to text.
- */
-
 import { z } from 'zod';
 import { defineTool } from 'flopsygraph';
 
@@ -63,12 +23,6 @@ export interface AskUserConfigurable {
     channelCapabilities?: readonly string[];
 }
 
-/**
- * Literal value the auto-appended "Other" button carries. Kept stable so
- * the role delta can match on it if we ever need to branch on "user chose
- * Other" in the future. Namespaced to avoid collisions with real option
- * values.
- */
 const OTHER_VALUE = '__other__';
 
 export const askUserTool = defineTool({
@@ -166,9 +120,6 @@ export const askUserTool = defineTool({
             return 'ask_user: no onReply configured; question dropped';
         }
 
-        // Compose the final option list with the optional "Other" suffix.
-        // Label differs from the stored value so "Other" reads naturally in
-        // text while the classifier key stays stable (OTHER_VALUE).
         const withOther: AskUserOption[] = [
             ...options,
             ...(allowOther !== false
@@ -185,9 +136,6 @@ export const askUserTool = defineTool({
         const supportsButtons = capabilities.includes('buttons');
 
         if (supportsButtons) {
-            // Native-button path: channel adapter renders the inline keyboard
-            // / components; tapped value comes back as a synthesized user
-            // message on the next turn (gateway's interactive-button pipeline).
             try {
                 await onReply(question, {
                     buttons: withOther.map((o) => ({
@@ -200,9 +148,6 @@ export const askUserTool = defineTool({
                 return `ask_user: delivery failed: ${err instanceof Error ? err.message : String(err)}`;
             }
         } else {
-            // Text-only path: render as a numbered prompt. The user replies
-            // with a number OR free text — either way the next turn delivers
-            // the answer as a normal user message.
             const numbered = withOther
                 .map((o, i) => {
                     const descSuffix = o.description ? ` — ${o.description}` : '';
@@ -221,11 +166,6 @@ export const askUserTool = defineTool({
             setDidSendViaTool();
         }
 
-        // Structured tool result — the agent sees this as the tool's output
-        // and learns the turn should end here. Describes the pending state
-        // so if the agent is checkpointed + resumed mid-reasoning (possible
-        // with our SqliteCheckpointStore), it re-enters knowing a question
-        // is outstanding.
         const validValues = withOther.map((o) => o.value).join(', ');
         return [
             `Question sent to user (${supportsButtons ? 'buttons' : 'text-only'}).`,

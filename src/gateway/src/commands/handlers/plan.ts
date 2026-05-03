@@ -1,23 +1,5 @@
-/**
- * `/plan` — explicit plan-mode gate from chat.
- *
- * Plan mode is normally entered by the agent itself (it calls `create_plan`
- * when a task is heavy enough to warrant user review). `/plan` lets the user
- * force it: the agent will draft a plan, present it with go/edit/no buttons,
- * and only execute after explicit approval.
- *
- * Three forms:
- *   /plan                       — show usage + how to interact with an active plan
- *   /plan <task description>    — arm plan mode for the task
- *   /plan cancel | stop | abort — drop any active plan
- *
- * Implementation: the handler returns `forwardToAgent` so the channel-worker
- * injects a bracketed nudge into the agent's message queue. The agent already
- * knows about `create_plan` from its system prompt — the bracketed prefix
- * just makes plan mode the explicit choice for this task.
- */
-
 import type { CommandContext, CommandDef } from '../types';
+import { getPlanFacade } from '../plan-facade';
 
 export const planCommand: CommandDef = {
     name: 'plan',
@@ -50,11 +32,26 @@ export const planCommand: CommandDef = {
         }
 
         if (raw === 'cancel' || raw === 'stop' || raw === 'abort') {
+            // Hard reset via the facade, plus an agent nudge so its next
+            // turn doesn't reference the dropped plan.
+            const facade = getPlanFacade();
+            const cleared = facade?.cancel(ctx.threadId) ?? false;
+
+            if (!facade) {
+                return {
+                    text: 'Cancelling plan mode.',
+                    forwardToAgent:
+                        '[The user invoked `/plan cancel`. If you have an active plan, drop it now and continue normally.]',
+                };
+            }
+
             return {
-                text: 'Cancelling plan mode.',
-                forwardToAgent:
-                    '[The user invoked `/plan cancel`. If you have an active plan in drafting state, drop it now and confirm in one short sentence. ' +
-                    'Then continue normally — they may follow up with a fresh request.]',
+                text: cleared
+                    ? 'Plan dropped. Send a fresh request when ready.'
+                    : 'No active plan to cancel.',
+                forwardToAgent: cleared
+                    ? '[The user invoked `/plan cancel`. The plan-mode state was just cleared at the interceptor level — there is no longer any plan or drafting state for this thread. Acknowledge briefly and wait for their next request. Do NOT reference the dropped plan.]'
+                    : undefined,
             };
         }
 

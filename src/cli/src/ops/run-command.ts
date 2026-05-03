@@ -15,7 +15,7 @@
 
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, openSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import { Command } from 'commander';
 import chalk from 'chalk';
 import stripAnsi from 'strip-ansi';
@@ -23,7 +23,7 @@ import { workspace } from '@flopsy/shared';
 import { bad, dim, info, link, ok, row, section } from '../ui/pretty';
 import { styleRabbit } from '../ui/banner';
 import { palette, tint } from '../ui/theme';
-import { configPath, readFlopsyConfig } from './config-reader';
+import { projectRoot, readFlopsyConfig } from './config-reader';
 import { probeGatewayState } from './gateway-state';
 
 export function registerRunCommands(root: Command): void {
@@ -115,7 +115,7 @@ export function registerRunCommands(root: Command): void {
 function passthroughNpm(npmArgs: string[]): void {
     const child = spawn('npm', npmArgs, {
         stdio: 'inherit',
-        cwd: dirname(configPath()),
+        cwd: projectRoot(),
     });
     child.on('exit', (code) => process.exit(code ?? 0));
     child.on('error', (err) => {
@@ -133,12 +133,16 @@ function passthroughNpm(npmArgs: string[]): void {
  * pick them up.
  */
 async function restartDetached(): Promise<void> {
-    const repoRoot = dirname(configPath());
+    // readFlopsyConfig must run BEFORE projectRoot() — it loads `.env` so
+    // FLOPSY_HOME is in process.env when workspace.logs() runs further
+    // down. Without this, logs land in `~/.flopsy/logs/` instead of the
+    // project's `.flopsy/logs/`.
     const { config } = readFlopsyConfig();
+    const repoRoot = projectRoot();
     const port = config.gateway?.port ?? 18789;
 
     mkdirSync(workspace.logs(), { recursive: true, mode: 0o700 });
-    const logPath = resolve(workspace.logs(), 'gateway-stdio.log');
+    const logPath = resolve(workspace.logs(), 'gateway.out.log');
     const logFd = openSync(logPath, 'a');
 
     // `npm run stop` is idempotent (trailing `|| true`) so we don't bail
@@ -150,8 +154,11 @@ async function restartDetached(): Promise<void> {
 }
 
 async function startDetached(): Promise<void> {
-    const repoRoot = dirname(configPath());
+    // readFlopsyConfig must run first — it loads .env (so FLOPSY_HOME is
+    // populated before workspace.logs() resolves), and on a fresh checkout
+    // it self-heals by seeding `.flopsy/` from the bundled templates.
     const { config } = readFlopsyConfig();
+    const repoRoot = projectRoot();
     const port = config.gateway?.port ?? 18789;
 
     // Guard against double-start — two processes racing for the port
@@ -168,7 +175,7 @@ async function startDetached(): Promise<void> {
     }
 
     mkdirSync(workspace.logs(), { recursive: true, mode: 0o700 });
-    const logPath = resolve(workspace.logs(), 'gateway-stdio.log');
+    const logPath = resolve(workspace.logs(), 'gateway.out.log');
     const logFd = openSync(logPath, 'a');
 
     await spawnDetachedAndReport(repoRoot, port, logFd, logPath, 'Gateway started');
@@ -186,10 +193,17 @@ async function spawnDetachedAndReport(
     title: string,
 ): Promise<void> {
     process.stdout.write(dim('starting gateway…\n'));
+    // Strip CLI-only env pollution before spawning the daemon. _silence-logs.ts
+    // sets LOG_LEVEL=warn for terse CLI output, but inheriting it into the
+    // long-running gateway suppresses INFO-level pino logs (harness-interceptor,
+    // session-extractor, etc.) — leaving operators debugging blind.
+    const daemonEnv = { ...process.env };
+    delete daemonEnv.LOG_LEVEL;
     const child = spawn('npm', ['start'], {
         cwd: repoRoot,
         detached: true,
         stdio: ['ignore', logFd, logFd],
+        env: daemonEnv,
     });
     child.unref();
 
@@ -214,14 +228,14 @@ async function spawnDetachedAndReport(
  * form instead of a no-op.
  */
 async function stopWithBanner(): Promise<void> {
-    const repoRoot = dirname(configPath());
     const { config } = readFlopsyConfig();
+    const repoRoot = projectRoot();
     const port = config.gateway?.port ?? 18789;
 
     const before = await probeGatewayState(port);
 
     mkdirSync(workspace.logs(), { recursive: true, mode: 0o700 });
-    const logPath = resolve(workspace.logs(), 'gateway-stdio.log');
+    const logPath = resolve(workspace.logs(), 'gateway.out.log');
     const logFd = openSync(logPath, 'a');
 
     process.stdout.write(dim('stopping gateway…\n'));

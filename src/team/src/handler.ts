@@ -1,6 +1,7 @@
 import { createLogger, resolveWorkspacePath, scrubPii } from '@flopsy/shared';
 import type {
     AgentCallbacks,
+    AgentChunk,
     AgentHandler,
     AgentResult,
     AggregateTaskSummary,
@@ -11,8 +12,9 @@ import type {
     ThreadStatusSnapshot,
 } from '@flopsy/gateway';
 import type { AgentDefinition, McpConfig } from '@flopsy/shared';
-import type { BaseChatModel, BaseStore, CheckpointStore, BaseTool, Provider, ContentBlock } from 'flopsygraph';
+import type { BaseChatModel, BaseStore, CheckpointStore, BaseTool, Provider, ContentBlock, ModelRouter, TextBlock } from 'flopsygraph';
 import {
+    CheckpointManager,
     ModelLoader,
     OllamaEmbedder,
     SqliteCheckpointStore,
@@ -23,8 +25,16 @@ import {
 import { parseModelString } from './bootstrap';
 import { createTeamMember, resolveRole } from './factory';
 import type { TeamMember, TeamRosterEntry } from './factory';
-import { getSharedLearningStore } from './harness';
-import type { AwayReviewer, FactConsolidator } from './harness/review';
+import { getSharedLearningStore, getSharedPairingStore } from './harness';
+import { setPairingFacade, setPersonalityFacade, setInsightsFacade, setBranchFacade } from '@flopsy/gateway';
+import type { SessionExtractor, ExtractionResult, SkillProposal } from './harness/review';
+import {
+    scanExistingSkills,
+    writeSkillFile,
+    appendLessonsToSkill,
+} from './harness/review';
+import { join as pathJoin } from 'path';
+import type { PersonalityRegistry } from './personalities';
 import {
     McpClientManager,
     bridgeAllTools,
@@ -32,7 +42,7 @@ import {
     loadMcpServers,
     type BridgedTool,
 } from './mcp';
-import type { LearningStore } from './harness';
+import type { LearningStore, SessionRow } from './harness';
 import { SessionResolver } from './session-resolver';
 import { TaskRegistry } from './state/task-registry';
 import type {
@@ -42,10 +52,6 @@ import type {
 
 const log = createLogger('team-handler');
 
-/**
- * Thread identity resolved from a channel threadId.
- * Multi-tenant: each thread gets its own userId/domain so learning is isolated.
- */
 export interface ThreadIdentity {
     readonly userId: string;
     readonly userName?: string;
@@ -55,37 +61,12 @@ export interface ThreadIdentity {
 export type ThreadResolver = (threadId: string) => Promise<ThreadIdentity> | ThreadIdentity;
 
 export interface TeamHandlerConfig {
-    /**
-     * The full team of agent definitions from config.agents. The handler
-     * instantiates the entry member per-thread; the rest are kept on hand for
-     * future delegation.
-     */
     readonly team: ReadonlyArray<AgentDefinition>;
-
-    /** Name of the entry agent — the one the gateway routes to. */
     readonly entryAgentName: string;
-
-    /** Model for the entry agent. Loaded once in bootstrap. */
     readonly model: BaseChatModel;
-
     readonly resolveThread: ThreadResolver;
-
-    /**
-     * Max per-thread agents kept in memory. Older threads are evicted LRU-style.
-     * Default: 100. Each thread holds ~a few MB (LLM state + harness context).
-     */
     readonly maxThreads?: number;
-
-    /** Override the shared LearningStore (for tests). */
     readonly store?: LearningStore;
-
-    /**
-     * Semantic memory store settings. Mirrors `flopsy.json5`'s `memory`
-     * section — carries the embedder choice so gandalf's `manage_memory` /
-     * `search_memory` tools can do cosine-similarity retrieval. When
-     * `enabled: false`, no memoryStore is wired and flopsygraph's default
-     * InMemoryStore kicks in (ephemeral, no search).
-     */
     readonly memory?: {
         readonly enabled?: boolean;
         readonly embedder?: {
@@ -95,53 +76,23 @@ export interface TeamHandlerConfig {
         };
     };
 
-    /**
-     * MCP server registry (mirrors `flopsy.json5`'s `mcp` section). Each
-     * configured + enabled server is spawned at handler construction; its
-     * tools are auto-namespaced (`<server>__<tool>`) and routed to team
-     * members per the per-server `assignTo` field OR per-agent
-     * `mcpServers` allow-list.
-     */
     readonly mcp?: McpConfig;
-
-    /**
-     * Generates a 1-3 sentence "where we left off" recap when a session
-     * rotates due to idle timeout. Injected as a context prefix on the
-     * first user message of the new session. Optional — omit to skip
-     * away-recap generation entirely.
-     */
-    readonly awayReviewer?: AwayReviewer;
-
-    /**
-     * Periodically merges duplicate or conflicting user preference facts.
-     * Runs at most once per 24 hours per user. Optional — omit to disable.
-     */
-    readonly factConsolidator?: FactConsolidator;
+    readonly sessionExtractor?: SessionExtractor;
+    readonly modelRouter?: ModelRouter;
+    readonly modelRouters?: ReadonlyMap<string, ModelRouter>;
+    readonly personalities?: PersonalityRegistry;
+    readonly observability?: import('flopsygraph').Observability;
 }
 
 interface ThreadEntry {
     readonly entry: TeamMember;
     readonly identity: ThreadIdentity;
-    /** Per-thread task map — background jobs, delegations, shell tasks. */
     readonly registry: TaskRegistry;
-    /**
-     * Closure that, given a worker name, returns a function that invokes
-     * that worker's ReactAgent. Built once when the thread is instantiated;
-     * each call lazily compiles the worker agent on first use and caches it.
-     */
     readonly buildSubAgent: SubAgentFactory;
     lastUsedAt: number;
     activeTurns: number;
 }
 
-/**
- * TeamHandler — bridge between the gateway and the harness-enabled team.
- *
- * Receives the FULL team definition at construction; instantiates the entry
- * member lazily per thread. Non-entry teammates (legolas, gimli, …) will be
- * wired for delegation in a later phase — today they're registered but not
- * instantiated.
- */
 export class TeamHandler implements AgentHandler {
     private readonly config: TeamHandlerConfig;
     private readonly maxThreads: number;
@@ -149,92 +100,172 @@ export class TeamHandler implements AgentHandler {
     private readonly sessionResolver!: SessionResolver;
     private readonly threads = new Map<string, ThreadEntry>();
     private readonly entryDef: AgentDefinition;
-    /**
-     * Shared across every thread's main agent. Keyed by threadId so
-     * cumulative token usage per conversation survives the `onGraphEnd`
-     * reset at the end of each `.invoke()`. Surfaced by `queryStatus`.
-     * It's both an `Interceptor` (passed into the agent's interceptor
-     * stack) and a set of read accessors (`getTotals`, `entries`, ...).
-     */
     private readonly tokens: ReturnType<typeof tokenCounter>;
-    /**
-     * One SQLite-backed CheckpointStore shared across every team member.
-     * Lives in `<workspace>/harness/checkpoints.db` (separate from
-     * state.db so large gzip'd state blobs don't thrash the WAL of the
-     * learning store's small-row writes).
-     *
-     * Effect: a thread's graph state (messages, tool calls, intermediate
-     * reasoning) survives process restart. Without this, the agent would
-     * "forget" every conversation on each `npm run restart`. Session
-     * search in state.db is complementary — it indexes the final
-     * user/assistant turns; the checkpointer persists the LIVE turn state
-     * mid-reasoning so a crashed run can resume exactly where it left off.
-     */
+    // Kept off state.db: gzipped checkpoint blobs would thrash the learning-store WAL.
     private readonly checkpointer: CheckpointStore;
-    /**
-     * Shared semantic memory store for the `manage_memory` / `search_memory`
-     * tools that flopsygraph auto-wires into every ReactAgent. Backed by
-     * SQLite at `<workspace>/harness/memory.db` so saved memories survive
-     * restarts.
-     *
-     * When FLOPSY_EMBEDDER_MODEL is set (e.g. "nomic-embed-text"), an
-     * OllamaEmbedder is attached so `search_memory` does cosine-similarity
-     * ranking. Without it, the store is keyed storage only — search falls
-     * back to a plain namespace listing, which is sufficient for small
-     * libraries. See docs/memory.md.
-     */
     private readonly memoryStore: BaseStore;
-    /**
-     * MCP client manager — owns the spawned MCP servers (Gmail, Notion, etc.).
-     * Lazy-initialised: `mcpReady` resolves once `connect()` finishes, so
-     * per-thread `createTeamMember` calls await it before pulling tools.
-     */
     private readonly mcpManager: McpClientManager;
     private readonly mcpAssignToMap: Readonly<Record<string, readonly string[]>>;
     private readonly mcpServersCfg: McpConfig['servers'];
     private mcpReady: Promise<readonly BridgedTool[]> = Promise.resolve([]);
-    private readonly awayReviewer?: AwayReviewer;
-    private readonly factConsolidator?: FactConsolidator;
-    /** threadId → in-flight recap promise; cleared on first inject or timeout. */
+    private mcpSkipReasons: Readonly<Record<string, string>> = {};
+    private readonly mcpToolCounts = new Map<string, number>();
+    private readonly sessionExtractor?: SessionExtractor;
+    readonly modelRouter?: ModelRouter;
+    readonly modelRouters?: ReadonlyMap<string, ModelRouter>;
+    readonly personalities?: PersonalityRegistry;
     private readonly pendingRecapPromises = new Map<string, Promise<string | null>>();
 
     constructor(config: TeamHandlerConfig) {
         this.config = config;
         this.maxThreads = config.maxThreads ?? 100;
         this.store = config.store ?? getSharedLearningStore();
-        this.awayReviewer = config.awayReviewer;
-        this.factConsolidator = config.factConsolidator;
-        // Resolves the incoming peer-routing-key (e.g. telegram:dm:5257796557)
-        // into an effective threadId carrying the active session
-        // (telegram:dm:5257796557#s-19834-4a7b9f1). Rotates on daily 4am
-        // local OR 24h idle. Heartbeat sources do NOT extend freshness.
+        this.sessionExtractor = config.sessionExtractor;
+        this.modelRouter = config.modelRouter;
+        this.modelRouters = config.modelRouters;
+        this.personalities = config.personalities;
+
+        // 24h is well past any sensible spawn timeoutMs (max configured = 2h); kill anything older.
+        try {
+            const STALE_MS = 24 * 60 * 60 * 1000;
+            const killed = this.store.killStaleBackgroundTasks(STALE_MS);
+            if (killed > 0) {
+                log.info(
+                    { killed, staleThresholdMs: STALE_MS },
+                    'background_tasks: marked stale running rows as killed at boot',
+                );
+            }
+        } catch (err) {
+            log.warn(
+                { err: redactSecrets(err) },
+                'background_tasks: boot-time stale sweep failed (non-fatal)',
+            );
+        }
+
+        const pairingStore = getSharedPairingStore();
+        setPairingFacade({
+            requestCode: (channel, senderId, senderName) =>
+                pairingStore.requestCode(channel, senderId, senderName),
+            approveByCode: (channel, code) => pairingStore.approveByCode(channel, code),
+            approveBySenderId: (channel, senderId, senderName) =>
+                pairingStore.approveBySenderId(channel, senderId, senderName),
+            revoke: (channel, senderId) => pairingStore.revoke(channel, senderId),
+            isApproved: (channel, senderId) => pairingStore.isApproved(channel, senderId),
+            listPending: (channel) => pairingStore.listPending(channel),
+            listApproved: (channel) => pairingStore.listApproved(channel),
+            clearExpired: (channel) => pairingStore.clearExpired(channel),
+            clearAllPending: (channel) => pairingStore.clearAllPending(channel),
+        });
+
+        if (this.personalities) {
+            const personalities = this.personalities;
+            setPersonalityFacade({
+                list: () =>
+                    personalities.list().map((p) => ({
+                        name: p.name,
+                        description: p.description,
+                    })),
+                getActive: (rawKey) => {
+                    const sessionId = this.resolveActiveSessionId(rawKey);
+                    return sessionId ? this.store.getSessionPersonality(sessionId) : null;
+                },
+                setActive: (rawKey, name) => {
+                    if (name !== null && !personalities.has(name)) return false;
+                    const sessionId = this.resolveActiveSessionId(rawKey);
+                    if (!sessionId) return false;
+                    this.store.setSessionPersonality(sessionId, name);
+                    return true;
+                },
+                evictThread: (rawKey) => {
+                    for (const k of [...this.threads.keys()]) {
+                        if (k === rawKey || k.startsWith(`${rawKey}#`)) {
+                            this.threads.delete(k);
+                        }
+                    }
+                },
+            });
+        }
+
+        const store = this.store;
+        setInsightsFacade({
+            snapshot: (rawKey, windowDays) => {
+                const peerKey = rawKey.split('#')[0] ?? rawKey;
+                const days = Math.max(1, Math.min(Math.floor(windowDays), 365));
+                const sinceMs = Date.now() - days * 86_400_000;
+                const sinceDateIso = new Date(sinceMs).toISOString().slice(0, 10);
+
+                const messages = store.getMessageCountForPeer(peerKey, sinceMs);
+                const sessionStats = store.getSessionStatsForPeer(peerKey, sinceMs, 5);
+                const tokens = store.getTokenUsageForPeer(peerKey, sinceDateIso);
+                const recent = store.getRecentClosedSessionsWithSummary(peerKey, sinceMs, 5);
+
+                if (
+                    messages.total === 0 &&
+                    sessionStats.count === 0 &&
+                    tokens.length === 0
+                ) {
+                    return null;
+                }
+
+                return {
+                    windowDays: days,
+                    sinceMs,
+                    activity: {
+                        sessions: sessionStats.count,
+                        turns: sessionStats.totalTurns,
+                        messagesTotal: messages.total,
+                        messagesUser: messages.user,
+                        messagesAssistant: messages.assistant,
+                    },
+                    tokens: tokens.map((t) => ({
+                        provider: t.provider,
+                        model: t.model,
+                        input: t.input,
+                        output: t.output,
+                        calls: t.calls,
+                    })),
+                    longestSessions: sessionStats.longest.map((s) => ({
+                        sessionId: s.sessionId,
+                        turnCount: s.turnCount,
+                        openedAt: s.openedAt,
+                        closedAt: s.closedAt,
+                        summary: s.summary,
+                    })),
+                    recentSessions: recent
+                        .filter((s) => s.summary !== null && s.closedAt !== null)
+                        .map((s) => ({
+                            sessionId: s.sessionId,
+                            closedAt: s.closedAt!,
+                            summary: s.summary!,
+                        })),
+                };
+            },
+        });
+
+        setBranchFacade({
+            fork: (rawKey, label) => this.branchSession(rawKey, label),
+            switch: (rawKey, label) => this.switchBranch(rawKey, label),
+            list: (rawKey) => {
+                const peerKey = rawKey.split('#')[0] ?? rawKey;
+                const activeId = this.store.getActiveSession(peerKey)?.sessionId ?? null;
+                return this.listBranches(rawKey).map((s) => ({
+                    sessionId: s.sessionId,
+                    label: s.branchLabel,
+                    active: s.sessionId === activeId,
+                    turnCount: s.turnCount,
+                    summary: s.summary,
+                    lastUserMessageAt: s.lastUserMessageAt,
+                }));
+            },
+        });
+
         this.sessionResolver = new SessionResolver(this.store);
-        // One persistent checkpoint DB per process. gzip compression: graph
-        // states grow quickly with tool results (web search blobs, file
-        // reads), and the compress path halves storage for typical chat
-        // flows with ~no CPU cost at our message volume. Separate file from
-        // state.db because the two have very different write shapes —
-        // mixing them trashes WAL checkpointing latency.
         this.checkpointer = new SqliteCheckpointStore({
-            path: resolveWorkspacePath('harness', 'checkpoints.db'),
+            path: resolveWorkspacePath('state', 'checkpoints.db'),
             compress: true,
-            // Cap per-thread history. ~30 resumable turns is plenty for
-            // crash recovery; without this the DB grows unbounded
-            // (long-running chat threads were hitting hundreds of MB).
             keepLatestPerThread: 30,
         });
 
-        // Persistent semantic memory store. Previously flopsygraph's default
-        // InMemoryStore was used — it died on restart and lacked an embedder,
-        // so `search_memory` returned nothing. That was the root cause of
-        // the "memory system might be glitchy" behavior the user reported.
-        //
-        // Config lives in flopsy.json5 under `memory: { embedder: ... }`.
-        // Default: persistent SQLite + Ollama `nomic-embed-text:v1.5` (274 MB,
-        // 768-dim). Set `memory.enabled: false` to skip embedder wiring
-        // (store still persists; search falls back to keyed listing).
-        // If Ollama isn't running, embed() throws at query time; search
-        // returns empty but save still succeeds — no gateway crash.
         const memoryCfg = config.memory ?? {};
         const memoryEnabled = memoryCfg.enabled !== false;
         const embedderCfg = memoryCfg.embedder;
@@ -247,48 +278,39 @@ export class TeamHandler implements AgentHandler {
                       embedderCfg.baseUrl,
                   )
                 : undefined;
-        this.memoryStore = new SqliteMemoryStore(
-            resolveWorkspacePath('harness', 'memory.db'),
-            embedder ? { embedder } : undefined,
-        );
+        this.memoryStore = new SqliteMemoryStore({
+            path: resolveWorkspacePath('state', 'memory.db'),
+            ...(embedder ? { embedder } : {}),
+        });
         log.info(
             {
-                memoryPath: resolveWorkspacePath('harness', 'memory.db'),
+                memoryPath: resolveWorkspacePath('state', 'memory.db'),
                 memoryEnabled,
                 embedderModel: embedderCfg?.model ?? 'none',
                 embedderBaseUrl: embedderCfg?.baseUrl ?? 'default',
             },
             'memoryStore ready',
         );
-        // Keyed by threadId + persisted past graph end, so each conversation
-        // accumulates across turns instead of resetting every .invoke().
-        // Attached to the main agent's interceptor stack below (factory).
         this.tokens = tokenCounter({
             keyFn: (ctx) =>
                 (ctx.configurable as { threadId?: string })?.threadId ?? ctx.threadId,
             persistAcrossGraphEnd: true,
-            // Persist every model-call delta into state.db so tokens
-            // survive process restarts and we get per-(thread, day, model)
-            // attribution for /status. The callback is already in a
-            // try/catch at the tokenCounter layer — a SQLite write error
-            // won't break the model response path.
-            onUpdate: (threadId, delta, _cumulative, ctx) => {
+            onUpdate: (threadId, delta, _cumulative, ctx, response) => {
                 const date = localDateString();
+                // modelFallback pins _fallbackTo on response.raw to keep token attribution accurate.
+                const fallback = (response.raw as Record<string, unknown> | undefined)?.['_fallbackTo'] as
+                    { provider?: string; model?: string } | undefined;
                 this.store.recordTokenUsage({
                     threadId,
                     date,
-                    provider: ctx.provider,
-                    model: ctx.model,
-                    input: delta.input,
+                    provider: fallback?.provider ?? ctx.provider,
+                    model:    fallback?.model    ?? ctx.model,
+                    input:  delta.input,
                     output: delta.output,
                 });
             },
         });
 
-        // MCP wiring — fire-and-forget the connect; threads await
-        // `mcpReady` before pulling tools so first-message slowness on
-        // cold start is bounded by the slowest server (handled inside
-        // McpClientManager with a 30s per-server timeout).
         const mcpManager = new McpClientManager();
         this.mcpManager = mcpManager;
         this.mcpServersCfg = config.mcp?.servers ?? {};
@@ -303,12 +325,18 @@ export class TeamHandler implements AgentHandler {
             this.mcpReady = (async () => {
                 try {
                     const { servers, skipped } = await loadMcpServers(mcpServersCfg);
+                    this.mcpSkipReasons = { ...skipped };
                     Object.entries(skipped).forEach(([name, reason]) =>
                         log.info({ server: name, reason }, 'mcp server skipped'),
                     );
                     if (servers.length === 0) return [];
                     await mcpManager.connect(servers);
-                    return await bridgeAllTools(mcpManager);
+                    const bridged = await bridgeAllTools(mcpManager);
+                    this.mcpToolCounts.clear();
+                    for (const t of bridged) {
+                        this.mcpToolCounts.set(t.mcpServer, (this.mcpToolCounts.get(t.mcpServer) ?? 0) + 1);
+                    }
+                    return bridged;
                 } catch (err) {
                     log.error(
                         { err: redactSecrets(err) },
@@ -346,19 +374,9 @@ export class TeamHandler implements AgentHandler {
         role: InvokeRole = 'user',
         media?: ReadonlyArray<InboundMedia>,
     ): Promise<AgentResult> {
-        // PR 4: resolve the inbound peer-routing-key (e.g. telegram:dm:5257796557)
-        // into an effective threadId carrying the active session
-        // (e.g. telegram:dm:5257796557#s-19834-4a7b9f1). Daily-4am OR 24h-idle
-        // rotation. Heartbeats/cron sources do not extend session freshness.
-        // Identity facts/preferences attach to the peer (permanent) — sessions
-        // bound conversation context.
         threadId = this.resolveSessionThreadId(threadId, role);
 
-        // If an away recap was queued for this thread (session just rotated on
-        // idle), race against an 8s window. If the model returns in time the
-        // recap is prepended to the user's first message so the agent has
-        // "where we left off" context without an extra round-trip. If the LLM
-        // is slow, we skip rather than hold up the user.
+        // Race the queued recap against an 8s window so a slow LLM doesn't hold up the user's turn.
         const RECAP_INJECT_TIMEOUT_MS = 8_000;
         let awayRecap: string | null = null;
         const recapPromise = this.pendingRecapPromises.get(threadId);
@@ -373,29 +391,16 @@ export class TeamHandler implements AgentHandler {
             }
         }
 
-        const entry = await this.getOrCreateThread(threadId);
+        const entry = await this.getOrCreateThread(threadId, {
+            isProactive: callbacks.channelName === 'proactive',
+        });
         entry.lastUsedAt = Date.now();
-
-        // NOTE: `callbacks.pending` contains texts the gateway ChannelWorker
-        // received while the previous turn was still running. The worker drains
-        // those back into its message queue AFTER this turn finishes
-        // (see channel-worker.ts:278-282). Do NOT re-queue them into the harness
-        // interceptor — that would cause each to be processed twice.
 
         entry.activeTurns += 1;
         try {
-            // Forward the gateway's callbacks + per-thread state into the
-            // agent's configurable. The delegation tools read these under
-            // the keys documented in each tool file. Sub-agents built by
-            // buildSubAgent receive a new configurable derived from this
-            // one (depth + 1) so they can't delegate further.
             const configurable: Record<string, unknown> = {
                 onReply: callbacks.onReply,
                 sendPoll: callbacks.sendPoll,
-                // Exposed to the messageQueue interceptor so mid-turn user
-                // messages can be injected into the current turn's
-                // reasoning. Interceptor calls this between tool results
-                // and the next LLM call.
                 drainPending: callbacks.drainPending,
                 setDidSendViaTool: callbacks.setDidSendViaTool,
                 reactToUserMessage: callbacks.reactToUserMessage,
@@ -405,30 +410,20 @@ export class TeamHandler implements AgentHandler {
                 depth: 0,
                 threadId,
                 userId: entry.identity.userId,
-                // LearningStore handle for tools that need direct DB access
-                // (search_past_conversations today; more to come). Keeps the
-                // tool stateless and scoped by the userId/threadId already in
-                // this configurable.
                 store: this.store,
-                // Message context — passed straight through from the gateway
-                // so the SystemPromptFn (and any tool) can read clean values
-                // instead of parsing the threadId.
                 channelName: callbacks.channelName,
-                // Channel-declared interactive capabilities (buttons, polls,
-                // components, select). The SystemPromptFn reads these into
-                // the runtime block so the model branches on what the
-                // channel actually supports — not on channel name trivia.
                 channelCapabilities: callbacks.channelCapabilities,
                 peer: callbacks.peer,
                 sender: callbacks.sender,
                 messageId: callbacks.messageId,
-                // Called by connect_service after OAuth succeeds so MCP servers
-                // that require that provider are restarted with fresh credentials.
+                personality: callbacks.personality,
+                runtimeHints: callbacks.runtimeHints,
+                taskStore: this.store,
                 onAuthSuccess: async (provider: string) => {
                     if (!this.mcpServersCfg || Object.keys(this.mcpServersCfg).length === 0) return;
+                    let affected: string[] = [];
                     try {
-                        // Find all servers that requiresAuth for this provider.
-                        const affected = Object.entries(this.mcpServersCfg)
+                        affected = Object.entries(this.mcpServersCfg)
                             .filter(([, srv]) =>
                                 srv.enabled !== false &&
                                 srv.requiresAuth?.includes(provider),
@@ -444,19 +439,25 @@ export class TeamHandler implements AgentHandler {
                         if (servers.length > 0) await this.mcpManager.restartServers(servers);
                     } catch (err) {
                         log.warn(
-                            { provider, err: err instanceof Error ? err.message : String(err) },
-                            'onAuthSuccess mcp restart failed (non-fatal)',
+                            { provider, servers: affected, err: err instanceof Error ? err.message : String(err) },
+                            'onAuthSuccess mcp restart failed — notifying user',
                         );
+                        try {
+                            const serverList = affected.length > 0 ? affected.join(', ') : provider;
+                            await callbacks.onReply(
+                                `✓ Authorized ${provider}, but couldn't restart the connector (${serverList}). Try /doctor, or message me again in ~30s.`,
+                            );
+                        } catch (sendErr) {
+                            log.error(
+                                { provider, sendErr: sendErr instanceof Error ? sendErr.message : String(sendErr) },
+                                'failed to notify user about MCP restart failure — they have no signal',
+                            );
+                        }
                     }
                 },
             };
 
-            // Persist the user turn BEFORE invoking the agent so the message
-            // survives even if the agent crashes mid-turn. The role is the
-            // logical originator of the text — 'user' for direct messages
-            // and 'assistant' for system-routed ones (task notifications,
-            // etc.), which we treat as not-user-authored and skip persisting
-            // to keep the search index focused on real human intent.
+            // Persist BEFORE invoke so the user turn survives an agent crash mid-turn.
             if (role === 'user') {
                 try {
                     this.store.recordMessage({
@@ -474,37 +475,111 @@ export class TeamHandler implements AgentHandler {
             }
 
             const effectiveText = awayRecap
-                ? `[Resuming after idle — previous session context: ${awayRecap}]\n\n${text}`
+                ? `[Continuity context — recap of your last session with this user: ${awayRecap}]\n[How to use this: if the user opens with a casual greeting like "hey", "how is everything", "what's up" — DO NOT reply with a generic "How can I help today?". Reference the recap: name what was in flight and ask if they want to continue, or proactively check the next step. If the user asks a direct question, answer it AND, if the recap mentions a pending follow-up, mention it briefly. Only ignore the recap if it's plainly irrelevant to what they just said.]\n\n${text}`
                 : text;
             const content = buildContent(effectiveText, media);
 
-            const result = await entry.entry.agent.invoke(
+            type FlopsyStreamChunk = {
+                content?: string;
+                reasoning?: string;
+                toolCallDeltas?: Array<{ index: number; id?: string; name?: string; args?: string }>;
+            };
+            type ChunkEvent = { type: 'message-chunk'; chunk?: FlopsyStreamChunk };
+            type NodeEvent = { type: 'node-start' | 'node-finish'; node: string; updates?: Record<string, unknown> };
+            type ResultEvent = { type: 'result'; data?: { state?: unknown } };
+            type AgentStreamEvent = ChunkEvent | NodeEvent | ResultEvent | { type: string };
+
+            // Tool-call deltas arrive in two parts: the start has name+index, later deltas
+            // carry partial_json args fragments — accumulate args by index for the tool-start emit.
+            let lastToolName: string | undefined;
+            let lastToolIndex: number | undefined;
+            const toolArgsByIndex = new Map<number, string>();
+            let resultState: unknown = null;
+
+            const emit = (chunk: AgentChunk): void => {
+                if (!callbacks.onChunk) return;
+                try { callbacks.onChunk(chunk); } catch { /* preview path is best-effort */ }
+            };
+
+            const stream = (entry.entry.agent as unknown as {
+                stream: (
+                    input: { messages: Array<{ role: string; content: unknown }> },
+                    opts: { threadId: string; signal: AbortSignal; configurable: Record<string, unknown> },
+                ) => AsyncIterable<AgentStreamEvent>;
+            }).stream(
                 { messages: [{ role, content }] },
                 { threadId, signal: callbacks.signal, configurable },
             );
 
-            // boundary: flopsygraph returns AgentState with messages/tokenUsage typed
-            // loosely across versions; narrow to the fields we actually consume.
+            for await (const event of stream) {
+                if (event.type === 'message-chunk') {
+                    const c = (event as ChunkEvent).chunk;
+                    if (!c) continue;
+                    if (c.content) emit({ type: 'text_delta', text: c.content });
+                    if (c.reasoning) emit({ type: 'thinking', text: c.reasoning });
+                    if (c.toolCallDeltas) {
+                        for (const d of c.toolCallDeltas) {
+                            if (d.name) {
+                                lastToolName = d.name;
+                                lastToolIndex = d.index;
+                            }
+                            if (d.args !== undefined) {
+                                const prev = toolArgsByIndex.get(d.index) ?? '';
+                                toolArgsByIndex.set(d.index, prev + d.args);
+                            }
+                        }
+                    }
+                } else if (event.type === 'node-start') {
+                    if ((event as NodeEvent).node === 'tools' && lastToolName) {
+                        const args = lastToolIndex !== undefined
+                            ? toolArgsByIndex.get(lastToolIndex)
+                            : undefined;
+                        emit({ type: 'tool_start', toolName: lastToolName, ...(args ? { args } : {}) });
+                    }
+                } else if (event.type === 'node-finish') {
+                    if ((event as NodeEvent).node === 'tools' && lastToolName) {
+                        emit({ type: 'tool_result', toolName: lastToolName });
+                        if (lastToolIndex !== undefined) toolArgsByIndex.delete(lastToolIndex);
+                        lastToolName = undefined;
+                        lastToolIndex = undefined;
+                    }
+                } else if (event.type === 'result') {
+                    resultState = (event as ResultEvent).data?.state;
+                }
+            }
+
+            if (!resultState) {
+                throw new Error('agent stream completed without a result event');
+            }
+            const result = resultState as {
+                messages?: unknown;
+                tokenUsage?: unknown;
+                stoppedByLimit?: unknown;
+                toolStepCount?: unknown;
+            };
+
             const messages =
                 (result.messages as unknown as Array<{ role: string; content: unknown }>) ?? [];
             const lastAssistant = [...messages].reverse().find((m) => m.role === 'assistant');
 
-            const reply = lastAssistant
+            const baseReply = lastAssistant
                 ? typeof lastAssistant.content === 'string'
                     ? lastAssistant.content
                     : JSON.stringify(lastAssistant.content)
                 : null;
 
-            // boundary: flopsygraph TokenUsage; we only surface prompt+completion.
+            const stoppedByLimit = result.stoppedByLimit === true;
+            const toolStepCount =
+                typeof result.toolStepCount === 'number' ? result.toolStepCount : undefined;
+            const reply =
+                baseReply && stoppedByLimit
+                    ? `${baseReply}\n\n_(I stopped after ${toolStepCount ?? 'too many'} tool calls — say "continue" if you want me to keep going.)_`
+                    : baseReply;
+
             const usage = result.tokenUsage as unknown as
                 | { promptTokens: number; completionTokens: number }
                 | undefined;
 
-            // Persist the assistant's final reply so session search can find
-            // it later. We only record the REPLY STRING — tool calls,
-            // intermediate reasoning, and worker outputs stay in flopsygraph's
-            // checkpoint (which is the right place for them) to keep the FTS
-            // index focused on what the user actually saw.
             if (reply && reply.trim().length > 0) {
                 try {
                     this.store.recordMessage({
@@ -517,6 +592,18 @@ export class TeamHandler implements AgentHandler {
                     log.warn(
                         { threadId, err: redactSecrets(err), op: 'recordMessage.assistant' },
                         'failed to persist assistant reply — session search may miss this message',
+                    );
+                }
+            }
+
+            if (role === 'user') {
+                const peerId = threadId.split('#')[0] ?? threadId;
+                try {
+                    this.sessionResolver.touch(peerId, 'user');
+                } catch (err) {
+                    log.warn(
+                        { threadId, err: redactSecrets(err), op: 'session.touch' },
+                        'failed to touch session — turn_count + freshness may drift',
                     );
                 }
             }
@@ -544,19 +631,9 @@ export class TeamHandler implements AgentHandler {
         return this.threads.size;
     }
 
-    /**
-     * Snapshot the thread's running/recent tasks for the gateway's slash
-     * commands (e.g. /status). Returns undefined when the thread hasn't
-     * been instantiated yet — typical on the first user message.
-     */
     queryStatus(threadId: string): ThreadStatusSnapshot | undefined {
         const entry = this.threads.get(threadId);
 
-        // Graceful degradation: when the thread hasn't been instantiated yet
-        // (no invoke has run — common right after a restart, since the thread
-        // map is in-memory), we still surface team roster, token history from
-        // state.db, and config so /status is useful on first load. Tasks and
-        // in-flight status go empty since there's nothing running.
         if (!entry) {
             const today = localDateString();
             const todayTotal = this.store.getTokenDailyTotal(threadId, today);
@@ -618,16 +695,9 @@ export class TeamHandler implements AgentHandler {
             }
         }
 
-        // Recent tasks sorted newest-first, capped at 5 to keep /status
-        // output readable.
         recent.sort((a, b) => (b.endedAtMs ?? 0) - (a.endedAtMs ?? 0));
         recent.length = Math.min(recent.length, 5);
 
-        // Today's tokens from state.db (daily bucket) + per-model breakdown.
-        // In-memory `this.tokens.getTotals(threadId)` still reflects
-        // cumulative-since-process-start; we prefer the persisted daily view
-        // because it survives restarts and gives per-model attribution. Top
-        // 5 models by volume keeps /status output scannable.
         const today = localDateString();
         const todayTotal = this.store.getTokenDailyTotal(threadId, today);
         const byModelAll = this.store.getTokenDailyByModel(threadId, today);
@@ -639,26 +709,14 @@ export class TeamHandler implements AgentHandler {
             calls: m.calls,
         }));
 
-        // Build team roster — one entry per configured non-main worker.
-        // A worker is `running` if the TaskRegistry has an active teammate
-        // task pinned to that worker; otherwise `idle`. Disabled workers
-        // (enabled: false in flopsy.json5) show separately so the user can
-        // see them without them being indistinguishable from idle.
         const now = Date.now();
 
-        // Per-worker last-active timestamp: the most recent endedAtMs
-        // across this worker's teammate tasks (completed / failed /
-        // killed). /status uses it to render "idle · last active 43s ago".
         const lastActiveByWorker = new Map<string, number>();
         for (const t of tasks) {
             if (t.type !== 'teammate' || !t.workerName || t.endedAt == null) continue;
             const prev = lastActiveByWorker.get(t.workerName) ?? 0;
             if (t.endedAt > prev) lastActiveByWorker.set(t.workerName, t.endedAt);
         }
-        // Include the main agent in the roster too — users expect gandalf
-        // listed alongside workers at a glance. Main has no "teammate" tasks
-        // (those are per-worker delegations), so it shows 'idle' unless we
-        // later add a turn-in-flight signal.
         const team = this.config.team
             .map((def): import('@flopsy/gateway').TeamMemberStatus => {
                 const staticFields = staticConfigFields(def);
@@ -671,9 +729,6 @@ export class TeamHandler implements AgentHandler {
                         ...staticFields,
                     };
                 }
-                // Find the first active task whose worker is this agent
-                // (teammate tasks carry workerName; one worker → at most one
-                // concurrent teammate task per thread, per the registry).
                 const activeTask = tasks.find(
                     (t) =>
                         t.type === 'teammate' &&
@@ -729,24 +784,21 @@ export class TeamHandler implements AgentHandler {
         if (!entry) return;
         try {
             await entry.entry.harnessInterceptor?.flush();
-            // Close the flopsygraph sandbox session if the agent had one —
-            // releases Docker containers / K8s pods promptly. Best-effort:
-            // closing a never-opened session or one already closed is a
-            // no-op but mustn't throw into the evict path.
-            await entry.entry.sandboxSession?.close().catch((err) =>
-                log.warn({ threadId, err }, 'sandbox session close failed'),
-            );
+            const agentHandle = entry.entry.agent as { dispose?: () => Promise<void> } | undefined;
+            if (agentHandle?.dispose) {
+                await agentHandle.dispose().catch((err) =>
+                    log.warn({ threadId, err }, 'agent dispose failed'),
+                );
+            } else {
+                await entry.entry.sandboxSession?.close().catch((err) =>
+                    log.warn({ threadId, err }, 'sandbox session close failed'),
+                );
+            }
         } finally {
             this.threads.delete(threadId);
         }
     }
 
-    /**
-     * Aggregate view across every live thread — the data source for
-     * `flopsy tasks` and the top-level `flopsy status` work surface.
-     * Applies filters (thread, status, limit) and sorts active-first
-     * then recent-first by end time.
-     */
     queryAllTasks(filter: TaskListFilter = {}): AggregateTaskSummary[] {
         const statusFilter = filter.status ? new Set(filter.status) : null;
         const out: AggregateTaskSummary[] = [];
@@ -766,7 +818,6 @@ export class TeamHandler implements AgentHandler {
                 });
             }
         }
-        // Active first, then recent by endedAt desc.
         out.sort((a, b) => {
             const aActive = a.status === 'pending' || a.status === 'running' || a.status === 'idle';
             const bActive = b.status === 'pending' || b.status === 'running' || b.status === 'idle';
@@ -784,10 +835,7 @@ export class TeamHandler implements AgentHandler {
         await Promise.allSettled(
             entries.map((e) => e.entry.harnessInterceptor?.flush() ?? Promise.resolve()),
         );
-        // Flush + close the checkpoint DB cleanly. If the store exposes a
-        // close() method (SqliteCheckpointStore does), call it so WAL is
-        // checkpointed to the main DB file before the process exits —
-        // otherwise the next boot spends extra cycles replaying WAL.
+        // WAL checkpoint on shutdown — otherwise the next boot replays it.
         const closable = this.checkpointer as { close?: () => void | Promise<void> };
         if (typeof closable.close === 'function') {
             try {
@@ -796,7 +844,6 @@ export class TeamHandler implements AgentHandler {
                 log.warn({ err: redactSecrets(err) }, 'checkpoint store close failed');
             }
         }
-        // Tear down spawned MCP child processes so they don't linger.
         try {
             await this.mcpManager.closeAll();
         } catch (err) {
@@ -804,21 +851,6 @@ export class TeamHandler implements AgentHandler {
         }
     }
 
-    /**
-     * Resolve the inbound peer-routing-key into an effective threadId
-     * carrying the active session (PR 4 — peer + session model).
-     *
-     * Idempotent on already-resolved keys: if `rawKey` already contains
-     * the `#` separator, treat it as already-resolved and pass through
-     * unchanged (used by proactive engine which resolves at fire time
-     * with its own source semantics, and by /new slash command which
-     * forces rotation explicitly).
-     *
-     * Parses peerInfo from the routing-key shape `<channel>:<scope>:<peerNativeId>`.
-     * If the shape doesn't match (legacy or odd input), passes through
-     * unchanged — no rotation, no migration. This keeps the failure mode
-     * "behave like before" instead of "drop messages."
-     */
     private resolveSessionThreadId(rawKey: string, role: InvokeRole): string {
         if (rawKey.includes('#')) return rawKey;
         const parts = rawKey.split(':');
@@ -835,23 +867,28 @@ export class TeamHandler implements AgentHandler {
                 { source },
             );
 
-            // Queue an away recap when a session rotates on idle so the model
-            // can greet the user with "where we left off" context. Only fires
-            // when an AwayReviewer is configured — otherwise this is a no-op.
             if (
                 result.isNew &&
-                result.closeReason === 'idle' &&
                 result.previousSessionId &&
-                this.awayReviewer
+                result.closeReason !== 'migration' &&
+                this.sessionExtractor
             ) {
                 const prevThreadId = `${result.peerId}#${result.previousSessionId}`;
-                const recapPromise = this.awayReviewer
-                    .generateRecap(prevThreadId)
+                const prevSessionId = result.previousSessionId;
+                const peerId = result.peerId;
+                // Fire-and-forget: feeds pendingRecapPromises so the new session's first turn can race it.
+                const summaryPromise = this.runSessionExtraction(prevThreadId, prevSessionId, peerId)
+                    .then((r) => r?.summary ?? null)
                     .catch(() => null);
-                this.pendingRecapPromises.set(result.threadId, recapPromise);
+                this.pendingRecapPromises.set(result.threadId, summaryPromise);
                 log.debug(
-                    { peerId: result.peerId, prevThreadId, newThreadId: result.threadId },
-                    'away recap queued for new idle session',
+                    {
+                        peerId,
+                        prevThreadId,
+                        newThreadId: result.threadId,
+                        closeReason: result.closeReason,
+                    },
+                    'session rotated: extraction queued',
                 );
             }
 
@@ -865,106 +902,585 @@ export class TeamHandler implements AgentHandler {
         }
     }
 
-    forceNewSession(rawKey: string): string | undefined {
-        // rawKey is the peer routing key: `channel:scope:nativeId`
+    private resolveActiveSessionId(rawKey: string): string | null {
+        const peerKey = rawKey.split('#')[0] ?? rawKey;
+        const active = this.store.getActiveSession(peerKey);
+        return active?.sessionId ?? null;
+    }
+
+    async forceNewSession(
+        rawKey: string,
+    ): Promise<{ sessionId: string; summary: string | null } | undefined> {
         const parts = rawKey.split(':');
         if (parts.length < 3) return undefined;
         const [channel, scope, ...rest] = parts;
         const peerNativeId = rest.join(':');
         if (!channel || !scope || !peerNativeId) return undefined;
+
+        let result: ReturnType<typeof this.sessionResolver.resolve>;
         try {
-            const result = this.sessionResolver.resolve(
+            result = this.sessionResolver.resolve(
                 rawKey,
                 { channel, scope, peerNativeId },
                 { source: 'user', force: true },
             );
-            log.info({ rawKey, newSessionId: result.sessionId }, '/new: forced session rotation');
-            return result.sessionId;
         } catch (err) {
             log.warn({ err: redactSecrets(err), rawKey }, 'forceNewSession failed');
             return undefined;
         }
+
+        log.info({ rawKey, newSessionId: result.sessionId }, '/new: forced session rotation');
+
+        if (result.previousSessionId) {
+            try {
+                const prevPersonality = this.store.getSessionPersonality(result.previousSessionId);
+                if (prevPersonality) {
+                    this.store.setSessionPersonality(result.sessionId, prevPersonality);
+                    log.debug(
+                        { threadId: result.threadId, personality: prevPersonality },
+                        '/new: carried forward active personality',
+                    );
+                }
+            } catch (err) {
+                log.warn(
+                    { err: redactSecrets(err), threadId: result.threadId },
+                    '/new: personality carry-forward failed; new session starts at default',
+                );
+            }
+        }
+
+        if (!result.previousSessionId || !this.sessionExtractor) {
+            return { sessionId: result.sessionId, summary: null };
+        }
+
+        const prevThreadId = `${result.peerId}#${result.previousSessionId}`;
+        const extraction = await this.runSessionExtraction(
+            prevThreadId,
+            result.previousSessionId,
+            result.peerId,
+        ).catch((err: unknown) => {
+            log.warn(
+                { err: redactSecrets(err), prevThreadId },
+                '/new: session extraction failed; continuing with empty summary',
+            );
+            return null;
+        });
+
+        // Inline prepend on the next user turn — <last_session> in the system prompt is too weak.
+        if (extraction?.summary) {
+            this.pendingRecapPromises.set(
+                result.threadId,
+                Promise.resolve(extraction.summary),
+            );
+            log.debug(
+                { threadId: result.threadId, chars: extraction.summary.length },
+                '/new: recap queued for first-turn prepend',
+            );
+        }
+
+        return { sessionId: result.sessionId, summary: extraction?.summary ?? null };
     }
 
-    resolveProactiveThreadId(
-        channelName: string,
-        peer: { id: string; type: 'user' | 'group' | 'channel' },
-        source: 'heartbeat' | 'cron',
-    ): string | undefined {
-        // Map peer.type → the scope segment used in our peerId format.
-        const scope = peer.type === 'user' ? 'dm' : peer.type;
-        const peerId = `${channelName}:${scope}:${peer.id}`;
+    /**
+     * Compact the peer's active session: summarise the checkpoint message
+     * history via LLM, then replace it with a single synthetic system
+     * message containing that summary. Frees context-window space without
+     * losing continuity. Used by the `/compact` slash command.
+     */
+    async compactSession(
+        rawKey: string,
+    ): Promise<{ messageCount: number; summary: string } | undefined> {
+        const peerKey = rawKey.split('#')[0] ?? rawKey;
+        const active = this.store.getActiveSession(peerKey);
+        if (!active) return undefined;
+
+        const threadId = `${peerKey}#${active.sessionId}`;
+
+        // Load the latest checkpoint for this thread.
+        const checkpoint = await CheckpointManager.latest<Record<string, unknown>>(
+            this.checkpointer,
+            threadId,
+        );
+        if (!checkpoint) return undefined;
+
+        // Extract the messages array from the checkpoint state.
+        const rawMessages = checkpoint.state['messages'];
+        if (!Array.isArray(rawMessages) || rawMessages.length === 0) return undefined;
+
+        // Require at least 10 messages — below that, compaction is wasteful.
+        const MIN_MESSAGES_FOR_COMPACT = 10;
+        if (rawMessages.length < MIN_MESSAGES_FOR_COMPACT) return undefined;
+
+        // Build transcript text from persisted messages. Cap each message
+        // body to 600 chars so very long assistant replies don't explode the
+        // summarisation prompt.
+        const PER_MESSAGE_CHAR_LIMIT = 600;
+        const COMPACT_SYSTEM_PROMPT = [
+            'You are a conversation summarizer.',
+            'The following is a conversation between a user and an AI assistant.',
+            'Create a concise but complete summary that preserves:',
+            '- Key decisions and outcomes',
+            '- Important facts or data discussed',
+            '- Any tasks that were started or completed',
+            '- The current state/context the user would need to continue work',
+            '',
+            'Format: A single paragraph or short bullet list. Be concise.',
+        ].join('\n');
+
+        const transcript = rawMessages
+            .map((m: unknown) => {
+                if (!m || typeof m !== 'object') return null;
+                const msg = m as Record<string, unknown>;
+                const role = typeof msg['role'] === 'string' ? msg['role'] : 'unknown';
+                const rawContent = msg['content'];
+                let body: string;
+                if (typeof rawContent === 'string') {
+                    body = rawContent;
+                } else if (Array.isArray(rawContent)) {
+                    body = rawContent
+                        .filter(
+                            (b): b is { type: string; text: string } =>
+                                b !== null &&
+                                typeof b === 'object' &&
+                                (b as Record<string, unknown>)['type'] === 'text' &&
+                                typeof (b as Record<string, unknown>)['text'] === 'string',
+                        )
+                        .map((b) => b.text)
+                        .join('');
+                } else {
+                    return null;
+                }
+                const prefix = role === 'user' ? 'User' : role === 'assistant' ? 'Assistant' : 'System';
+                return `${prefix}: ${body.slice(0, PER_MESSAGE_CHAR_LIMIT)}`;
+            })
+            .filter((line): line is string => line !== null)
+            .join('\n');
+
+        if (transcript.trim().length === 0) return undefined;
+
+        let summary: string;
         try {
-            const result = this.sessionResolver.resolve(
-                peerId,
-                { channel: channelName, scope, peerNativeId: peer.id },
-                { source },
+            const signal = AbortSignal.timeout(60_000);
+            const response = await this.config.model.invoke(
+                [
+                    { role: 'system', content: COMPACT_SYSTEM_PROMPT },
+                    { role: 'user', content: `CONVERSATION:\n${transcript}\n\nSummarize concisely.` },
+                ],
+                { signal },
             );
-            return result.threadId;
+            const content = response.content;
+            if (typeof content === 'string') {
+                summary = content.trim();
+            } else if (Array.isArray(content)) {
+                summary = (content as ContentBlock[])
+                    .filter((b): b is TextBlock => b.type === 'text')
+                    .map((b) => b.text)
+                    .join('')
+                    .trim();
+            } else {
+                summary = '';
+            }
         } catch (err) {
-            log.warn(
-                { err: redactSecrets(err), peerId },
-                'resolveProactiveThreadId failed — will use ephemeral thread',
-            );
+            log.warn({ err: redactSecrets(err), threadId }, '/compact: LLM summarisation failed');
             return undefined;
+        }
+
+        if (!summary) return undefined;
+
+        // Replace checkpoint state with a single synthetic system message.
+        const summaryMessage = {
+            role: 'system',
+            content: `[Session compacted — ${rawMessages.length} earlier messages summarised]\n\n${summary}`,
+        };
+        const compactedState: Record<string, unknown> = {
+            ...checkpoint.state,
+            messages: [summaryMessage],
+        };
+
+        await this.checkpointer.save({
+            ...checkpoint,
+            checkpointId: `${threadId}:compact:${Date.now()}`,
+            state: compactedState,
+            savedAt: Date.now(),
+            metadata: {
+                ...(checkpoint.metadata ?? {}),
+                compactedAt: Date.now(),
+                compactedMessageCount: rawMessages.length,
+            },
+        });
+
+        // Evict cached thread so the next invoke reloads from the new checkpoint.
+        this.evictPeerThreads(peerKey);
+
+        log.info(
+            { threadId, messageCount: rawMessages.length, summaryChars: summary.length },
+            '/compact: session compacted',
+        );
+
+        return { messageCount: rawMessages.length, summary };
+    }
+
+    // Iterates every matching thread because post-/new the OLD thread is the one users want cleared.
+    cancelPlan(rawKey: string): boolean {
+        let cleared = false;
+        for (const [threadId, entry] of this.threads) {
+            if (!isThreadForRawKey(threadId, rawKey)) continue;
+            const controller = entry.entry.planningController;
+            if (!controller) continue;
+            if (controller.cancel(threadId)) cleared = true;
+        }
+        return cleared;
+    }
+
+    getPlanState(rawKey: string): {
+        mode: 'idle' | 'drafting' | 'approved';
+        hasPlan: boolean;
+        objective?: string;
+    } | null {
+        let best: { threadId: string; lastTouched: number; entry: ThreadEntry } | null = null;
+        for (const [threadId, entry] of this.threads) {
+            if (!isThreadForRawKey(threadId, rawKey)) continue;
+            if (!entry.entry.planningController) continue;
+            const touched = entry.lastUsedAt;
+            if (!best || touched > best.lastTouched) {
+                best = { threadId, lastTouched: touched, entry };
+            }
+        }
+        if (!best) return null;
+        return best.entry.entry.planningController!.getState(best.threadId);
+    }
+
+    listMcpServers(): ReadonlyArray<{
+        name: string;
+        status: 'connected' | 'skipped' | 'failed' | 'disabled';
+        reason?: string;
+        toolCount?: number;
+    }> {
+        const out: Array<{
+            name: string;
+            status: 'connected' | 'skipped' | 'failed' | 'disabled';
+            reason?: string;
+            toolCount?: number;
+        }> = [];
+        const connectedSet = new Set(this.mcpManager.connectedServerNames);
+        const failedMap = this.mcpManager.failedServers;
+        const skippedMap = this.mcpSkipReasons;
+
+        for (const [name, cfg] of Object.entries(this.mcpServersCfg)) {
+            if (cfg.enabled === false) {
+                out.push({ name, status: 'disabled' });
+                continue;
+            }
+            if (connectedSet.has(name)) {
+                const tools = this.mcpToolCounts.get(name);
+                out.push({ name, status: 'connected', ...(tools !== undefined ? { toolCount: tools } : {}) });
+                continue;
+            }
+            if (failedMap[name]) {
+                out.push({ name, status: 'failed', reason: failedMap[name] });
+                continue;
+            }
+            if (skippedMap[name]) {
+                out.push({ name, status: 'skipped', reason: skippedMap[name] });
+                continue;
+            }
+            out.push({ name, status: 'skipped', reason: 'never loaded' });
+        }
+        return out.sort((a, b) => a.name.localeCompare(b.name));
+    }
+
+    // Without evictCachedThreads, existing conversations keep their stale boot-time tool list.
+    async reloadMcp(opts?: { evictCachedThreads?: boolean }): Promise<{
+        connected: string[];
+        skipped: Array<{ name: string; reason: string }>;
+        failed: Array<{ name: string; reason: string }>;
+        evictedCachedThreads: boolean;
+    }> {
+        const beforeConnected = new Set(this.mcpManager.connectedServerNames);
+
+        const { servers, skipped } = await loadMcpServers(this.mcpServersCfg);
+
+        this.mcpSkipReasons = { ...skipped };
+
+        if (servers.length > 0) {
+            await this.mcpManager.connect(servers);
+        }
+
+        if (this.mcpManager.connectedServerNames.length > 0) {
+            this.mcpReady = bridgeAllTools(this.mcpManager).then((tools) => {
+                this.mcpToolCounts.clear();
+                for (const t of tools) {
+                    this.mcpToolCounts.set(t.mcpServer, (this.mcpToolCounts.get(t.mcpServer) ?? 0) + 1);
+                }
+                return tools;
+            });
+            await this.mcpReady;
+        }
+
+        const afterConnected = new Set(this.mcpManager.connectedServerNames);
+        const newlyConnected = [...afterConnected].filter((n) => !beforeConnected.has(n)).sort();
+
+        const failedAfter = this.mcpManager.failedServers;
+
+        let evictedCachedThreads = false;
+        if (opts?.evictCachedThreads && newlyConnected.length > 0) {
+            const victimIds = [...this.threads.keys()];
+            await Promise.allSettled(
+                victimIds.map(async (id) => {
+                    const entry = this.threads.get(id);
+                    if (!entry) return;
+                    await entry.entry.sandboxSession?.close().catch(() => undefined);
+                    this.threads.delete(id);
+                }),
+            );
+            evictedCachedThreads = true;
+        }
+
+        return {
+            connected: newlyConnected,
+            skipped: Object.entries(this.mcpSkipReasons).map(([name, reason]) => ({ name, reason })),
+            failed: Object.entries(failedAfter).map(([name, reason]) => ({ name, reason })),
+            evictedCachedThreads,
+        };
+    }
+
+    async branchSession(
+        rawKey: string,
+        label: string,
+    ): Promise<
+        | { ok: true; sessionId: string; label: string }
+        | { ok: false; reason: 'no-active-session' | 'duplicate' | 'invalid-label' | 'failed' }
+    > {
+        const trimmed = label.trim();
+        if (trimmed.length === 0) return { ok: false, reason: 'invalid-label' };
+
+        const peerKey = rawKey.split('#')[0] ?? rawKey;
+        const active = this.store.getActiveSession(peerKey);
+        if (!active) return { ok: false, reason: 'no-active-session' };
+
+        const srcThreadId = `${peerKey}#${active.sessionId}`;
+        try {
+            const newRow = this.store.forkSession({
+                peerId: peerKey,
+                srcSessionId: active.sessionId,
+                srcThreadId,
+                newThreadId: (newSessionId) => `${peerKey}#${newSessionId}`,
+                label: trimmed,
+                source: 'user',
+            });
+
+            const newThreadId = `${peerKey}#${newRow.sessionId}`;
+
+            // The `messages` table is FTS-only; the agent's working memory lives in the checkpoint store.
+            try {
+                await CheckpointManager.fork(this.checkpointer, {
+                    sourceThreadId: srcThreadId,
+                    newThreadId,
+                    metadata: { branchLabel: trimmed },
+                });
+            } catch (err) {
+                if (err instanceof Error && err.message.includes('no checkpoints')) {
+                    log.debug(
+                        { srcThreadId, newThreadId },
+                        '/branch: source thread has no checkpoints to clone — new branch starts empty',
+                    );
+                } else {
+                    throw err;
+                }
+            }
+
+            this.evictPeerThreads(peerKey);
+
+            log.info(
+                { peerId: peerKey, newSessionId: newRow.sessionId, label: trimmed },
+                '/branch: forked session + cloned checkpoint state',
+            );
+            return { ok: true, sessionId: newRow.sessionId, label: trimmed };
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (msg.includes('UNIQUE constraint failed')) {
+                return { ok: false, reason: 'duplicate' };
+            }
+            log.warn({ rawKey, err: redactSecrets(err) }, 'branchSession failed');
+            return { ok: false, reason: 'failed' };
         }
     }
 
-    private async getOrCreateThread(threadId: string): Promise<ThreadEntry> {
+    async switchBranch(
+        rawKey: string,
+        label: string,
+    ): Promise<
+        | { ok: true; sessionId: string; label: string }
+        | { ok: false; reason: 'unknown-label' | 'invalid-label' }
+    > {
+        const trimmed = label.trim();
+        if (trimmed.length === 0) return { ok: false, reason: 'invalid-label' };
+
+        const peerKey = rawKey.split('#')[0] ?? rawKey;
+        const target = this.store.switchToBranch(peerKey, trimmed);
+        if (!target) return { ok: false, reason: 'unknown-label' };
+
+        this.evictPeerThreads(peerKey);
+        log.info(
+            { peerId: peerKey, sessionId: target.sessionId, label: trimmed },
+            '/branch: switched to branch',
+        );
+        return { ok: true, sessionId: target.sessionId, label: trimmed };
+    }
+
+    listBranches(rawKey: string): SessionRow[] {
+        const peerKey = rawKey.split('#')[0] ?? rawKey;
+        return this.store.listBranchesForPeer(peerKey);
+    }
+
+    private evictPeerThreads(peerKey: string): void {
+        for (const k of [...this.threads.keys()]) {
+            if (k === peerKey || k.startsWith(`${peerKey}#`)) {
+                this.threads.delete(k);
+            }
+        }
+    }
+
+    private async runSessionExtraction(
+        closedThreadId: string,
+        closedSessionId: string,
+        peerId: string,
+    ): Promise<ExtractionResult | null> {
+        if (!this.sessionExtractor) return null;
+
+        const skillsPath = resolveWorkspacePath('skills');
+        const existingSkills = scanExistingSkills(skillsPath);
+
+        const result = await this.sessionExtractor.extract(
+            closedThreadId,
+            peerId,
+            existingSkills,
+        );
+        if (!result) return null;
+
+        try {
+            this.store.setSessionSummary(closedSessionId, result.summary);
+
+            // Write under proposed/ so the agent does NOT auto-load unreviewed skills.
+            let proposedSkillName: string | null = null;
+            if (result.skill_proposal) {
+                const proposed = result.skill_proposal;
+                const proposedRoot = pathJoin(skillsPath, 'proposed');
+                try {
+                    const written = await writeSkillFile(
+                        proposedRoot,
+                        proposed.name,
+                        renderProposedSkillBody(proposed),
+                    );
+                    if (written) proposedSkillName = proposed.name;
+                } catch (err) {
+                    log.warn(
+                        { err: (err as Error).message, name: proposed.name, peerId },
+                        'skill proposal write failed',
+                    );
+                }
+            }
+
+            const skillsImproved: string[] = [];
+            if (result.skill_lessons.length > 0) {
+                for (const entry of result.skill_lessons) {
+                    try {
+                        const ok = await appendLessonsToSkill(
+                            skillsPath,
+                            entry.name,
+                            entry.lessons,
+                        );
+                        if (ok) skillsImproved.push(entry.name);
+                    } catch (err) {
+                        log.warn(
+                            { err: (err as Error).message, skill: entry.name, peerId },
+                            'append lessons failed',
+                        );
+                    }
+                }
+            }
+
+            log.info(
+                {
+                    peerId,
+                    closedSessionId,
+                    summaryChars: result.summary.length,
+                    skillProposed: proposedSkillName,
+                    skillsImproved,
+                },
+                'session extraction persisted',
+            );
+        } catch (err) {
+            log.warn(
+                { err: redactSecrets(err), peerId, closedSessionId },
+                'session extraction persisted partially or failed',
+            );
+        }
+
+        // 24h retention matches proactive reaper default; older child-worker checkpoints get pruned.
+        const sweepable = this.checkpointer as {
+            pruneByThreadPrefix?: (prefix: string, olderThanMs: number) => Promise<number>;
+        };
+        if (typeof sweepable.pruneByThreadPrefix === 'function') {
+            const closedThreadId = `${peerId}#${closedSessionId}`;
+            const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+            try {
+                const deleted = await sweepable.pruneByThreadPrefix(
+                    `${closedThreadId}:worker:`,
+                    ONE_DAY_MS,
+                );
+                if (deleted > 0) {
+                    log.debug(
+                        { closedThreadId, deleted },
+                        'pruned stale worker checkpoints for closed session',
+                    );
+                }
+            } catch (err) {
+                log.warn(
+                    { err: redactSecrets(err), closedThreadId },
+                    'worker-checkpoint sweep failed (non-fatal)',
+                );
+            }
+        }
+        return result;
+    }
+
+    private async getOrCreateThread(
+        threadId: string,
+        opts: { isProactive?: boolean } = {},
+    ): Promise<ThreadEntry> {
         const existing = this.threads.get(threadId);
         if (existing) return existing;
 
         const identity = await this.config.resolveThread(threadId);
 
-        // Pull MCP tools assigned to this main agent. Awaits the
-        // initial connect (first thread instantiation eats any cold-
-        // start cost; subsequent threads get the cached result).
         const allMcpTools = await this.mcpReady;
-        const mcpTools = filterToolsForAgent(
+        const filteredMcpTools = filterToolsForAgent(
             allMcpTools,
             this.entryDef.name,
             this.entryDef.mcpServers,
             this.mcpAssignToMap,
-        ) as unknown as BaseTool[];
+        );
+        const { staticMcpTools, dynamicMcpTools } = this.partitionMcpToolsByPreload(filteredMcpTools);
+        const mcpTools = dynamicMcpTools as unknown as BaseTool[];
+        const mcpPreloadedTools = staticMcpTools as unknown as BaseTool[];
 
         const member = createTeamMember(this.entryDef, {
             model: this.config.model,
             userId: identity.userId,
             userName: identity.userName,
             store: this.store,
-            // Main-agent only: token accounting interceptor shared across
-            // threads, keyed by threadId. Factory appends it to the
-            // interceptor stack when role === 'main'.
-            extraInterceptors: [this.tokens],
-            // Persistent thread state. flopsygraph auto-resumes from the
-            // latest checkpoint for this threadId on subsequent .invoke()s,
-            // so a restart doesn't wipe the conversation.
-            checkpointer: this.checkpointer,
-            // Persistent semantic memory — backs manage_memory/search_memory.
-            // Without this, flopsygraph defaulted to InMemoryStore which
-            // lost every saved memory on restart and (lacking an embedder)
-            // made search_memory return nothing — root cause of the
-            // "glitchy memory" symptom.
             memoryStore: this.memoryStore,
-            // Filtered MCP tools (gmail__send, notion__search_pages, etc.).
-            // Empty when no servers connect or none route to this agent.
-            // Passed as DYNAMIC so flopsygraph's DCL handles discovery:
-            // schemas land in the prompt only when >10 items (short names +
-            // descriptions) and agent calls __search_tools__/__load_tool__
-            // to activate. Keeps NVIDIA's system prompt from ballooning.
+            extraInterceptors: [this.tokens],
+            checkpointer: this.checkpointer,
+            extraTools: mcpPreloadedTools.length > 0 ? mcpPreloadedTools : undefined,
             extraDynamicTools: mcpTools,
-            // Team capability roster — renders into gandalf's system
-            // prompt so it knows each worker's actual MCP kit.
             teamRoster: this.buildTeamRoster(),
-            // Main agent keeps the shared user-preference namespace so user
-            // facts saved by gandalf are durable across all topics. Workers
-            // each get an isolated `memories:<name>` namespace (set by
-            // factory default) to prevent cross-worker key collisions.
-            memoryNamespace: 'memories',
-            // Per-model-call timeout: if the primary model stalls beyond this,
-            // flopsygraph throws ProviderError(0) which triggers model-fallback
-            // to switch to the next candidate — well before the 10-min turn wall.
+            personalities: this.personalities,
+            // Stall guard: triggers ProviderError(0) → model-fallback before the 10-min turn wall.
             modelCallTimeoutMs: 45_000,
+            ...(opts.isProactive ? { isProactive: true } : {}),
+            ...(this.config.observability ? { observability: this.config.observability } : {}),
         });
 
         const registry = new TaskRegistry();
@@ -996,46 +1512,27 @@ export class TeamHandler implements AgentHandler {
         return entry;
     }
 
-    /**
-     * Closure factory: given an identity, returns a function that looks up a
-     * worker by name and runs it as an ephemeral sub-agent. Workers are
-     * built fresh per call — Claude Code's approach — so their context is
-     * isolated. The parent's LearningStore IS shared so worker lessons flow
-     * back into the same pool.
-     */
     private makeSubAgentFactory(identity: ThreadIdentity, threadId: string): SubAgentFactory {
         return (workerName: string): SubAgentRunner | undefined => {
             const def = this.allowedWorkers.find((w) => w.name === workerName);
             if (!def) return undefined;
 
-            // Each delegation builds a fresh TeamMember so context doesn't
-            // bleed across tasks. Depth=1 comes from the tool's configurable
-            // construction below (main agent sets depth=0; sub-agent sets
-            // depth=1 and must not delegate further — enforced in-tool).
             return async ({ task, signal }) => {
-                // Same MCP filtering as the main agent — workers can have
-                // their own `mcpServers` allow-list OR receive servers
-                // tagged with their name in `assignTo`. mcpReady is
-                // already settled by the time gandalf delegates.
                 const allMcpTools = await this.mcpReady;
-                const workerMcpTools = filterToolsForAgent(
+                const filteredWorkerMcp = filterToolsForAgent(
                     allMcpTools,
                     def.name,
                     def.mcpServers,
                     this.mcpAssignToMap,
-                ) as unknown as BaseTool[];
+                );
+                const { staticMcpTools: workerStaticMcp, dynamicMcpTools: workerDynamicMcp } =
+                    this.partitionMcpToolsByPreload(filteredWorkerMcp);
+                const workerMcpTools = workerDynamicMcp as unknown as BaseTool[];
+                const workerPreloadedMcp = workerStaticMcp as unknown as BaseTool[];
 
-                // Resolve the worker's configured model. Without this
-                // every worker would run on gandalf's model and /status
-                // would show everything under one bucket — masking which
-                // worker actually did the work. Falls back to the main's
-                // model only if the worker has no `model` in flopsy.json5.
                 const workerModel = await resolveWorkerModel(def, this.config.model);
 
-                // P5 tool-call telemetry: warn when a worker's roster-listed
-                // MCP servers produced zero bridged tools. Catches the
-                // "disabled MCP in flopsy.json5 but still delegated to"
-                // scenario before the worker runs for minutes and gets killed.
+                // Catches "disabled in flopsy.json5 but still delegated" before a long, doomed run.
                 const rosterMcpNames = this.mcpServersForWorker(def);
                 if (rosterMcpNames.length > 0 && workerMcpTools.length === 0) {
                     log.warn(
@@ -1048,25 +1545,22 @@ export class TeamHandler implements AgentHandler {
                     );
                 }
 
+                // CheckpointStore is keyed by threadId; child threadId keeps main's slot pristine
+                // and the deterministic hash lets a restarted gateway resume mid-flight.
+                const childThreadId = `${threadId}:worker:${def.name}:${stableHash(task)}`;
+
                 const worker = createTeamMember(def, {
                     model: workerModel,
                     userId: identity.userId,
                     userName: identity.userName,
                     store: this.store,
-                    // Pass tokenCounter to workers so their LLM calls
-                    // (legolas web-lookup, gimli analysis, saruman's 10-ish
-                    // deep-research calls) land in state.db under the same
-                    // (thread, day, model) key — /status shows them all.
+                    // Worker LLM calls bucket under the same (thread, day, model) key as the main agent.
                     extraInterceptors: [this.tokens],
-                    // Share the same memory store so workers see the facts
-                    // gandalf has saved across turns (and vice versa).
-                    // Namespace isolation is the store's job, not ours.
-                    memoryStore: this.memoryStore,
-                    // Same DCL treatment as the main agent — workers also
-                    // see only __search_tools__/__load_tool__ until they
-                    // explicitly activate an MCP tool.
+                    extraTools: workerPreloadedMcp.length > 0 ? workerPreloadedMcp : undefined,
                     extraDynamicTools: workerMcpTools,
                     modelCallTimeoutMs: 60_000,
+                    checkpointer: this.checkpointer,
+                    ...(this.config.observability ? { observability: this.config.observability } : {}),
                 });
 
                 try {
@@ -1074,22 +1568,12 @@ export class TeamHandler implements AgentHandler {
                         { messages: [{ role: 'user', content: task }] },
                         {
                             signal,
-                            // Propagate the conversation's threadId so the
-                            // tokenCounter keys worker LLM calls into the
-                            // SAME (thread, day, model) bucket as gandalf's.
-                            // Without this, worker tokens would land under
-                            // an auto-generated runId and /status would miss
-                            // them for the conversation the user is in.
-                            threadId,
+                            threadId: childThreadId,
                             configurable: {
                                 userId: identity.userId,
-                                threadId,
+                                threadId: childThreadId,
+                                parentThreadId: threadId,
                                 depth: 1,
-                                // Workers never receive onReply / eventQueue /
-                                // registry — they can't send directly to the
-                                // user and can't delegate further. MAX_DEPTH
-                                // is enforced in-tool as a second line of
-                                // defence.
                             },
                         },
                     );
@@ -1103,9 +1587,14 @@ export class TeamHandler implements AgentHandler {
                         .reverse()
                         .find((m) => m.role === 'assistant');
                     if (!lastAssistant) return '';
-                    return typeof lastAssistant.content === 'string'
+                    const fullReply = typeof lastAssistant.content === 'string'
                         ? lastAssistant.content
                         : JSON.stringify(lastAssistant.content);
+                    return await this.foldWorkerReply(
+                        fullReply,
+                        workerName,
+                        task,
+                    );
                 } finally {
                     await worker.harnessInterceptor?.flush().catch((err: unknown) => {
                         log.warn(
@@ -1118,12 +1607,6 @@ export class TeamHandler implements AgentHandler {
         };
     }
 
-    /**
-     * Build the capability roster for the main agent's system prompt —
-     * one entry per enabled peer, listing toolsets + MCP servers that
-     * will actually route to them. Without this, gandalf picks workers
-     * by name alone and hallucinates capabilities that aren't there.
-     */
     private buildTeamRoster(): readonly TeamRosterEntry[] {
         return this.allowedWorkers.map((def): TeamRosterEntry => ({
             name: def.name,
@@ -1134,12 +1617,6 @@ export class TeamHandler implements AgentHandler {
         }));
     }
 
-    /**
-     * MCP server names a worker will see:
-     *   - explicit pull via `def.mcpServers` takes precedence
-     *   - otherwise each server whose assignTo includes this worker's name
-     *     (or the "*" broadcast wildcard)
-     */
     private mcpServersForWorker(def: AgentDefinition): string[] {
         const pull = def.mcpServers;
         if (pull && pull.length > 0) return [...pull];
@@ -1148,6 +1625,83 @@ export class TeamHandler implements AgentHandler {
                 assigned.includes(def.name) || assigned.includes('*'),
             )
             .map(([name]) => name);
+    }
+
+    private async foldWorkerReply(
+        fullReply: string,
+        workerName: string,
+        task: string,
+    ): Promise<string> {
+        if (!fullReply || fullReply.length < WORKER_REPLY_OFFLOAD_THRESHOLD_CHARS) {
+            return fullReply;
+        }
+
+        const fs = await import('node:fs');
+        const path = await import('node:path');
+        const dir = resolveWorkspacePath('cache', 'worker-outputs');
+        try {
+            fs.mkdirSync(dir, { recursive: true });
+        } catch (err) {
+            log.warn(
+                { err: err instanceof Error ? err.message : String(err), dir },
+                'foldWorkerReply: mkdir failed, falling back to inline truncation',
+            );
+            return (
+                fullReply.slice(0, WORKER_REPLY_PREVIEW_CHARS) +
+                `\n\n[truncated — full reply was ${fullReply.length} chars; could not offload to disk]`
+            );
+        }
+
+        const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const slug = task
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-+|-+$/g, '')
+            .slice(0, 40) || 'task';
+        const fileName = `${ts}-${workerName}-${slug}.md`;
+        const fullPath = path.join(dir, fileName);
+
+        try {
+            fs.writeFileSync(fullPath, fullReply, 'utf-8');
+        } catch (err) {
+            log.warn(
+                { err: err instanceof Error ? err.message : String(err), fullPath },
+                'foldWorkerReply: write failed, falling back to inline truncation',
+            );
+            return (
+                fullReply.slice(0, WORKER_REPLY_PREVIEW_CHARS) +
+                `\n\n[truncated — full reply was ${fullReply.length} chars; could not offload to disk]`
+            );
+        }
+
+        const relPath = path.relative(resolveWorkspacePath(''), fullPath) || fileName;
+
+        return [
+            `[handoff: ${workerName} → orchestrator]`,
+            `Reply size: ${fullReply.length.toLocaleString()} chars (${(fullReply.length / 1024).toFixed(1)} KB)`,
+            `Full reply saved to: ${relPath}`,
+            `Use read_file("${relPath}") to load the rest if you need more than the preview below.`,
+            '',
+            '--- preview ---',
+            fullReply.slice(0, WORKER_REPLY_PREVIEW_CHARS),
+            '--- end preview ---',
+        ].join('\n');
+    }
+
+    private partitionMcpToolsByPreload(
+        tools: readonly BridgedTool[],
+    ): { staticMcpTools: BridgedTool[]; dynamicMcpTools: BridgedTool[] } {
+        const staticMcpTools: BridgedTool[] = [];
+        const dynamicMcpTools: BridgedTool[] = [];
+        for (const t of tools) {
+            const cfg = this.mcpServersCfg[t.mcpServer];
+            if (cfg && cfg.preload === true) {
+                staticMcpTools.push(t);
+            } else {
+                dynamicMcpTools.push(t);
+            }
+        }
+        return { staticMcpTools, dynamicMcpTools };
     }
 
     private get allowedWorkers(): ReadonlyArray<AgentDefinition> {
@@ -1193,21 +1747,6 @@ export class TeamHandler implements AgentHandler {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Resolve the BaseChatModel a worker should run on. If the worker has
- * its own `model: "provider:name"` in flopsy.json5, build it via the
- * ModelLoader singleton (cached across calls). Otherwise inherit the
- * main agent's model so small setups still work without per-worker
- * config.
- *
- * On load failure (provider unreachable, bad name) we log and fall back
- * to the main — a degraded worker is better than a crashed turn, and
- * the 429 triggers the modelFallback interceptor anyway.
- */
 async function resolveWorkerModel(
     def: AgentDefinition,
     fallback: BaseChatModel,
@@ -1232,13 +1771,23 @@ async function resolveWorkerModel(
     }
 }
 
-/**
- * Local YYYY-MM-DD for the process's timezone. Used as the `date` column
- * in `token_usage` so day boundaries respect the user's wall clock rather
- * than UTC (which would otherwise split "today" in two for non-UTC users).
- * Computed in JS instead of `date('now')` in SQLite so a long-running
- * transaction won't straddle midnight and land writes on the wrong day.
- */
+function isThreadForRawKey(threadId: string, rawKey: string): boolean {
+    return threadId === rawKey || threadId.startsWith(rawKey + '#');
+}
+
+// FNV-1a 32-bit, base36 — non-cryptographic, deterministic across restarts.
+function stableHash(input: string): string {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < input.length; i++) {
+        h ^= input.charCodeAt(i);
+        h = Math.imul(h, 0x01000193);
+    }
+    return (h >>> 0).toString(36);
+}
+
+const WORKER_REPLY_OFFLOAD_THRESHOLD_CHARS = 1500;
+const WORKER_REPLY_PREVIEW_CHARS = 800;
+
 function localDateString(d: Date = new Date()): string {
     const y = d.getFullYear();
     const m = String(d.getMonth() + 1).padStart(2, '0');
@@ -1246,17 +1795,6 @@ function localDateString(d: Date = new Date()): string {
     return `${y}-${m}-${day}`;
 }
 
-/**
- * Build the LLM content payload for an inbound turn.
- *
- * Images with binary data or a URL become vision ContentBlocks placed before
- * the text so the model can reference them naturally. Images without data (e.g.
- * oversized or download-failed) fall back to an inline notice appended to the
- * text body so the model knows something was there but couldn't be loaded.
- *
- * Non-image media types (video, document, sticker, location) are already
- * encoded as structured text by the channel adapters — nothing extra to emit.
- */
 function buildContent(
     text: string,
     media?: ReadonlyArray<InboundMedia>,
@@ -1298,12 +1836,6 @@ function redactSecrets(err: unknown): { name?: string; message: string; stack?: 
     return { message: scrubPii(String(err)) };
 }
 
-/**
- * Extract the static (config-driven) fields from an AgentDefinition so
- * `/team` in chat carries the same metadata that `flopsy team show` does
- * on the CLI side — role, domain, model, toolsets, mcp servers, sandbox
- * toggle — without the handler needing to re-read flopsy.json5.
- */
 function staticConfigFields(def: AgentDefinition): Partial<import('@flopsy/gateway').TeamMemberStatus> {
     const sb = (def as AgentDefinition & { sandbox?: Record<string, unknown> }).sandbox;
     const sandbox = sb && sb['enabled'] === true
@@ -1324,4 +1856,23 @@ function staticConfigFields(def: AgentDefinition): Partial<import('@flopsy/gatew
         ...(def.mcpServers && def.mcpServers.length > 0 ? { mcpServers: def.mcpServers } : {}),
         ...(sandbox ? { sandbox } : {}),
     };
+}
+
+
+// Frontmatter `name` MUST match the directory name or the skills() interceptor silently drops it.
+function renderProposedSkillBody(p: SkillProposal): string {
+    const cleanBody = p.body.replace(/^---[\s\S]*?\n---\n?/, '').trim();
+    const today = new Date().toISOString().slice(0, 10);
+    return [
+        '---',
+        `name: ${p.name}`,
+        `description: ${p.description.replace(/\n/g, ' ').trim()}`,
+        `when-to-use: ${p.when_to_use.replace(/\n/g, ' ').trim()}`,
+        'source: extractor',
+        `proposed-on: ${today}`,
+        '---',
+        '',
+        cleanBody,
+        '',
+    ].join('\n');
 }

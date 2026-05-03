@@ -2,12 +2,11 @@ import Database from 'better-sqlite3';
 import { realpathSync } from 'fs';
 import { dirname, resolve } from 'path';
 import { createLogger, resolveFlopsyHome, resolveWorkspacePath, ensureDir } from '@flopsy/shared';
-import type { Strategy, Lesson } from '@shared/types';
 
 const log = createLogger('learning-store');
 
 /** Current schema version. Bump when adding new tables or columns. */
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 2;
 
 /** Concurrency tuning — mirrors Hermes' proven pattern for multi-process SQLite. */
 const BUSY_TIMEOUT_MS = 1_000;
@@ -16,88 +15,19 @@ const WRITE_RETRY_MIN_MS = 20;
 const WRITE_RETRY_MAX_MS = 150;
 const CHECKPOINT_EVERY_N_WRITES = 50;
 
-export interface SkillEffectivenessEntry {
-    effectiveness: number;
-    successRate: number;
-    useCount: number;
-    successCount: number;
-    failureCount: number;
-    lastUsed: number;
-    lastUpdated: number;
-    tags: string[];
+// Public learning-layer types — minimal, peer-keyed primitives.
+
+export interface ToolFailureRow {
+    peerId: string;
+    toolName: string;
+    errorPattern: string;
+    count: number;
+    firstSeen: number;
+    lastSeen: number;
 }
 
-export interface FactRow {
-    id: string;
-    userId: string;
-    subject: string;
-    predicate: string;
-    object: string;
-    validityStart: number;
-    validityEnd: number | null;
-    confidence: number;
-    source: string;
-}
-
-// ---------------------------------------------------------------------------
 // Raw DB row shapes — mirror the DDL column names (snake_case).
-// These live next to the queries so drift shows up at compile time.
-// ---------------------------------------------------------------------------
-
-interface DbStrategyRow {
-    id: string;
-    user_id: string;
-    name: string;
-    description: string | null;
-    domain: string | null;
-    effectiveness: number;
-    uses: number;
-    last_used: number;
-    created_at: number;
-    refinements: number;
-    linked_skill_id: string | null;
-    tags: string;
-}
-
-interface DbLessonRow {
-    id: string;
-    user_id: string;
-    rule: string;
-    reason: string | null;
-    domain: string | null;
-    severity: string;
-    recorded_at: number;
-    prevention_count: number;
-    applies_to: string;
-    example_mistake: string | null;
-    correction: string | null;
-    tags: string;
-}
-
-interface DbSkillMetaRow {
-    user_id: string;
-    skill_name: string;
-    effectiveness: number;
-    success_rate: number;
-    use_count: number;
-    success_count: number;
-    failure_count: number;
-    last_used: number;
-    last_updated: number;
-    tags: string;
-}
-
-interface DbFactRow {
-    id: string;
-    user_id: string;
-    subject: string;
-    predicate: string;
-    object: string;
-    validity_start: number;
-    validity_end: number | null;
-    confidence: number;
-    source: string;
-}
+// They live next to the queries so drift shows up at compile time.
 
 interface DbPeerRow {
     peer_id: string;
@@ -118,16 +48,10 @@ interface DbSessionRow {
     turn_count: number;
     last_user_message_at: number;
     source: string;
-}
-
-interface DbTopSkillRow {
-    name: string;
-    effectiveness: number;
-    successRate: number;
-}
-
-interface DbEffectivenessRow {
-    effectiveness: number;
+    summary: string | null;
+    active_personality: string | null;
+    branch_label: string | null;
+    parent_session_id: string | null;
 }
 
 /** Summed totals across providers/models for a single (thread, date). */
@@ -185,21 +109,64 @@ interface DbMessageRow {
     created_at: number;
 }
 
+/** Lifecycle states for a `spawn_background_task` row. */
+export type BackgroundTaskStatus =
+    | 'running'
+    | 'completed'
+    | 'delivered'
+    | 'failed'
+    | 'killed';
+
+/** Persisted background task — durable mirror of in-memory TaskRegistry state. */
+export interface BackgroundTaskRow {
+    taskId: string;
+    threadId: string;
+    workerName: string;
+    taskPrompt: string;
+    toolAllowlist: readonly string[] | null;
+    timeoutMs: number | null;
+    deliveryMode: string | null;
+    status: BackgroundTaskStatus;
+    createdAt: number;
+    endedAt: number | null;
+    result: string | null;
+    error: string | null;
+    description: string | null;
+}
+
+interface DbBackgroundTaskRow {
+    task_id: string;
+    thread_id: string;
+    worker_name: string;
+    task_prompt: string;
+    tool_allowlist: string | null;
+    timeout_ms: number | null;
+    delivery_mode: string | null;
+    status: BackgroundTaskStatus;
+    created_at: number;
+    ended_at: number | null;
+    result: string | null;
+    error: string | null;
+    description: string | null;
+}
+
 interface DbMessageSearchRow extends DbMessageRow {
     rank: number;
     snippet: string;
 }
 
 /**
- * LearningStore — unified SQLite backend for the harness.
+ * LearningStore — SQLite backend for harness state.
  *
  * Stores:
- *   - LEARNING state: strategies, lessons, skill effectiveness, facts
- *   - TOKEN accounting: per-(thread, day, provider, model) buckets
- *   - MESSAGES: user+assistant turns with an FTS5 index for session search
- *     (the agent's `search_past_conversations` tool reads this to answer
- *     "did I mention X last week?"). Only final-turn messages are persisted
- *     — intermediate tool loops stay in flopsygraph's checkpoint store.
+ *   - PEERS + SESSIONS: session lifecycle and per-peer continuity.
+ *   - TOOL FAILURES: per-(peer, tool, error) recurring-error tracking.
+ *   - TOKEN accounting: per-(thread, day, provider, model) buckets.
+ *   - MESSAGES: user+assistant turns with an FTS5 index for session search.
+ *   - BACKGROUND TASKS: durable mirror of in-memory TaskRegistry state.
+ *
+ * Per-peer agent memory (profile / notes / directives) lives in the
+ * unified BaseStore (memory.db) — see SqliteMemoryStore in flopsygraph.
  *
  * Hermes-style concurrency: WAL, 1s busy_timeout, 15-retry write loop with
  * 20-150ms jitter, BEGIN IMMEDIATE transactions, PASSIVE checkpoint every
@@ -210,18 +177,13 @@ export class LearningStore {
     private readonly dbPath: string;
     private writeCount = 0;
     private closed = false;
-    /**
-     * Backing buffer for Atomics.wait — sleeps the thread without event-loop
-     * blocking. Allocated once, zero-initialised, never written to (we only
-     * read a value that never matches, so wait always times out).
-     */
+    /** Atomics.wait buffer — sleeps without blocking the event loop. */
     private readonly retrySleepView: Int32Array = new Int32Array(
         new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT),
     );
 
     constructor(dbPath?: string) {
-        // Default: <workspace-root>/harness/state.db (FLOPSY_HOME-aware).
-        this.dbPath = dbPath ?? resolveWorkspacePath('harness', 'state.db');
+        this.dbPath = dbPath ?? resolveWorkspacePath('state', 'learning.db');
         ensurePathInAllowedRoots(this.dbPath);
         ensureDir(dirname(this.dbPath));
 
@@ -246,371 +208,86 @@ export class LearningStore {
         this.db.close();
     }
 
+    /**
+     * Hand out the underlying SQLite connection so satellite stores
+     * (PairingStore, etc.) can share it without opening a second writer.
+     * Callers MUST treat the connection as read/write but never close it.
+     */
+    getDatabase(): Database.Database {
+        return this.db;
+    }
+
     get isClosed(): boolean {
         return this.closed;
     }
 
-    // STRATEGIES --------------------------------------------------------------
-
-    createStrategy(userId: string, strategy: Omit<Strategy, 'id'> & { id?: string }): Strategy {
-        const id =
-            strategy.id ?? `strategy_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-        const full: Strategy = { ...strategy, id } as Strategy;
-
+    /**
+     * Record a tool failure. UPSERT: same (peer, tool, pattern) triple
+     * increments `count` and refreshes `last_seen`. Empty pattern → no-op
+     * (some adapters surface blank errors and we don't want to pollute
+     * the table with rows that mean nothing).
+     */
+    recordToolFailure(args: {
+        peerId: string;
+        toolName: string;
+        errorPattern: string;
+    }): void {
+        const pattern = args.errorPattern.trim();
+        if (pattern.length === 0) return;
+        const now = Date.now();
         this.runWrite(() => {
             this.db
                 .prepare(
-                    `INSERT OR REPLACE INTO strategies
-            (id, user_id, name, description, domain, effectiveness, uses, last_used, created_at, refinements, linked_skill_id, tags)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    `INSERT INTO tool_failures
+                        (peer_id, tool_name, error_pattern, count, first_seen, last_seen)
+                     VALUES (?, ?, ?, 1, ?, ?)
+                     ON CONFLICT(peer_id, tool_name, error_pattern) DO UPDATE SET
+                        count = count + 1,
+                        last_seen = excluded.last_seen`,
                 )
-                .run(
-                    full.id,
-                    userId,
-                    full.name,
-                    full.description,
-                    full.domain ?? null,
-                    full.effectiveness,
-                    full.uses,
-                    full.lastUsed,
-                    full.createdAt,
-                    full.refinements,
-                    full.linkedSkillId ?? null,
-                    JSON.stringify(full.tags ?? []),
-                );
-        });
-
-        return full;
-    }
-
-    getStrategy(id: string): Strategy | null {
-        const row = this.db.prepare(`SELECT * FROM strategies WHERE id = ?`).get(id) as
-            | DbStrategyRow
-            | undefined;
-        return row ? rowToStrategy(row) : null;
-    }
-
-    getStrategiesForUser(userId: string): Strategy[] {
-        const rows = this.db
-            .prepare(`SELECT * FROM strategies WHERE user_id = ? ORDER BY effectiveness DESC`)
-            .all(userId) as DbStrategyRow[];
-        return rows.map(rowToStrategy);
-    }
-
-    getTopStrategiesByEffectiveness(userId: string, limit = 5): Strategy[] {
-        const rows = this.db
-            .prepare(
-                `SELECT * FROM strategies WHERE user_id = ? ORDER BY effectiveness DESC LIMIT ?`,
-            )
-            .all(userId, limit) as DbStrategyRow[];
-        return rows.map(rowToStrategy);
-    }
-
-    getStrategiesByDomain(userId: string, domain: string): Strategy[] {
-        const rows = this.db
-            .prepare(
-                `SELECT * FROM strategies WHERE user_id = ? AND domain = ? ORDER BY effectiveness DESC`,
-            )
-            .all(userId, domain) as DbStrategyRow[];
-        return rows.map(rowToStrategy);
-    }
-
-    updateStrategyEffectiveness(id: string, signalStrength: number): void {
-        this.runWrite(() => {
-            this.applyEffectivenessDelta(id, signalStrength);
+                .run(args.peerId, args.toolName, pattern, now, now);
         });
     }
 
     /**
-     * Apply multiple effectiveness updates in one transaction. Preferred over
-     * repeated `updateStrategyEffectiveness` calls from tight loops — avoids
-     * N separate BEGIN IMMEDIATE/COMMIT cycles.
+     * Return the most-recent tool failures for a peer, capped at `limit` and
+     * filtered to the last `windowMs` (default 7 days). Sorted by recency
+     * with ties broken by repeat count (heavier patterns surface first).
      */
-    batchUpdateStrategyEffectiveness(
-        updates: ReadonlyArray<{ id: string; signalStrength: number }>,
-    ): void {
-        if (updates.length === 0) return;
-        this.runWrite(() => {
-            for (const u of updates) this.applyEffectivenessDelta(u.id, u.signalStrength);
-        });
-    }
-
-    /** Caller must already be inside a runWrite transaction. */
-    private applyEffectivenessDelta(id: string, signalStrength: number): void {
-        const row = this.db.prepare(`SELECT effectiveness FROM strategies WHERE id = ?`).get(id) as
-            | DbEffectivenessRow
-            | undefined;
-        if (!row) return;
-
-        const boosted = row.effectiveness * (1 + signalStrength * 0.1);
-        const clamped = Math.max(0.2, Math.min(1.0, boosted));
-
-        this.db
-            .prepare(
-                `UPDATE strategies
-            SET effectiveness = ?, uses = uses + 1, last_used = ?, refinements = refinements + 1
-          WHERE id = ?`,
-            )
-            .run(clamped, Date.now(), id);
-    }
-
-    deleteStrategy(id: string): void {
-        this.runWrite(() => {
-            this.db.prepare(`DELETE FROM strategies WHERE id = ?`).run(id);
-        });
-    }
-
-    // LESSONS -----------------------------------------------------------------
-
-    createLesson(userId: string, lesson: Omit<Lesson, 'id'> & { id?: string }): Lesson {
-        const id = lesson.id ?? `lesson_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-        const full: Lesson = { ...lesson, id } as Lesson;
-
-        this.runWrite(() => {
-            this.db
-                .prepare(
-                    `INSERT OR REPLACE INTO lessons
-            (id, user_id, rule, reason, domain, severity, recorded_at, prevention_count, applies_to, example_mistake, correction, tags)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                )
-                .run(
-                    full.id,
-                    userId,
-                    full.rule,
-                    full.reason,
-                    full.domain ?? null,
-                    full.severity,
-                    full.recordedAt,
-                    full.preventionCount ?? 0,
-                    full.appliesTo,
-                    full.exampleMistake ?? null,
-                    full.correction ?? null,
-                    JSON.stringify(full.tags ?? []),
-                );
-        });
-
-        return full;
-    }
-
-    getLessonsForUser(userId: string): Lesson[] {
-        const rows = this.db
-            .prepare(`SELECT * FROM lessons WHERE user_id = ? ORDER BY recorded_at DESC`)
-            .all(userId) as DbLessonRow[];
-        return rows.map(rowToLesson);
-    }
-
-    getLessonsByDomain(userId: string, domain: string): Lesson[] {
+    listRecentToolFailures(
+        peerId: string,
+        options: { limit?: number; windowMs?: number } = {},
+    ): ReadonlyArray<ToolFailureRow> {
+        const limit = Math.max(1, Math.min(options.limit ?? 5, 50));
+        const windowMs = options.windowMs ?? 7 * 24 * 60 * 60 * 1000;
+        const since = Date.now() - windowMs;
         const rows = this.db
             .prepare(
-                `SELECT * FROM lessons WHERE user_id = ? AND domain = ? ORDER BY recorded_at DESC`,
+                `SELECT peer_id, tool_name, error_pattern, count, first_seen, last_seen
+                   FROM tool_failures
+                  WHERE peer_id = ? AND last_seen >= ?
+                  ORDER BY last_seen DESC, count DESC
+                  LIMIT ?`,
             )
-            .all(userId, domain) as DbLessonRow[];
-        return rows.map(rowToLesson);
+            .all(peerId, since, limit) as Array<{
+            peer_id: string;
+            tool_name: string;
+            error_pattern: string;
+            count: number;
+            first_seen: number;
+            last_seen: number;
+        }>;
+        return rows.map((r) => ({
+            peerId: r.peer_id,
+            toolName: r.tool_name,
+            errorPattern: r.error_pattern,
+            count: r.count,
+            firstSeen: r.first_seen,
+            lastSeen: r.last_seen,
+        }));
     }
 
-    findLessonByRule(userId: string, rule: string): Lesson | null {
-        const row = this.db
-            .prepare(`SELECT * FROM lessons WHERE user_id = ? AND rule = ?`)
-            .get(userId, rule) as DbLessonRow | undefined;
-        return row ? rowToLesson(row) : null;
-    }
-
-    // SKILL EFFECTIVENESS -----------------------------------------------------
-
-    getSkillMeta(userId: string, skillName: string): SkillEffectivenessEntry | null {
-        const row = this.db
-            .prepare(`SELECT * FROM skills_meta WHERE user_id = ? AND skill_name = ?`)
-            .get(userId, skillName) as DbSkillMetaRow | undefined;
-        return row ? rowToSkillMeta(row) : null;
-    }
-
-    initSkillMeta(userId: string, skillName: string, domain?: string): SkillEffectivenessEntry {
-        const existing = this.getSkillMeta(userId, skillName);
-        if (existing) return existing;
-
-        const entry: SkillEffectivenessEntry = {
-            effectiveness: 0.5,
-            successRate: 0.5,
-            useCount: 0,
-            successCount: 0,
-            failureCount: 0,
-            lastUsed: 0,
-            lastUpdated: Date.now(),
-            tags: domain ? [domain] : [],
-        };
-
-        this.runWrite(() => {
-            this.db
-                .prepare(
-                    `INSERT INTO skills_meta
-            (user_id, skill_name, effectiveness, success_rate, use_count, success_count, failure_count, last_used, last_updated, tags)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                )
-                .run(
-                    userId,
-                    skillName,
-                    entry.effectiveness,
-                    entry.successRate,
-                    entry.useCount,
-                    entry.successCount,
-                    entry.failureCount,
-                    entry.lastUsed,
-                    entry.lastUpdated,
-                    JSON.stringify(entry.tags),
-                );
-        });
-
-        return entry;
-    }
-
-    /**
-     * Exponential smoothing: new = old * 0.7 + signalBased * 0.3, clamped [0.2, 1.0].
-     */
-    updateSkillMeta(
-        userId: string,
-        skillName: string,
-        signalStrength: number,
-    ): SkillEffectivenessEntry {
-        return this.runWrite(() => {
-            const entry =
-                this.getSkillMeta(userId, skillName) ?? this.initSkillMeta(userId, skillName);
-
-            const isSuccess = signalStrength >= 0;
-            const useCount = entry.useCount + 1;
-            const successCount = entry.successCount + (isSuccess ? 1 : 0);
-            const failureCount = entry.failureCount + (isSuccess ? 0 : 1);
-            const successRate = successCount / useCount;
-
-            const signalBased = Math.max(0, Math.min(1, 0.5 + signalStrength * 0.1));
-            const effectiveness = Math.max(
-                0.2,
-                Math.min(1.0, entry.effectiveness * 0.7 + signalBased * 0.3),
-            );
-
-            const now = Date.now();
-
-            this.db
-                .prepare(
-                    `UPDATE skills_meta
-              SET effectiveness = ?, success_rate = ?, use_count = ?,
-                  success_count = ?, failure_count = ?, last_used = ?, last_updated = ?
-            WHERE user_id = ? AND skill_name = ?`,
-                )
-                .run(
-                    effectiveness,
-                    successRate,
-                    useCount,
-                    successCount,
-                    failureCount,
-                    now,
-                    now,
-                    userId,
-                    skillName,
-                );
-
-            return {
-                ...entry,
-                effectiveness,
-                successRate,
-                useCount,
-                successCount,
-                failureCount,
-                lastUsed: now,
-                lastUpdated: now,
-            };
-        });
-    }
-
-    getTopSkills(
-        userId: string,
-        limit = 5,
-    ): Array<{ name: string; effectiveness: number; successRate: number }> {
-        return this.db
-            .prepare(
-                `SELECT skill_name AS name, effectiveness, success_rate AS successRate
-           FROM skills_meta
-          WHERE user_id = ?
-          ORDER BY effectiveness DESC
-          LIMIT ?`,
-            )
-            .all(userId, limit) as DbTopSkillRow[];
-    }
-
-    getSkillsByDomain(
-        userId: string,
-        domain: string,
-    ): Array<{ name: string; entry: SkillEffectivenessEntry }> {
-        const rows = this.db
-            .prepare(`SELECT * FROM skills_meta WHERE user_id = ?`)
-            .all(userId) as DbSkillMetaRow[];
-        return rows
-            .map((r) => ({ name: r.skill_name, entry: rowToSkillMeta(r) }))
-            .filter((s) => s.entry.tags.includes(domain));
-    }
-
-    // FACTS (bi-temporal) -----------------------------------------------------
-    //
-    // Structured long-term memory: (subject, predicate, object) tuples with
-    // validity windows. Conversation messages live in the `messages` table
-    // below with an FTS5 index; facts are the distilled form of what the
-    // agent learned from those conversations.
-
-    recordFact(fact: Omit<FactRow, 'id'> & { id?: string }): FactRow {
-        const id = fact.id ?? `fact_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-        const row: FactRow = { ...fact, id };
-
-        this.runWrite(() => {
-            this.db
-                .prepare(
-                    `UPDATE facts SET validity_end = ?
-            WHERE user_id = ? AND subject = ? AND predicate = ? AND validity_end IS NULL`,
-                )
-                .run(row.validityStart, row.userId, row.subject, row.predicate);
-
-            this.db
-                .prepare(
-                    `INSERT INTO facts
-            (id, user_id, subject, predicate, object, validity_start, validity_end, confidence, source)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                )
-                .run(
-                    row.id,
-                    row.userId,
-                    row.subject,
-                    row.predicate,
-                    row.object,
-                    row.validityStart,
-                    row.validityEnd,
-                    row.confidence,
-                    row.source,
-                );
-        });
-
-        return row;
-    }
-
-    retireFact(id: string, validityEnd: number = Date.now()): void {
-        this.runWrite(() => {
-            this.db
-                .prepare(`UPDATE facts SET validity_end = ? WHERE id = ? AND validity_end IS NULL`)
-                .run(validityEnd, id);
-        });
-    }
-
-    getCurrentFacts(userId: string, subject?: string): FactRow[] {
-        const rows = subject
-            ? (this.db
-                  .prepare(
-                      `SELECT * FROM facts WHERE user_id = ? AND subject = ? AND validity_end IS NULL`,
-                  )
-                  .all(userId, subject) as DbFactRow[])
-            : (this.db
-                  .prepare(`SELECT * FROM facts WHERE user_id = ? AND validity_end IS NULL`)
-                  .all(userId) as DbFactRow[]);
-        return rows.map(rowToFact);
-    }
-
-    // PEERS + SESSIONS (PR 4) -------------------------------------------------
+    // Peers + sessions (added in PR 4).
 
     /**
      * Insert peer if not present; refresh `last_active_at` either way.
@@ -661,17 +338,232 @@ export class LearningStore {
             this.db
                 .prepare(
                     `INSERT INTO sessions
-                     (session_id, peer_id, opened_at, closed_at, close_reason, turn_count, last_user_message_at, source)
-                     VALUES (?, ?, ?, NULL, NULL, 0, ?, ?)`,
+                     (session_id, peer_id, opened_at, closed_at, close_reason, turn_count, last_user_message_at, source, summary, active_personality)
+                     VALUES (?, ?, ?, NULL, NULL, 0, ?, ?, NULL, NULL)`,
                 )
                 .run(sessionId, input.peerId, openedAt, openedAt, input.source);
             this.db
                 .prepare(`UPDATE peers SET active_session_id = ?, last_active_at = ? WHERE peer_id = ?`)
                 .run(sessionId, openedAt, input.peerId);
         });
+
         const row = this.getSession(sessionId);
         if (!row) throw new Error(`openSession post-condition failed: ${sessionId}`);
         return row;
+    }
+
+    /**
+     * Fork the active session into a labeled branch. Atomic:
+     *   1. close the source session (close_reason='user')
+     *   2. open a new session with `branch_label = label` and
+     *      `parent_session_id = src.sessionId`
+     *   3. clone messages from the source into the new session so the agent
+     *      sees the same prefix when the next turn lands
+     *   4. flip peers.active_session_id to the new session
+     *
+     * Returns the new SessionRow. Throws when:
+     *   - the label is already used by this peer (UNIQUE INDEX violation)
+     *   - the source session doesn't belong to this peer (defence in depth)
+     */
+    forkSession(input: {
+        peerId: string;
+        srcSessionId: string;
+        srcThreadId: string;
+        newThreadId: (newSessionId: string) => string;
+        label: string;
+        source: SessionSource;
+    }): SessionRow {
+        const trimmed = input.label.trim();
+        if (trimmed.length === 0) throw new Error('branch label cannot be empty');
+
+        const src = this.getSession(input.srcSessionId);
+        if (!src) throw new Error(`forkSession: source session not found: ${input.srcSessionId}`);
+        if (src.peerId !== input.peerId) {
+            throw new Error('forkSession: source session belongs to a different peer');
+        }
+
+        const newSessionId = generateSessionId();
+        const now = Date.now();
+        const newThreadId = input.newThreadId(newSessionId);
+
+        this.runWrite(() => {
+            // 1. close source if still open
+            this.db
+                .prepare(
+                    `UPDATE sessions
+                     SET closed_at = ?, close_reason = 'user'
+                     WHERE session_id = ? AND closed_at IS NULL`,
+                )
+                .run(now, input.srcSessionId);
+
+            // 2. open new session, labeled and parented
+            this.db
+                .prepare(
+                    `INSERT INTO sessions
+                     (session_id, peer_id, opened_at, closed_at, close_reason,
+                      turn_count, last_user_message_at, source,
+                      summary, active_personality, branch_label, parent_session_id)
+                     VALUES (?, ?, ?, NULL, NULL, 0, ?, ?, NULL, ?, ?, ?)`,
+                )
+                .run(
+                    newSessionId,
+                    input.peerId,
+                    now,
+                    now,
+                    input.source,
+                    src.activePersonality,
+                    trimmed,
+                    input.srcSessionId,
+                );
+
+            // 3. copy messages — preserves order via shared created_at, and
+            // re-running the FTS5 trigger keeps full-text search aligned with
+            // the new thread_id so /search hits land in the new branch too.
+            this.db
+                .prepare(
+                    `INSERT INTO messages (user_id, thread_id, role, content, created_at)
+                     SELECT user_id, ?, role, content, created_at
+                     FROM messages
+                     WHERE thread_id = ?`,
+                )
+                .run(newThreadId, input.srcThreadId);
+
+            // 4. flip peer's active pointer
+            this.db
+                .prepare(`UPDATE peers SET active_session_id = ?, last_active_at = ? WHERE peer_id = ?`)
+                .run(newSessionId, now, input.peerId);
+        });
+
+        const newRow = this.getSession(newSessionId);
+        if (!newRow) throw new Error(`forkSession post-condition failed: ${newSessionId}`);
+        return newRow;
+    }
+
+    /**
+     * Look up a branch by (peer, label). Returns the session row or null
+     * — works regardless of whether the labeled session is currently open
+     * or closed (so `/branch switch` can find a dormant branch).
+     */
+    getSessionByBranchLabel(peerId: string, label: string): SessionRow | null {
+        const r = this.db
+            .prepare(
+                `SELECT * FROM sessions
+                  WHERE peer_id = ? AND branch_label = ?
+                  LIMIT 1`,
+            )
+            .get(peerId, label.trim()) as DbSessionRow | undefined;
+        return r ? rowToSession(r) : null;
+    }
+
+    /**
+     * List all branches (labeled sessions) for a peer plus the active
+     * session if it's unlabeled — newest first. Powers `/branch list`.
+     * Limit defaults to 20; the UI is line-oriented so anything beyond
+     * that pushes the active section off-screen.
+     */
+    listBranchesForPeer(peerId: string, limit = 20): SessionRow[] {
+        const rows = this.db
+            .prepare(
+                `SELECT * FROM sessions
+                  WHERE peer_id = ?
+                    AND (branch_label IS NOT NULL OR closed_at IS NULL)
+                  ORDER BY (closed_at IS NULL) DESC, opened_at DESC
+                  LIMIT ?`,
+            )
+            .all(peerId, Math.max(1, Math.min(limit, 100))) as DbSessionRow[];
+        return rows.map(rowToSession);
+    }
+
+    /**
+     * Switch the active session pointer to a previously-forked branch.
+     * Closes the currently-active session (close_reason='user') and re-opens
+     * the target by clearing its `closed_at`. Returns the reopened SessionRow,
+     * or null when the label is unknown for this peer.
+     *
+     * Reopening a closed session preserves its original `opened_at` and
+     * `branch_label` — only `closed_at` flips back to NULL so the active
+     * index treats it as live again. Messages aren't copied: the target
+     * already has its own snapshot of history from when it was forked.
+     */
+    switchToBranch(peerId: string, label: string): SessionRow | null {
+        const target = this.getSessionByBranchLabel(peerId, label);
+        if (!target) return null;
+
+        const now = Date.now();
+        this.runWrite(() => {
+            // Close the currently-active session if it isn't already the target.
+            const peer = this.getPeer(peerId);
+            if (peer?.activeSessionId && peer.activeSessionId !== target.sessionId) {
+                this.db
+                    .prepare(
+                        `UPDATE sessions
+                         SET closed_at = ?, close_reason = 'user'
+                         WHERE session_id = ? AND closed_at IS NULL`,
+                    )
+                    .run(now, peer.activeSessionId);
+            }
+            // Re-open target if it was closed.
+            this.db
+                .prepare(
+                    `UPDATE sessions
+                     SET closed_at = NULL, close_reason = NULL,
+                         last_user_message_at = ?
+                     WHERE session_id = ?`,
+                )
+                .run(now, target.sessionId);
+            this.db
+                .prepare(`UPDATE peers SET active_session_id = ?, last_active_at = ? WHERE peer_id = ?`)
+                .run(target.sessionId, now, peerId);
+        });
+
+        return this.getSession(target.sessionId);
+    }
+
+    /**
+     * Set or clear the active personality overlay for a session. Pass null
+     * to revert to the default voice (SOUL.md only). The /personality slash
+     * command writes here. /new naturally clears it because a new session
+     * row starts with active_personality=NULL.
+     */
+    setSessionPersonality(sessionId: string, personalityName: string | null): void {
+        this.runWrite(() => {
+            this.db
+                .prepare(`UPDATE sessions SET active_personality = ? WHERE session_id = ?`)
+                .run(personalityName, sessionId);
+        });
+    }
+
+    /** Read the active personality for a session. Returns null when unset. */
+    getSessionPersonality(sessionId: string): string | null {
+        const r = this.db
+            .prepare(`SELECT active_personality FROM sessions WHERE session_id = ?`)
+            .get(sessionId) as { active_personality: string | null } | undefined;
+        return r?.active_personality ?? null;
+    }
+
+    /** Persist the AI-written recap onto a (typically just-closed) session. */
+    setSessionSummary(sessionId: string, summary: string): void {
+        this.runWrite(() => {
+            this.db
+                .prepare(`UPDATE sessions SET summary = ? WHERE session_id = ?`)
+                .run(summary, sessionId);
+        });
+    }
+
+    /**
+     * Most-recently-closed session for a peer with a non-empty summary.
+     * Used to inject "where we left off" context into the next session.
+     */
+    getMostRecentClosedSession(peerId: string): SessionRow | null {
+        const r = this.db
+            .prepare(
+                `SELECT * FROM sessions
+                  WHERE peer_id = ? AND closed_at IS NOT NULL AND summary IS NOT NULL
+                  ORDER BY closed_at DESC
+                  LIMIT 1`,
+            )
+            .get(peerId) as DbSessionRow | undefined;
+        return r ? rowToSession(r) : null;
     }
 
     closeSession(sessionId: string, reason: SessionCloseReason, closedAt: number = Date.now()): void {
@@ -736,8 +628,6 @@ export class LearningStore {
         });
     }
 
-    // TOKEN USAGE -------------------------------------------------------------
-
     /**
      * UPSERT a model-call delta into the (thread, day, provider, model) bucket.
      * Called from the tokenCounter interceptor's onUpdate hook — one row per
@@ -801,7 +691,128 @@ export class LearningStore {
             .all(threadId, date) as TokenDailyByModel[];
     }
 
-    // MESSAGES + SESSION SEARCH ----------------------------------------------
+    // INSIGHTS — peer-scoped aggregates. Every query MUST scope by (peerId, sinceMs).
+
+    /**
+     * Count + role-split of messages persisted in the window. Cheap rollup
+     * for the activity card in /insights.
+     */
+    getMessageCountForPeer(peerId: string, sinceMs: number): {
+        total: number;
+        user: number;
+        assistant: number;
+    } {
+        const row = this.db
+            .prepare(
+                `SELECT
+                   COUNT(*)                                                 AS total,
+                   SUM(CASE WHEN role = 'user'      THEN 1 ELSE 0 END)      AS user,
+                   SUM(CASE WHEN role = 'assistant' THEN 1 ELSE 0 END)      AS assistant
+                 FROM messages
+                 WHERE user_id = ? AND created_at >= ?`,
+            )
+            .get(peerId, sinceMs) as {
+            total: number | null;
+            user: number | null;
+            assistant: number | null;
+        };
+        return {
+            total: row.total ?? 0,
+            user: row.user ?? 0,
+            assistant: row.assistant ?? 0,
+        };
+    }
+
+    /**
+     * Sessions stats over the window. Returns the count, total turns, and
+     * the top N longest sessions (turn_count desc) so /insights can call
+     * out "your longest session was 47 turns about FlopsyBot memory."
+     */
+    getSessionStatsForPeer(
+        peerId: string,
+        sinceMs: number,
+        longestLimit = 5,
+    ): {
+        count: number;
+        totalTurns: number;
+        longest: SessionRow[];
+    } {
+        const summary = this.db
+            .prepare(
+                `SELECT COUNT(*) AS count, COALESCE(SUM(turn_count), 0) AS turns
+                 FROM sessions
+                 WHERE peer_id = ? AND opened_at >= ?`,
+            )
+            .get(peerId, sinceMs) as { count: number; turns: number };
+
+        const longestRows = this.db
+            .prepare(
+                `SELECT * FROM sessions
+                 WHERE peer_id = ? AND opened_at >= ?
+                 ORDER BY turn_count DESC, opened_at DESC
+                 LIMIT ?`,
+            )
+            .all(peerId, sinceMs, Math.max(1, Math.min(longestLimit, 50))) as DbSessionRow[];
+
+        return {
+            count: summary.count ?? 0,
+            totalTurns: summary.turns ?? 0,
+            longest: longestRows.map(rowToSession),
+        };
+    }
+
+    /**
+     * Token usage over the window. Sums across days + sessions, broken down
+     * by (provider, model). Sorted heaviest first. Filters by `thread_id LIKE
+     * peerId%` because token_usage is keyed by full threadId (peer + session
+     * suffix); the LIKE picks up every session for this peer.
+     */
+    getTokenUsageForPeer(
+        peerId: string,
+        sinceDateIso: string,
+    ): Array<{ provider: string; model: string; input: number; output: number; calls: number }> {
+        return this.db
+            .prepare(
+                `SELECT provider, model,
+                        SUM(input)  AS input,
+                        SUM(output) AS output,
+                        SUM(calls)  AS calls
+                 FROM token_usage
+                 WHERE thread_id LIKE ? AND date >= ?
+                 GROUP BY provider, model
+                 ORDER BY (SUM(input) + SUM(output)) DESC`,
+            )
+            .all(`${peerId}%`, sinceDateIso) as Array<{
+            provider: string;
+            model: string;
+            input: number;
+            output: number;
+            calls: number;
+        }>;
+    }
+
+    /**
+     * Most-recently-closed sessions in the window with their summary —
+     * /insights shows these as a "what you've been working on" list.
+     */
+    getRecentClosedSessionsWithSummary(
+        peerId: string,
+        sinceMs: number,
+        limit = 5,
+    ): SessionRow[] {
+        const rows = this.db
+            .prepare(
+                `SELECT * FROM sessions
+                 WHERE peer_id = ?
+                   AND closed_at IS NOT NULL
+                   AND closed_at >= ?
+                   AND summary IS NOT NULL
+                 ORDER BY closed_at DESC
+                 LIMIT ?`,
+            )
+            .all(peerId, sinceMs, Math.max(1, Math.min(limit, 50))) as DbSessionRow[];
+        return rows.map(rowToSession);
+    }
 
     /**
      * Persist one conversation turn (user input OR assistant reply). Intended
@@ -915,6 +926,42 @@ export class LearningStore {
         return rows.map(rowToMessage).reverse();
     }
 
+    /**
+     * Fetch the most-recent messages for a peer across ALL their sessions.
+     * Unlike getThreadMessages (session-scoped), this queries by user_id so it
+     * crosses session boundaries — used to inject prior-session context after /new.
+     *
+     * Excludes messages from the given currentThreadId so the current session's
+     * in-context messages aren't duplicated in the harness block.
+     */
+    getRecentMessagesForPeer(
+        userId: string,
+        limit = 12,
+        excludeThreadId?: string,
+    ): MessageRow[] {
+        const rows = excludeThreadId
+            ? (this.db
+                .prepare(
+                    `SELECT id, user_id, thread_id, role, content, created_at
+                       FROM messages
+                      WHERE user_id = ?
+                        AND thread_id != ?
+                      ORDER BY created_at DESC
+                      LIMIT ?`,
+                )
+                .all(userId, excludeThreadId, Math.max(1, Math.min(limit, 100))) as DbMessageRow[])
+            : (this.db
+                .prepare(
+                    `SELECT id, user_id, thread_id, role, content, created_at
+                       FROM messages
+                      WHERE user_id = ?
+                      ORDER BY created_at DESC
+                      LIMIT ?`,
+                )
+                .all(userId, Math.max(1, Math.min(limit, 100))) as DbMessageRow[]);
+        return rows.map(rowToMessage).reverse();
+    }
+
     // INFRASTRUCTURE ----------------------------------------------------------
 
     /**
@@ -980,199 +1027,149 @@ export class LearningStore {
         const existing = this.db
             .prepare(`SELECT version FROM schema_version WHERE id = 1`)
             .get() as { version: number } | undefined;
-        const currentVersion = existing?.version ?? 0;
+        if (existing?.version === SCHEMA_VERSION) return;
 
-        if (currentVersion === 0) {
-            this.applyInitialSchema();
-            this.applyTokenUsageSchema(); // v2
-            this.applyMessagesSchema(); // v3
-            this.db
-                .prepare(`INSERT OR REPLACE INTO schema_version (id, version) VALUES (1, ?)`)
-                .run(SCHEMA_VERSION);
-            return;
+        if (existing && existing.version < SCHEMA_VERSION) {
+            log.warn(
+                { currentVersion: existing.version, expectedVersion: SCHEMA_VERSION, path: this.dbPath },
+                'state.db schema outdated — delete the file and restart to migrate (per-peer memory now lives in memory.db)',
+            );
         }
 
-        // Forward migrations. Each block: run DDL, bump version. Idempotent —
-        // CREATE TABLE IF NOT EXISTS so re-run after a crash is safe.
-        if (currentVersion < 2) {
-            this.applyTokenUsageSchema();
-            this.db
-                .prepare(`INSERT OR REPLACE INTO schema_version (id, version) VALUES (1, ?)`)
-                .run(2);
-        }
-        if (currentVersion < 3) {
-            this.applyMessagesSchema();
-            this.db
-                .prepare(`INSERT OR REPLACE INTO schema_version (id, version) VALUES (1, ?)`)
-                .run(3);
-        }
+        // No migrations — schema is a single canonical DDL block. When the
+        // schema changes (new columns, new tables), bump SCHEMA_VERSION,
+        // edit `applyInitialSchema`, and delete `state.db` once.
+        this.applyInitialSchema();
+        this.db
+            .prepare(`INSERT OR REPLACE INTO schema_version (id, version) VALUES (1, ?)`)
+            .run(SCHEMA_VERSION);
+    }
+
+    // background_tasks: durable mirror for spawn_background_task.
+
+    /**
+     * Insert a new background task row at spawn time. Throws on duplicate
+     * `taskId` because TaskRegistry's monotonic id generator should never
+     * produce a collision; if it does, that's a bug worth surfacing.
+     */
+    recordBackgroundTask(row: BackgroundTaskRow): void {
+        this.db
+            .prepare(
+                `INSERT INTO background_tasks
+                   (task_id, thread_id, worker_name, task_prompt, tool_allowlist,
+                    timeout_ms, delivery_mode, status, created_at, ended_at,
+                    result, error, description)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+                row.taskId,
+                row.threadId,
+                row.workerName,
+                row.taskPrompt,
+                row.toolAllowlist ? JSON.stringify(row.toolAllowlist) : null,
+                row.timeoutMs,
+                row.deliveryMode,
+                row.status,
+                row.createdAt,
+                row.endedAt,
+                row.result,
+                row.error,
+                row.description,
+            );
     }
 
     /**
-     * v2 migration: per-thread x per-day x per-model token accounting.
-     * Composite PK (thread_id, date, provider, model) gives us UPSERT
-     * semantics - one row per unique combo, accumulated in place.
+     * Update an existing background task to its terminal (or near-terminal)
+     * state. `running → completed | failed | killed`. The runner's success
+     * path supplies `result`; failure paths supply `error`. Patch is partial
+     * so we only touch the fields that changed.
      */
-    private applyTokenUsageSchema(): void {
-        const ddl = [
-            `CREATE TABLE IF NOT EXISTS token_usage (
-                thread_id  TEXT    NOT NULL,
-                date       TEXT    NOT NULL,
-                provider   TEXT    NOT NULL,
-                model      TEXT    NOT NULL,
-                input      INTEGER NOT NULL DEFAULT 0,
-                output     INTEGER NOT NULL DEFAULT 0,
-                calls      INTEGER NOT NULL DEFAULT 0,
-                updated_at INTEGER NOT NULL,
-                PRIMARY KEY (thread_id, date, provider, model)
-            )`,
-            `CREATE INDEX IF NOT EXISTS idx_token_usage_thread_date ON token_usage(thread_id, date DESC)`,
-        ];
-        for (const stmt of ddl) {
-            this.db.prepare(stmt).run();
-        }
-        log.info('token_usage table ready (v2)');
+    updateBackgroundTaskStatus(
+        taskId: string,
+        patch: { status: BackgroundTaskStatus; result?: string; error?: string; endedAt?: number },
+    ): void {
+        const endedAt = patch.endedAt ?? Date.now();
+        this.db
+            .prepare(
+                `UPDATE background_tasks
+                    SET status = ?,
+                        ended_at = COALESCE(?, ended_at),
+                        result = COALESCE(?, result),
+                        error = COALESCE(?, error)
+                  WHERE task_id = ?`,
+            )
+            .run(
+                patch.status,
+                endedAt,
+                patch.result ?? null,
+                patch.error ?? null,
+                taskId,
+            );
     }
 
     /**
-     * v3 migration: conversation messages + FTS5 content index.
-     *
-     * The messages table is the authoritative transcript; `messages_fts` is a
-     * contentless FTS5 virtual table that indexes only `content` and looks up
-     * the row via the shared rowid. Triggers keep them in sync so callers
-     * only ever touch `messages` directly.
-     *
-     * Tokenizer: `porter unicode61 remove_diacritics 2` — case-insensitive,
-     * diacritics-normalised, porter stemming so "running" / "ran" match "run".
-     * Unicode61 handles multi-byte tokens cleanly (CJK, emoji-adjacent text).
-     *
-     * All FTS5 DDL is guarded: FTS5 is bundled with better-sqlite3's default
-     * amalgamation, but if a custom build dropped it we'd rather fail LOUDLY
-     * at first startup than surface "no such module: fts5" inside a tool call.
+     * Mark a `completed` task as `delivered` once the channel-worker has
+     * successfully run the task_complete turn and surfaced the result to the
+     * user. This is the idempotency seal — the boot resume sweep skips
+     * `delivered` rows so we never double-deliver after a restart.
      */
-    private applyMessagesSchema(): void {
-        const ddl = [
-            `CREATE TABLE IF NOT EXISTS messages (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id    TEXT    NOT NULL,
-                thread_id  TEXT    NOT NULL,
-                role       TEXT    NOT NULL CHECK (role IN ('user', 'assistant')),
-                content    TEXT    NOT NULL,
-                created_at INTEGER NOT NULL
-            )`,
-            `CREATE INDEX IF NOT EXISTS idx_messages_user_time
-                ON messages(user_id, created_at DESC)`,
-            `CREATE INDEX IF NOT EXISTS idx_messages_thread_time
-                ON messages(thread_id, created_at)`,
-            // Contentless FTS5 table — stores only the inverted index; the
-            // underlying row lives in `messages`. `content_rowid=id` means
-            // FTS5 uses `messages.id` as the shared rowid so the JOIN in
-            // searchMessages() is a pure rowid lookup.
-            `CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-                content,
-                content='messages',
-                content_rowid='id',
-                tokenize='porter unicode61 remove_diacritics 2'
-            )`,
-            // Triggers: INSERT and DELETE on messages keep FTS5 current. No
-            // UPDATE trigger — we never edit content, only insert/delete.
-            `CREATE TRIGGER IF NOT EXISTS messages_ai
-                AFTER INSERT ON messages BEGIN
-                  INSERT INTO messages_fts(rowid, content)
-                    VALUES (new.id, new.content);
-                END`,
-            `CREATE TRIGGER IF NOT EXISTS messages_ad
-                AFTER DELETE ON messages BEGIN
-                  INSERT INTO messages_fts(messages_fts, rowid, content)
-                    VALUES('delete', old.id, old.content);
-                END`,
-        ];
-        for (const stmt of ddl) {
-            try {
-                this.db.prepare(stmt).run();
-            } catch (err) {
-                // FTS5 missing from the SQLite build surfaces here. Re-raise
-                // with a hint so the operator knows what to rebuild rather
-                // than chasing "no such module" across the stack.
-                const msg = err instanceof Error ? err.message : String(err);
-                if (msg.includes('no such module: fts5')) {
-                    throw new Error(
-                        'LearningStore: SQLite build is missing FTS5 module. ' +
-                            'Rebuild better-sqlite3 with the default amalgamation ' +
-                            '(it ships FTS5) or use Node 20+ prebuilt binaries.',
-                    );
-                }
-                throw err;
-            }
-        }
-        log.info('messages + fts5 table ready (v3)');
+    markBackgroundTaskDelivered(taskId: string): void {
+        this.db
+            .prepare(
+                `UPDATE background_tasks
+                    SET status = 'delivered'
+                  WHERE task_id = ? AND status = 'completed'`,
+            )
+            .run(taskId);
+    }
+
+    /**
+     * Pull all background tasks for a thread that are in any of the requested
+     * statuses, oldest first (resume order matters: we want to spawn the
+     * oldest pending task first so it's not starved by newer ones).
+     */
+    listBackgroundTasksForThread(
+        threadId: string,
+        statuses: ReadonlyArray<BackgroundTaskStatus>,
+    ): BackgroundTaskRow[] {
+        if (statuses.length === 0) return [];
+        const placeholders = statuses.map(() => '?').join(',');
+        const rows = this.db
+            .prepare(
+                `SELECT task_id, thread_id, worker_name, task_prompt, tool_allowlist,
+                        timeout_ms, delivery_mode, status, created_at, ended_at,
+                        result, error, description
+                   FROM background_tasks
+                  WHERE thread_id = ? AND status IN (${placeholders})
+                  ORDER BY created_at ASC`,
+            )
+            .all(threadId, ...statuses) as DbBackgroundTaskRow[];
+        return rows.map(rowToBackgroundTask);
+    }
+
+    /**
+     * Sweep `running` tasks older than `cutoffAgeMs` into `killed` status.
+     * Called once at TeamHandler construction so we don't try to resume
+     * tasks that were stranded for hours/days (likely orphaned by upstream
+     * issues we can't recover from). Returns the number marked.
+     */
+    killStaleBackgroundTasks(cutoffAgeMs: number, now = Date.now()): number {
+        const cutoff = now - cutoffAgeMs;
+        const result = this.db
+            .prepare(
+                `UPDATE background_tasks
+                    SET status = 'killed',
+                        ended_at = ?,
+                        error = COALESCE(error, 'stale on boot — exceeded ' || ? || 'ms')
+                  WHERE status = 'running' AND created_at < ?`,
+            )
+            .run(now, cutoffAgeMs, cutoff);
+        return result.changes;
     }
 
     private applyInitialSchema(): void {
         this.db.exec(`
-      CREATE TABLE IF NOT EXISTS strategies (
-        id               TEXT PRIMARY KEY,
-        user_id          TEXT NOT NULL,
-        name             TEXT NOT NULL,
-        description      TEXT,
-        domain           TEXT,
-        effectiveness    REAL NOT NULL,
-        uses             INTEGER NOT NULL DEFAULT 0,
-        last_used        INTEGER NOT NULL DEFAULT 0,
-        created_at       INTEGER NOT NULL,
-        refinements      INTEGER NOT NULL DEFAULT 0,
-        linked_skill_id  TEXT,
-        tags             TEXT NOT NULL DEFAULT '[]'
-      );
-      CREATE INDEX IF NOT EXISTS idx_strategies_user ON strategies(user_id, effectiveness DESC);
-      CREATE INDEX IF NOT EXISTS idx_strategies_domain ON strategies(user_id, domain);
-
-      CREATE TABLE IF NOT EXISTS lessons (
-        id               TEXT PRIMARY KEY,
-        user_id          TEXT NOT NULL,
-        rule             TEXT NOT NULL,
-        reason           TEXT,
-        domain           TEXT,
-        severity         TEXT NOT NULL DEFAULT 'important',
-        recorded_at      INTEGER NOT NULL,
-        prevention_count INTEGER NOT NULL DEFAULT 0,
-        applies_to       TEXT NOT NULL DEFAULT 'user:all',
-        example_mistake  TEXT,
-        correction       TEXT,
-        tags             TEXT NOT NULL DEFAULT '[]'
-      );
-      CREATE INDEX IF NOT EXISTS idx_lessons_user ON lessons(user_id, recorded_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_lessons_domain ON lessons(user_id, domain);
-
-      CREATE TABLE IF NOT EXISTS skills_meta (
-        user_id        TEXT NOT NULL,
-        skill_name     TEXT NOT NULL,
-        effectiveness  REAL NOT NULL DEFAULT 0.5,
-        success_rate   REAL NOT NULL DEFAULT 0.5,
-        use_count      INTEGER NOT NULL DEFAULT 0,
-        success_count  INTEGER NOT NULL DEFAULT 0,
-        failure_count  INTEGER NOT NULL DEFAULT 0,
-        last_used      INTEGER NOT NULL DEFAULT 0,
-        last_updated   INTEGER NOT NULL,
-        tags           TEXT NOT NULL DEFAULT '[]',
-        PRIMARY KEY (user_id, skill_name)
-      );
-      CREATE INDEX IF NOT EXISTS idx_skills_eff ON skills_meta(user_id, effectiveness DESC);
-
-      CREATE TABLE IF NOT EXISTS facts (
-        id             TEXT PRIMARY KEY,
-        user_id        TEXT NOT NULL,
-        subject        TEXT NOT NULL,
-        predicate      TEXT NOT NULL,
-        object         TEXT NOT NULL,
-        validity_start INTEGER NOT NULL,
-        validity_end   INTEGER,
-        confidence     REAL NOT NULL DEFAULT 1.0,
-        source         TEXT NOT NULL DEFAULT 'explicit'
-      );
-      CREATE INDEX IF NOT EXISTS idx_facts_current ON facts(user_id, subject, predicate, validity_end);
-
-      -- ── Peer + Session model (PR 4) ─────────────────────────────────
+      -- ── Peer + Session model ────────────────────────────────────────
       -- Permanent identity (peer) decoupled from bounded conversation
       -- (session). Resolves the "thread grows forever" problem.
       --
@@ -1200,18 +1197,150 @@ export class LearningStore {
         close_reason          TEXT,
         turn_count            INTEGER NOT NULL DEFAULT 0,
         last_user_message_at  INTEGER NOT NULL,
-        source                TEXT NOT NULL DEFAULT 'user'
+        source                TEXT NOT NULL DEFAULT 'user',
+        summary               TEXT,
+        active_personality    TEXT,
+        branch_label          TEXT,
+        parent_session_id     TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_sessions_peer
         ON sessions(peer_id, opened_at DESC);
       CREATE INDEX IF NOT EXISTS idx_sessions_active
         ON sessions(peer_id) WHERE closed_at IS NULL;
+      -- One label per peer — /branch name would be ambiguous otherwise.
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_branch_label
+        ON sessions(peer_id, branch_label) WHERE branch_label IS NOT NULL;
+
+      -- ── Tool failure capture ────────────────────────────────────────
+      -- Per-peer record of how often each (tool, error pattern) pair has
+      -- failed. The harness injects the top N recent rows into the system
+      -- prompt as <tool_quirks> so the agent learns "x_search 429s after
+      -- 10 calls in an hour — switch to web_search" without anyone teaching
+      -- it. PK is the (peer, tool, pattern) triple so repeats UPSERT into
+      -- a single row with an incrementing count.
+      CREATE TABLE IF NOT EXISTS tool_failures (
+        peer_id       TEXT NOT NULL,
+        tool_name     TEXT NOT NULL,
+        error_pattern TEXT NOT NULL,
+        count         INTEGER NOT NULL DEFAULT 1,
+        first_seen    INTEGER NOT NULL,
+        last_seen     INTEGER NOT NULL,
+        PRIMARY KEY (peer_id, tool_name, error_pattern)
+      );
+      CREATE INDEX IF NOT EXISTS idx_tool_failures_peer_recent
+        ON tool_failures(peer_id, last_seen DESC);
+
+      -- ── Token usage (per thread × day × model) ──────────────────────
+      CREATE TABLE IF NOT EXISTS token_usage (
+        thread_id  TEXT    NOT NULL,
+        date       TEXT    NOT NULL,
+        provider   TEXT    NOT NULL,
+        model      TEXT    NOT NULL,
+        input      INTEGER NOT NULL DEFAULT 0,
+        output     INTEGER NOT NULL DEFAULT 0,
+        calls      INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (thread_id, date, provider, model)
+      );
+      CREATE INDEX IF NOT EXISTS idx_token_usage_thread_date
+        ON token_usage(thread_id, date DESC);
+
+      -- Conversation messages + FTS5 content index.
+      -- Authoritative transcript (messages) + a contentless FTS5 virtual
+      -- table that indexes only content and looks up the row via the
+      -- shared rowid. Triggers keep them in sync.
+      CREATE TABLE IF NOT EXISTS messages (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id    TEXT    NOT NULL,
+        thread_id  TEXT    NOT NULL,
+        role       TEXT    NOT NULL CHECK (role IN ('user', 'assistant')),
+        content    TEXT    NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_messages_user_time
+        ON messages(user_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_messages_thread_time
+        ON messages(thread_id, created_at);
+
+      -- background_tasks: durable mirror of TaskRegistry in-memory state for
+      -- spawn_background_task. Lets a detached worker run survive a gateway
+      -- restart — on boot, the resume sweep walks this table, re-spawns
+      -- "running" rows (workers pick up their own checkpoint thanks to Fix A
+      -- deterministic child threadId), and re-pushes task_complete events
+      -- for "completed" but-not-"delivered" rows.
+      --
+      -- State machine:
+      --   running   → spawned, runner promise in flight (re-spawn on boot)
+      --   completed → runner resolved with a result, NOT yet user-visible
+      --                (re-push task_complete on next thread access)
+      --   delivered → channel-worker successfully ran the task_complete turn
+      --                (terminal, kept for /audit; pruned separately)
+      --   failed    → runner threw a non-abort error (terminal)
+      --   killed    → user/timeout aborted, OR resume sweep marked stale (>24h)
+      --
+      -- thread_id matches the gateway routing-key format used by TeamHandler
+      -- (e.g. telegram:dm:5257796557#s-12). It is the lookup key for both
+      -- per-thread fetches and the staleness sweep.
+      CREATE TABLE IF NOT EXISTS background_tasks (
+        task_id        TEXT    PRIMARY KEY,
+        thread_id      TEXT    NOT NULL,
+        worker_name    TEXT    NOT NULL,
+        task_prompt    TEXT    NOT NULL,
+        tool_allowlist TEXT,
+        timeout_ms     INTEGER,
+        delivery_mode  TEXT,
+        status         TEXT    NOT NULL CHECK (status IN ('running','completed','delivered','failed','killed')),
+        created_at     INTEGER NOT NULL,
+        ended_at       INTEGER,
+        result         TEXT,
+        error          TEXT,
+        description    TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_bgtasks_status
+        ON background_tasks(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_bgtasks_thread
+        ON background_tasks(thread_id, status);
     `);
+
+        // FTS5 virtual table + triggers run as separate statements so a
+        // missing FTS5 module surfaces as a single, clear error rather than
+        // poisoning the whole schema apply.
+        try {
+            this.db.exec(`
+                CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                  content,
+                  content='messages',
+                  content_rowid='id',
+                  tokenize='porter unicode61 remove_diacritics 2'
+                );
+                CREATE TRIGGER IF NOT EXISTS messages_ai
+                  AFTER INSERT ON messages BEGIN
+                    INSERT INTO messages_fts(rowid, content)
+                      VALUES (new.id, new.content);
+                  END;
+                CREATE TRIGGER IF NOT EXISTS messages_ad
+                  AFTER DELETE ON messages BEGIN
+                    INSERT INTO messages_fts(messages_fts, rowid, content)
+                      VALUES('delete', old.id, old.content);
+                  END;
+            `);
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (msg.includes('no such module: fts5')) {
+                throw new Error(
+                    'LearningStore: SQLite build is missing FTS5 module. ' +
+                        'Rebuild better-sqlite3 with the default amalgamation ' +
+                        '(it ships FTS5) or use Node 20+ prebuilt binaries.',
+                );
+            }
+            throw err;
+        }
+
         log.info('initial schema applied');
     }
 }
 
-// ── Peer + Session types (PR 4) ────────────────────────────────────────
+// Peer + Session types (added in PR 4).
 
 export interface PeerRow {
     peerId: string;
@@ -1232,58 +1361,20 @@ export interface SessionRow {
     turnCount: number;
     lastUserMessageAt: number;
     source: SessionSource;
+    /** AI-written 1-3 sentence recap of this session, generated when it closes. */
+    summary: string | null;
+    /** Name of the personality overlay active for this session (`null` = default voice). */
+    activePersonality: string | null;
+    /** User-chosen label set by `/branch <name>`. Unique per peer. Null for unlabeled sessions. */
+    branchLabel: string | null;
+    /** When this session was forked, the session it inherited messages from. Null for "main"/root sessions. */
+    parentSessionId: string | null;
 }
 
 export type SessionCloseReason = 'idle' | 'daily' | 'length' | 'user' | 'migration';
 export type SessionSource = 'user' | 'heartbeat' | 'cron' | 'webhook';
 
 // Row → Model converters -----------------------------------------------------
-
-function rowToStrategy(r: DbStrategyRow): Strategy {
-    const severityTags: Strategy['tags'] = safeJsonParse<string[]>(r.tags, []);
-    return {
-        id: r.id,
-        name: r.name,
-        description: r.description ?? '',
-        domain: r.domain ?? undefined,
-        effectiveness: r.effectiveness,
-        uses: r.uses,
-        lastUsed: r.last_used,
-        createdAt: r.created_at,
-        refinements: r.refinements,
-        linkedSkillId: r.linked_skill_id ?? undefined,
-        tags: severityTags,
-    };
-}
-
-function rowToLesson(r: DbLessonRow): Lesson {
-    return {
-        id: r.id,
-        rule: r.rule,
-        reason: r.reason ?? '',
-        domain: r.domain ?? undefined,
-        severity: r.severity as Lesson['severity'],
-        recordedAt: r.recorded_at,
-        preventionCount: r.prevention_count,
-        appliesTo: r.applies_to,
-        exampleMistake: r.example_mistake ?? undefined,
-        correction: r.correction ?? undefined,
-        tags: safeJsonParse<string[]>(r.tags, []),
-    };
-}
-
-function rowToSkillMeta(r: DbSkillMetaRow): SkillEffectivenessEntry {
-    return {
-        effectiveness: r.effectiveness,
-        successRate: r.success_rate,
-        useCount: r.use_count,
-        successCount: r.success_count,
-        failureCount: r.failure_count,
-        lastUsed: r.last_used,
-        lastUpdated: r.last_updated,
-        tags: safeJsonParse<string[]>(r.tags, []),
-    };
-}
 
 function rowToMessage(r: DbMessageRow): MessageRow {
     return {
@@ -1293,6 +1384,36 @@ function rowToMessage(r: DbMessageRow): MessageRow {
         role: r.role === 'assistant' ? 'assistant' : 'user',
         content: r.content,
         createdAt: r.created_at,
+    };
+}
+
+function rowToBackgroundTask(r: DbBackgroundTaskRow): BackgroundTaskRow {
+    let toolAllowlist: readonly string[] | null = null;
+    if (r.tool_allowlist) {
+        try {
+            const parsed = JSON.parse(r.tool_allowlist);
+            if (Array.isArray(parsed) && parsed.every((s) => typeof s === 'string')) {
+                toolAllowlist = parsed;
+            }
+        } catch {
+            // Malformed JSON in the DB shouldn't crash a resume sweep — fall
+            // through with null. The worker will run with the default toolset.
+        }
+    }
+    return {
+        taskId: r.task_id,
+        threadId: r.thread_id,
+        workerName: r.worker_name,
+        taskPrompt: r.task_prompt,
+        toolAllowlist,
+        timeoutMs: r.timeout_ms,
+        deliveryMode: r.delivery_mode,
+        status: r.status,
+        createdAt: r.created_at,
+        endedAt: r.ended_at,
+        result: r.result,
+        error: r.error,
+        description: r.description,
     };
 }
 
@@ -1343,20 +1464,6 @@ function sanitizeFtsQuery(raw: string): string {
     return tokens.map((t) => `"${t}"`).join(' ');
 }
 
-function rowToFact(r: DbFactRow): FactRow {
-    return {
-        id: r.id,
-        userId: r.user_id,
-        subject: r.subject,
-        predicate: r.predicate,
-        object: r.object,
-        validityStart: r.validity_start,
-        validityEnd: r.validity_end,
-        confidence: r.confidence,
-        source: r.source,
-    };
-}
-
 function rowToPeer(r: DbPeerRow): PeerRow {
     return {
         peerId: r.peer_id,
@@ -1379,6 +1486,10 @@ function rowToSession(r: DbSessionRow): SessionRow {
         turnCount: r.turn_count,
         lastUserMessageAt: r.last_user_message_at,
         source: r.source as SessionSource,
+        summary: r.summary ?? null,
+        activePersonality: r.active_personality ?? null,
+        branchLabel: r.branch_label ?? null,
+        parentSessionId: r.parent_session_id ?? null,
     };
 }
 
@@ -1396,19 +1507,6 @@ function generateSessionId(): string {
     const suffix = Math.floor(Math.random() * 0xfffffff).toString(16).padStart(7, '0');
     return `s-${dayNum}-${suffix}`;
 }
-
-function safeJsonParse<T>(raw: unknown, fallback: T): T {
-    if (typeof raw !== 'string') return fallback;
-    try {
-        return JSON.parse(raw) as T;
-    } catch {
-        return fallback;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Security helpers
-// ---------------------------------------------------------------------------
 
 /**
  * Refuse to open a LearningStore outside the resolved Flopsy workspace.

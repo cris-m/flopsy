@@ -185,16 +185,12 @@ function flipEnabled(name: string, value: boolean): void {
     console.log(table([[displayName, transport, status]]));
 }
 
-// ---------------------------------------------------------------------------
-// mcp routes — matrix view of which agent sees which MCP server's tools.
-//
+// `mcp routes` — matrix view of which agent sees which MCP server's tools.
 // Resolution logic mirrors `filterToolsForAgent` in src/team/src/mcp/tool-bridge:
 //   1. If agent.mcpServers is set and non-empty → use that allow-list (pull).
 //   2. Otherwise → include if server.assignTo includes agentName or '*' (push).
-//
 // Disabled servers are called out but not expanded across columns (they
 // don't route to anyone regardless of config).
-// ---------------------------------------------------------------------------
 
 type RouteReason = 'pull-allowlist' | 'push-assignTo' | 'wildcard' | 'not-routed' | 'disabled';
 

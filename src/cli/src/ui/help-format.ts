@@ -71,16 +71,13 @@ export function createHelpConfig(): Partial<Help> {
             const formatList = (textArray: string[]): string =>
                 textArray.join('\n').replace(/^/gm, ' '.repeat(itemIndentWidth));
 
-            // ---- USAGE ----
             let output: string[] = [`${paintHeading('Usage:')} ${helper.commandUsage(cmd)}`, ''];
 
-            // ---- DESCRIPTION ----
             const desc = helper.commandDescription(cmd);
             if (desc.length > 0) {
                 output = output.concat([helper.wrap(desc, helpWidth, 0), '']);
             }
 
-            // ---- ARGUMENTS ----
             const argumentList = helper.visibleArguments(cmd).map((arg) =>
                 formatItem(paintOption(arg.name()), helper.argumentDescription(arg)),
             );
@@ -88,7 +85,6 @@ export function createHelpConfig(): Partial<Help> {
                 output = output.concat([paintHeading('Arguments:'), formatList(argumentList), '']);
             }
 
-            // ---- OPTIONS ----
             const optionList = helper.visibleOptions(cmd).map((opt) =>
                 formatItem(helper.optionTerm(opt), helper.optionDescription(opt)),
             );
@@ -96,7 +92,6 @@ export function createHelpConfig(): Partial<Help> {
                 output = output.concat([paintHeading('Options:'), formatList(optionList), '']);
             }
 
-            // ---- COMMANDS ----
             const commandList = helper.visibleCommands(cmd).map((sub) =>
                 formatItem(helper.subcommandTerm(sub), helper.subcommandDescription(sub)),
             );

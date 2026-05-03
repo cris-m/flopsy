@@ -1,7 +1,7 @@
 /**
  * `flopsy memory kpi` — per-namespace memory stats from the SQLite store.
  *
- * Reads `.flopsy/harness/memory.db` directly (no gateway required).
+ * Reads `.flopsy/state/memory.db` directly (no gateway required).
  * Each row in the output is one namespace — typically `memories` (shared
  * user prefs saved by gandalf) or `memories:<agent>` (per-worker).
  *
@@ -41,7 +41,7 @@ export function registerMemoryCommands(root: Command): void {
         .option('-n, --namespace <ns>', 'Drill into a single namespace and list keys')
         .action(async (opts: { json?: boolean; namespace?: string }) => {
             readFlopsyConfig(); // validate config exists
-            const dbPath = resolveWorkspacePath('harness', 'memory.db');
+            const dbPath = resolveWorkspacePath('state', 'memory.db');
 
             if (!existsSync(dbPath)) {
                 if (opts.json) {

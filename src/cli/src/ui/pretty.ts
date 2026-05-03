@@ -143,7 +143,7 @@ export function state(kind: ExtendedState, text: string, opts: PrettyOptions = {
  * modern Gnome Terminal, etc.) — otherwise we fall back to the plain
  * label + URL so no garbage bytes leak into dumb terminals.
  *
- * Usage:  `link('/Users/me/.flopsy/harness/state.db')`
+ * Usage:  `link('/Users/me/.flopsy/state/learning.db')`
  *         `link('https://console.cloud.google.com/...', 'Google Cloud')`
  */
 export function link(url: string, label?: string): string {

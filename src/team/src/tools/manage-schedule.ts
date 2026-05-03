@@ -1,35 +1,13 @@
-/**
- * manage_schedule — create + manage proactive heartbeats and cron jobs at
- * runtime, persisted to ~/.flopsy/state/proactive.db (separate from the
- * static config in flopsy.json5).
- *
- * Operations:
- *   create    — add a new heartbeat or cron job (registered immediately)
- *   list      — show all runtime-created schedules
- *   delete    — remove a runtime schedule by id
- *   disable   — mark disabled (takes effect on next restart)
- *   enable    — re-enable a previously disabled schedule
- *
- * Schedule types:
- *   heartbeat — fires on a simple interval ("30m", "1h", "1d")
- *   cron      — three flavours:
- *                 at     — fire once at epoch ms (naturally oneshot)
- *                 every  — fixed interval in ms
- *                 cron   — 5-field cron expression with IANA timezone
- *
- * Flat schema — OpenAI requires type:"object" at the top level and rejects
- * discriminatedUnion's oneOf output. Fields are validated per-operation in
- * `execute()` with readable error strings.
- */
+// Flat schema — OpenAI rejects discriminatedUnion's oneOf at top level; per-op validation in execute().
 
 import { z } from 'zod';
 import { defineTool } from 'flopsygraph';
 import { copyPromptFile, type HeartbeatDefinitionConfig, type JobDefinitionConfig } from '@flopsy/shared';
-import { getScheduleFacade } from './schedule-registry';
+import { getScheduleFacade, type ScheduleFacade } from './schedule-registry';
 
 const schema = z.object({
     operation: z
-        .enum(['create', 'list', 'delete', 'disable', 'enable'])
+        .enum(['create', 'list', 'update', 'delete', 'disable', 'enable'])
         .describe('Which operation to perform'),
 
     // create-only
@@ -101,11 +79,11 @@ const schema = z.object({
         .optional()
         .describe('(create, cron+cronKind=every) Interval in ms (min 60000 = 1 min)'),
 
-    // delete/disable/enable
+    // update/delete/disable/enable
     id: z
         .string()
         .optional()
-        .describe('(delete/disable/enable) The schedule id returned by `list` or `create`'),
+        .describe('(update/delete/disable/enable) The schedule id returned by `list` or `create`'),
 });
 
 export const manageScheduleTool = defineTool({
@@ -132,9 +110,14 @@ See docs/proactive.md.
 Operations:
   create    — add a new schedule (persists to state, registers immediately)
   list      — show all runtime-created schedules
+  update    — patch fields of an existing schedule (preserves run stats and prompt file)
   delete    — remove a runtime schedule by id
   disable   — pause (takes effect on next restart)
-  enable    — resume a previously disabled schedule`,
+  enable    — resume a previously disabled schedule
+
+For update, pass id + only the fields you want to change. Fields not
+supplied are kept as-is. Schedule kind cannot change (heartbeat ↔ cron
+requires delete+create).`,
     schema,
     async execute(args, ctx) {
         const facade = getScheduleFacade();
@@ -151,11 +134,7 @@ Operations:
             ...(configurable.agentName ? { agentName: configurable.agentName } : {}),
         };
 
-        // Recursion guard — matches Hermes' rule: a proactive-invoked agent
-        // session cannot create/modify/delete schedules, otherwise a cron or
-        // heartbeat fire can spawn more cron jobs and runaway the system.
-        // Read-only operations (list) are still allowed so the agent can
-        // report what's configured.
+        // Recursion guard: proactive-spawned sessions can read schedules but never mutate them.
         const isProactiveInvoked = configurable.threadId?.startsWith('proactive:') ?? false;
         const isMutating = args.operation !== 'list';
         if (isProactiveInvoked && isMutating) {
@@ -232,6 +211,36 @@ Operations:
                 }
                 return createCronJob(resolvedArgs, facade, createdBy);
             }
+
+            case 'update': {
+                if (!args.id) return 'Missing required field: id';
+                const existing = facade.listSchedules().find((s) => s.id === args.id);
+                if (!existing) {
+                    return `No runtime schedule with id "${args.id}". Use operation:"list" to see ids.`;
+                }
+                if (existing.kind === 'webhook') {
+                    return 'Update is not supported for webhook schedules — delete and recreate instead.';
+                }
+
+                let resolvedPromptFile = args.promptFile;
+                if (args.promptFile?.startsWith('/')) {
+                    try {
+                        resolvedPromptFile = await copyPromptFile(
+                            args.promptFile,
+                            args.id,
+                            existing.kind,
+                        );
+                    } catch (err) {
+                        return `Failed to copy promptFile: ${err instanceof Error ? err.message : String(err)}`;
+                    }
+                }
+                const patch: Args = { ...args, promptFile: resolvedPromptFile };
+
+                if (existing.kind === 'heartbeat') {
+                    return updateHeartbeat(args.id, existing.configJson, patch, facade);
+                }
+                return updateCronJob(args.id, existing.configJson, patch, facade);
+            }
         }
     },
 });
@@ -280,7 +289,8 @@ function createCronJob(args: Args, facade: NonNullable<ReturnType<typeof getSche
         };
     }
 
-    const id = `runtime-cron-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    // Re-using args.id here keeps id and copied promptFile path in sync.
+    const id = args.id ?? `runtime-cron-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const job: JobDefinitionConfig = {
         id,
         name: args.name ?? id,
@@ -297,4 +307,97 @@ function createCronJob(args: Args, facade: NonNullable<ReturnType<typeof getSche
     const ok = facade.addRuntimeCronJob(job, createdBy);
     if (!ok) return 'Failed to add cron job (engine not started?).';
     return `Cron job "${job.name}" created (id=${id}, kind=${args.cronKind}${job.payload.oneshot ? ', oneshot' : ''}).`;
+}
+
+function updateHeartbeat(
+    id: string,
+    currentConfigJson: string,
+    patch: Args,
+    facade: ScheduleFacade,
+): string {
+    let current: HeartbeatDefinitionConfig;
+    try {
+        current = JSON.parse(currentConfigJson) as HeartbeatDefinitionConfig;
+    } catch {
+        return `Stored config for "${id}" is malformed JSON — cannot update; delete and recreate.`;
+    }
+
+    // prompt and promptFile are mutually exclusive — supplying one clears the other.
+    const swapToInline = patch.prompt !== undefined;
+    const swapToFile = patch.promptFile !== undefined;
+
+    const next: HeartbeatDefinitionConfig = {
+        ...current,
+        ...(patch.name !== undefined ? { name: patch.name } : {}),
+        ...(patch.interval !== undefined ? { interval: patch.interval } : {}),
+        ...(patch.deliveryMode !== undefined ? { deliveryMode: patch.deliveryMode } : {}),
+        ...(patch.oneshot !== undefined ? { oneshot: patch.oneshot } : {}),
+        ...(swapToInline ? { prompt: patch.prompt!, promptFile: undefined } : {}),
+        ...(swapToFile ? { promptFile: patch.promptFile!, prompt: '' } : {}),
+        ...(typeof patch.activeHoursStart === 'number' && typeof patch.activeHoursEnd === 'number'
+            ? { activeHours: { start: patch.activeHoursStart, end: patch.activeHoursEnd } }
+            : {}),
+    };
+
+    const ok = facade.replaceRuntimeSchedule(id, next);
+    if (!ok) return `Failed to update heartbeat "${id}" (kind mismatch or engine not started).`;
+    return `Heartbeat "${next.name}" updated (interval=${next.interval}, mode=${next.deliveryMode}${next.oneshot ? ', oneshot' : ''}).`;
+}
+
+function updateCronJob(
+    id: string,
+    currentConfigJson: string,
+    patch: Args,
+    facade: ScheduleFacade,
+): string {
+    let current: JobDefinitionConfig;
+    try {
+        current = JSON.parse(currentConfigJson) as JobDefinitionConfig;
+    } catch {
+        return `Stored config for "${id}" is malformed JSON — cannot update; delete and recreate.`;
+    }
+
+    // Schedule patch — the user picks one cronKind; we ignore the others.
+    let nextSchedule: JobDefinitionConfig['schedule'] = current.schedule;
+    if (patch.cronKind === 'at') {
+        if (typeof patch.atMs !== 'number') return 'cronKind="at" requires atMs (absolute epoch ms).';
+        if (patch.atMs <= Date.now()) return 'atMs must be in the future.';
+        nextSchedule = { kind: 'at', atMs: patch.atMs };
+    } else if (patch.cronKind === 'every') {
+        if (typeof patch.everyMs !== 'number') return 'cronKind="every" requires everyMs (min 60000).';
+        nextSchedule = { kind: 'every', everyMs: patch.everyMs };
+    } else if (patch.cronKind === 'cron') {
+        if (!patch.cronExpr) return 'cronKind="cron" requires cronExpr (5-field expression).';
+        nextSchedule = {
+            kind: 'cron',
+            expr: patch.cronExpr,
+            ...(patch.cronTz ? { tz: patch.cronTz } : {}),
+        };
+    } else if (patch.cronTz !== undefined && current.schedule.kind === 'cron') {
+        // Timezone-only change keeps the existing expression.
+        nextSchedule = { ...current.schedule, tz: patch.cronTz };
+    }
+
+    // Payload patch — same prompt/promptFile swap rule as heartbeats.
+    const swapToInline = patch.prompt !== undefined;
+    const swapToFile = patch.promptFile !== undefined;
+    const nextPayload: JobDefinitionConfig['payload'] = {
+        ...current.payload,
+        ...(patch.deliveryMode !== undefined ? { deliveryMode: patch.deliveryMode } : {}),
+        ...(patch.oneshot !== undefined ? { oneshot: patch.oneshot } : {}),
+        ...(swapToInline ? { message: patch.prompt!, promptFile: undefined } : {}),
+        ...(swapToFile ? { promptFile: patch.promptFile!, message: undefined } : {}),
+    };
+
+    const next: JobDefinitionConfig = {
+        ...current,
+        ...(patch.name !== undefined ? { name: patch.name } : {}),
+        schedule: nextSchedule,
+        payload: nextPayload,
+    };
+
+    const ok = facade.replaceRuntimeSchedule(id, next);
+    if (!ok) return `Failed to update cron "${id}" (kind mismatch or engine not started).`;
+    const kindLabel = nextSchedule.kind;
+    return `Cron job "${next.name}" updated (id=${id}, kind=${kindLabel}${next.payload.oneshot ? ', oneshot' : ''}).`;
 }

@@ -6,3 +6,4 @@ export { SignalChannel, type SignalChannelConfig } from './signal';
 export { IMessageChannel, type IMessageChannelConfig } from './imessage';
 export { SlackChannel, type SlackChannelConfig } from './slack';
 export { GoogleChatChannel, type GoogleChatChannelConfig } from './googlechat';
+export { ChatChannel, type ChatChannelConfig } from './chat';

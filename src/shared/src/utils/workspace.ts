@@ -90,29 +90,51 @@ export function createWorkspace(env: NodeJS.ProcessEnv = process.env) {
     const home = () => resolveFlopsyHome(env);
     const sub = (...parts: string[]) => join(home(), ...parts);
 
+    /**
+     * Workspace layout:
+     *
+     *   <HOME>/
+     *     config/         — human-edited config (flopsy.json5, SOUL.md, AGENTS.md, personalities.yaml)
+     *     content/        — human-authored prompts/skills (skills/, roles/, prompts/)
+     *     state/          — machine-managed databases (proactive.db, memory.db,
+     *                        checkpoints.db, learning.db, *.json snapshots)
+     *     cache/          — regenerable artifacts (tool-outputs/, worker-outputs/)
+     *     auth/           — credentials (mode 0o700)
+     *     logs/           — rotating log files
+     *     gateway.pid     — daemon PID
+     */
     return {
         /** Workspace root (e.g. ~/.flopsy) */
         root: home,
-        state: (...parts: string[]) => sub('state', ...parts),
-        sessions: (...parts: string[]) => sub('sessions', ...parts),
-        prompts: () => sub('prompts'),
-        credentials: (...parts: string[]) => sub('credentials', ...parts),
-        logs: () => sub('logs'),
-        memory: () => sub('memory'),
-        checkpoints: () => sub('checkpoints'),
-        cache: (...parts: string[]) => sub('cache', ...parts),
-        agents: () => sub('agents'),
-        skills: () => sub('skills'),
-        learning: () => sub('learning'),
-        data: (...parts: string[]) => sub('data', ...parts),
-        dataAgent: () => sub('data', 'agent'),
-        dataCheckpoints: () => sub('data', 'checkpoints'),
-        config: () => sub('config.json5'),
-        storeDb: () => sub('store.db'),
-        checkpointsDb: () => sub('checkpoints.db'),
-        pidFile: () => sub('gateway.pid'),
-        /** <os.tmpdir()>/flopsy-scratch */
-        scratch: () => join(tmpdir(), 'flopsy-scratch'),
+
+        // Config + content (human-edited).
+        config:        (...parts: string[]) => sub('config', ...parts),
+        content:       (...parts: string[]) => sub('content', ...parts),
+        skills:        () => sub('content', 'skills'),
+        roles:         () => sub('content', 'roles'),
+        prompts:       (...parts: string[]) => sub('content', 'prompts', ...parts),
+
+        // Authoritative config file path — `loadConfig()` reads from here.
+        configFile:    () => sub('config', 'flopsy.json5'),
+
+        // Auth + transient runtime.
+        auth:          (...parts: string[]) => sub('auth', ...parts),
+        logs:          () => sub('logs'),
+        pidFile:       () => sub('gateway.pid'),
+
+        // Machine state — DB files live directly under state/.
+        state:         (...parts: string[]) => sub('state', ...parts),
+        memoryDb:      () => sub('state', 'memory.db'),
+        checkpointsDb: () => sub('state', 'checkpoints.db'),
+        learningDb:    () => sub('state', 'learning.db'),
+
+        // Cache (safe to nuke).
+        cache:         (...parts: string[]) => sub('cache', ...parts),
+        toolOutputs:   () => sub('cache', 'tool-outputs'),
+        workerOutputs: () => sub('cache', 'worker-outputs'),
+
+        /** <os.tmpdir()>/flopsy-scratch — outside FLOPSY_HOME on purpose. */
+        scratch:       () => join(tmpdir(), 'flopsy-scratch'),
     };
 }
 

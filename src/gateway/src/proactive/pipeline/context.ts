@@ -18,13 +18,9 @@ function formatAgo(ms: number): string {
 }
 
 /**
- * Build a markdown context block listing what the agent has already covered
- * recently — by semantic topic and by stable item ID. Prepended to the prompt
- * so the agent naturally avoids repeating itself even when rephrasing would
- * produce a different content hash.
- *
- * Topics carry cooldown windows (3d if delivered, 12h if suppressed).
- * Returns an empty string when there's nothing to inject.
+ * Markdown block listing recently-covered topics + reported item IDs.
+ * Topic cooldowns: 3d delivered, 12h suppressed. Returns '' when nothing
+ * applies.
  */
 export function buildAntiRepetitionContext(
     store: StateStore,
@@ -74,8 +70,8 @@ export function buildAntiRepetitionContext(
 }
 
 /**
- * Parse `REPORTED: emails=[id1,id2] news=[url1]` lines from raw agent output.
- * Auto-extracts http(s) URLs for news-style jobs as a fallback.
+ * Parse `REPORTED: emails=[id1,id2] news=[url1]` lines from agent output.
+ * Auto-extracts URLs for news-style jobs as a fallback.
  */
 export function parseReportedLines(
     text: string,
@@ -116,9 +112,6 @@ export function parseReportedLines(
     return out;
 }
 
-/**
- * Strip REPORTED: tracking lines from text before delivery.
- */
 export function stripReportedLines(text: string): string {
     return text
         .split('\n')

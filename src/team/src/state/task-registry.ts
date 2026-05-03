@@ -95,10 +95,6 @@ export class TaskRegistry {
         return this.tasks.delete(id);
     }
 
-    // -----------------------------------------------------------------------
-    // Queries
-    // -----------------------------------------------------------------------
-
     list(): TaskState[] {
         return [...this.tasks.values()];
     }
@@ -153,9 +149,7 @@ export class TaskRegistry {
         return { total: this.tasks.size, byStatus, byType };
     }
 
-    // -----------------------------------------------------------------------
-    // Pending-message helpers (mid-turn injection)
-    // -----------------------------------------------------------------------
+    // Pending-message helpers — mid-turn injection between tool-round boundaries.
 
     /**
      * Append a user message to a teammate's pendingMessages buffer. Returns
@@ -190,10 +184,6 @@ export class TaskRegistry {
         this.tasks.set(taskId, { ...task, pendingMessages: [] });
         return drained;
     }
-
-    // -----------------------------------------------------------------------
-    // Bulk operations (shutdown, user-stop)
-    // -----------------------------------------------------------------------
 
     /**
      * Abort every active task's whole or current-turn controller. Used by

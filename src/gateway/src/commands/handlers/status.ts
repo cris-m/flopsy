@@ -1,153 +1,150 @@
-/**
- * `/status` slash command — chat-side status reply.
- *
- * Builds a `StatusSnapshot` from the gateway + thread context and renders
- * it via `renderChannelMarkdown()` from `@flopsy/shared`. The same DTO
- * powers `flopsy status` on the terminal side — only the renderer
- * differs, keeping the two output paths in lock-step without drift.
- */
-
-import { renderChannelMarkdown, type StatusSnapshot } from '@flopsy/shared';
-import type { CommandDef, CommandContext, GatewayStatusSnapshot, ThreadStatus } from '../types';
+import { panel, row, STATE, agoLabel, truncate, formatCount } from '@flopsy/shared';
+import type {
+    CommandDef,
+    CommandContext,
+    GatewayStatusSnapshot,
+    ThreadStatus,
+} from '../types';
+import type { PanelSection } from '@flopsy/shared';
 
 export const statusCommand: CommandDef = {
     name: 'status',
     aliases: ['s'],
     description: 'Show gateway + team status.',
     handler: async (ctx: CommandContext) => {
-        const snapshot = buildSnapshot(ctx);
-        return { text: renderChannelMarkdown(snapshot) };
+        return { text: render(ctx) };
     },
 };
 
-function buildSnapshot(ctx: CommandContext): StatusSnapshot {
+function render(ctx: CommandContext): string {
     const g = ctx.gatewayStatus;
     const t = ctx.threadStatus;
+    const sections: PanelSection[] = [];
 
-    const gateway: StatusSnapshot['gateway'] = g
-        ? {
-              running: true,
-              host: '127.0.0.1',
-              port: g.port ?? 0,
-              ...(g.uptimeMs !== undefined ? { uptimeMs: g.uptimeMs } : {}),
-              ...(g.version ? { version: g.version } : {}),
-              activeThreads: g.activeThreads,
-          }
-        : {
-              running: false,
-              host: '127.0.0.1',
-              port: 0,
-          };
+    sections.push(buildGatewaySection(g));
+    sections.push(buildChannelsSection(g));
+    if (t?.team && t.team.length > 0) sections.push(buildTeamSection(t));
+    if (g?.proactive) sections.push(buildProactiveSection(g));
+    if (t) sections.push(buildThreadSection(t));
 
-    const channels: StatusSnapshot['channels'] = (g?.channels ?? []).map((c) => ({
-        name: c.name,
-        enabled: c.enabled,
-        ...(c.enabled
-            ? { status: normalizeChannelStatus(c.status) }
-            : { status: 'disabled' as const }),
-    }));
-
-    const team: StatusSnapshot['team'] = (t?.team ?? []).map((m) => ({
-        name: m.name,
-        enabled: m.enabled,
-        status: m.status === 'running' ? 'working' : m.status === 'disabled' ? 'disabled' : 'idle',
-        ...(m.currentTask ? { currentTask: m.currentTask.description } : {}),
-        ...(m.lastActiveAt !== undefined ? { lastActiveAgoMs: Date.now() - m.lastActiveAt } : {}),
-    }));
-
-    const proactive = buildProactive(g);
-
-    const thread = t ? buildThread(t) : undefined;
-
-    return {
-        gateway,
-        channels,
-        team,
-        proactive,
-        integrations: {
-            auth: [],
-            mcp: { enabled: false, configured: 0, active: 0 },
-            memory: { enabled: false },
-        },
-        paths: { config: '', state: '' },
-        ...(thread ? { thread } : {}),
-    };
+    const summary = buildSummary(g, t);
+    return panel(sections, summary ? { header: summary } : {});
 }
 
-function buildProactive(g?: GatewayStatusSnapshot): StatusSnapshot['proactive'] {
-    const p = g?.proactive;
-    const wh = g?.webhook;
-    const now = Date.now();
-    return {
-        enabled: p !== undefined,
-        ...(p ? { running: p.running } : {}),
-        heartbeats: {
-            count: p?.heartbeats ?? 0,
-            enabled: p?.heartbeats ?? 0,
-            ...(p?.lastHeartbeatAt ? { lastFireAgoMs: now - p.lastHeartbeatAt } : {}),
-        },
-        cron: {
-            count: p?.cronJobs ?? 0,
-            enabled: p?.cronJobs ?? 0,
-        },
-        webhooks: {
-            count: p?.inboundWebhooks ?? 0,
-            enabled: wh?.enabled ?? false,
-        },
-    };
-}
-
-function buildThread(t: ThreadStatus): NonNullable<StatusSnapshot['thread']> {
-    const now = Date.now();
-    return {
-        entryAgent: t.entryAgent,
-        ...(t.tokens
-            ? {
-                  tokensToday: {
-                      input: t.tokens.input,
-                      output: t.tokens.output,
-                      calls: t.tokens.calls,
-                      byModel: t.tokens.byModel.map((m) => ({
-                          model: `${m.provider}:${m.model}`,
-                          input: m.input,
-                          output: m.output,
-                          calls: m.calls,
-                      })),
-                  },
-              }
-            : {}),
-        ...(t.activeTasks.length > 0
-            ? {
-                  activeTasks: t.activeTasks.map((a) => ({
-                      id: a.id,
-                      worker: a.worker,
-                      description: a.description,
-                      runningMs: now - a.startedAtMs,
-                  })),
-              }
-            : {}),
-        ...(t.recentTasks.length > 0
-            ? {
-                  recentTasks: t.recentTasks.map((r) => ({
-                      id: r.id,
-                      worker: r.worker,
-                      description: r.description,
-                      status: r.status,
-                      ...(r.endedAtMs !== undefined ? { endedAgoMs: now - r.endedAtMs } : {}),
-                  })),
-              }
-            : {}),
-    };
-}
-
-function normalizeChannelStatus(s: string): StatusSnapshot['channels'][number]['status'] {
-    switch (s) {
-        case 'connected':
-        case 'connecting':
-        case 'disconnected':
-        case 'error':
-            return s;
-        default:
-            return 'unknown';
+function buildSummary(g?: GatewayStatusSnapshot, t?: ThreadStatus): string {
+    const parts: string[] = ['STATUS'];
+    if (g?.uptimeMs !== undefined) {
+        parts.push(`up ${agoLabel(g.uptimeMs).replace(' ago', '')}`);
     }
+    if (t?.entryAgent) parts.push(t.entryAgent);
+    return parts.join(' · ');
+}
+
+function buildGatewaySection(g?: GatewayStatusSnapshot): PanelSection {
+    if (!g) return { title: 'gateway', lines: [row('status', `${STATE.fail} not running`)] };
+    const lines: string[] = [];
+    lines.push(row('status', `${STATE.ok} running`));
+    if (g.uptimeMs !== undefined) lines.push(row('uptime', agoLabel(g.uptimeMs).replace(' ago', '')));
+    if (g.activeThreads !== undefined && g.activeThreads > 0) {
+        lines.push(row('active turns', String(g.activeThreads)));
+    }
+    if (g.version) lines.push(row('version', g.version));
+    return { title: 'gateway', lines };
+}
+
+function buildChannelsSection(g?: GatewayStatusSnapshot): PanelSection {
+    const channels = g?.channels ?? [];
+    if (channels.length === 0) {
+        return { title: 'channels', lines: [row('', '(none configured)')] };
+    }
+    const lines = channels.map((c) => {
+        const glyph = !c.enabled
+            ? STATE.off
+            : c.status === 'connected'
+                ? STATE.ok
+                : c.status === 'error'
+                    ? STATE.fail
+                    : STATE.warn;
+        const note = !c.enabled ? 'disabled' : c.status ?? 'unknown';
+        return row(c.name, `${glyph}  ${note}`);
+    });
+    return { title: 'channels', lines };
+}
+
+function buildTeamSection(t: ThreadStatus): PanelSection {
+    const team = t.team ?? [];
+    const lines: string[] = [];
+    const now = Date.now();
+    for (const m of team) {
+        let value: string;
+        if (!m.enabled) {
+            value = `${STATE.off}  disabled`;
+        } else if (m.status === 'running' && m.currentTask) {
+            value = `${STATE.on}  working · "${truncate(m.currentTask.description, 36)}"`;
+        } else if (m.status === 'running') {
+            value = `${STATE.on}  working`;
+        } else {
+            const ago =
+                m.lastActiveAt !== undefined
+                    ? ` · last ${agoLabel(now - m.lastActiveAt)}`
+                    : '';
+            value = `${STATE.off}  idle${ago}`;
+        }
+        lines.push(row(m.name, value));
+    }
+    return { title: `team  (${t.entryAgent ?? '?'})`, lines };
+}
+
+function buildProactiveSection(g: GatewayStatusSnapshot): PanelSection {
+    const p = g.proactive!;
+    const lines: string[] = [];
+    if (p.heartbeats !== undefined && p.heartbeats > 0) {
+        const last = p.lastHeartbeatAt ? ` · last ${agoLabel(Date.now() - p.lastHeartbeatAt)}` : '';
+        lines.push(row('heartbeats', `${p.heartbeats} active${last}`));
+    }
+    if (p.cronJobs !== undefined && p.cronJobs > 0) {
+        lines.push(row('cron jobs', String(p.cronJobs)));
+    }
+    if (p.inboundWebhooks !== undefined && p.inboundWebhooks > 0) {
+        lines.push(row('webhooks', String(p.inboundWebhooks)));
+    }
+    const stats24h = (p as { stats24h?: { delivered: number; suppressed: number; errors: number } }).stats24h;
+    if (stats24h) {
+        const parts = [
+            `${stats24h.delivered} delivered`,
+            `${stats24h.suppressed} suppressed`,
+            `${stats24h.errors} error${stats24h.errors === 1 ? '' : 's'}`,
+        ];
+        lines.push(row('24h', parts.join(' · ')));
+    }
+    if (lines.length === 0) {
+        lines.push(row('', '(no schedules)'));
+    }
+    return { title: 'proactive', lines };
+}
+
+function buildThreadSection(t: ThreadStatus): PanelSection {
+    const lines: string[] = [];
+    if (t.tokens && t.tokens.calls > 0) {
+        const k = t.tokens;
+        lines.push(
+            row('tokens today', `${formatCount(k.input)} in · ${formatCount(k.output)} out · ${k.calls} call${k.calls === 1 ? '' : 's'}`),
+        );
+    }
+    if (t.activeTasks.length > 0) {
+        lines.push(row('active', `${t.activeTasks.length} task${t.activeTasks.length === 1 ? '' : 's'}`));
+        for (const a of t.activeTasks.slice(0, 3)) {
+            const age = agoLabel(Date.now() - a.startedAtMs).replace(' ago', '');
+            lines.push(row(`  ${a.worker}`, `"${truncate(a.description, 40)}" · ${age}`));
+        }
+    }
+    if (t.recentTasks.length > 0 && t.activeTasks.length === 0) {
+        const r = t.recentTasks[0]!;
+        const age = r.endedAtMs !== undefined ? agoLabel(Date.now() - r.endedAtMs) : '?';
+        lines.push(row('last task', `${r.worker} · ${r.status} · ${age}`));
+    }
+    if (lines.length === 0) {
+        lines.push(row('', 'idle'));
+    }
+    return { title: 'this thread', lines };
 }

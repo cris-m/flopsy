@@ -36,6 +36,15 @@ export interface ScheduleFacade {
     ): boolean;
     removeRuntimeSchedule(id: string): boolean;
     setRuntimeScheduleEnabled(id: string, enabled: boolean): boolean;
+    /**
+     * Replace a runtime schedule's config in place. Preserves enabled flag,
+     * created_at, and run stats — unlike delete+create which wipes them.
+     * Returns false if id is unknown or kind would change.
+     */
+    replaceRuntimeSchedule(
+        id: string,
+        newConfig: HeartbeatDefinitionConfig | JobDefinitionConfig,
+    ): boolean;
     listSchedules(): Array<{
         id: string;
         kind: 'heartbeat' | 'cron' | 'webhook';

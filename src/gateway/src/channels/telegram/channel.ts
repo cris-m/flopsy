@@ -11,14 +11,12 @@ import type {
 } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
 import { isSafeMediaUrl } from '@gateway/core/security';
+import { splitForTelegram } from './message-splitter';
 import type { TelegramChannelConfig } from './types';
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 
-// Telegram's callback_data is a 1-64 byte opaque string returned verbatim
-// when the user taps an inline-keyboard button. We put the button's `value`
-// here — for plan approval that's "go" / "edit" / "no", which happens to
-// match the regex classifier's vocabulary so taps synthesize cleanly.
+// Telegram callback_data is a 1-64 byte opaque string returned on tap.
 const TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64;
 
 function fitsCallback(s: string): boolean {
@@ -34,7 +32,6 @@ function buildInlineKeyboard(
 
     for (const block of interactive.blocks) {
         if (block.type === 'buttons') {
-            // Chunk into rows of up to 3 to avoid overflow on narrow clients.
             for (let i = 0; i < block.buttons.length; i += ROW_SIZE) {
                 const row = block.buttons
                     .slice(i, i + ROW_SIZE)
@@ -43,8 +40,7 @@ function buildInlineKeyboard(
                 if (row.length > 0) rows.push(row);
             }
         } else if (block.type === 'select') {
-            // Render select options as buttons (Telegram has no native
-            // dropdown). Select values that exceed 64 bytes are dropped.
+            // Telegram has no native dropdown — render as buttons.
             for (let i = 0; i < block.options.length; i += ROW_SIZE) {
                 const row = block.options
                     .slice(i, i + ROW_SIZE)
@@ -53,17 +49,14 @@ function buildInlineKeyboard(
                 if (row.length > 0) rows.push(row);
             }
         }
-        // `poll` blocks handled via sendPoll (separate code path).
+        // `poll` blocks handled via sendPoll.
     }
 
     return rows.length > 0 ? rows : undefined;
 }
 
-/**
- * Telegram's fixed reaction whitelist (from Bot API docs). Any emoji outside
- * this set returns 400 `REACTION_INVALID`. Kept as a Set for O(1) membership
- * checks before calling `setMessageReaction`.
- */
+// Telegram Bot API reaction whitelist. Anything outside returns 400
+// REACTION_INVALID. https://core.telegram.org/bots/api#reactiontypeemoji
 const TELEGRAM_ALLOWED_REACTIONS: ReadonlySet<string> = new Set([
     '👍', '👎', '❤', '🔥', '🥰', '👏', '😁', '🤔', '🤯', '😱', '🤬', '😢',
     '🎉', '🤩', '🤮', '💩', '🙏', '👌', '🕊', '🤡', '🥱', '🥴', '😍', '🐳',
@@ -74,12 +67,8 @@ const TELEGRAM_ALLOWED_REACTIONS: ReadonlySet<string> = new Set([
     '🤷‍♂', '🤷', '🤷‍♀', '😡',
 ]);
 
-/**
- * Approximate-match table for emojis the agent commonly emits that aren't in
- * Telegram's whitelist. Keyed by the agent's choice → the nearest allowed
- * emoji with similar semantic meaning. Unknown input falls through to 👍
- * (neutral acknowledgement) — better than a 400 error, silent to the user.
- */
+// Approximate-match table for agent-emitted emojis outside Telegram's
+// whitelist. Unknown input falls through to 👍.
 const TELEGRAM_REACTION_FALLBACKS: Readonly<Record<string, string>> = {
     '⏳': '🤔', // in-progress / thinking
     '✅': '👍', // done / success
@@ -116,10 +105,6 @@ export class TelegramChannel extends BaseChannel {
     readonly name = 'telegram';
     readonly authType = 'token';
     readonly streaming: StreamingCapability = { editBased: true, minEditIntervalMs: 1000 };
-    // Interactive surfaces Telegram renders natively. The agent reads this via
-    // the runtime block in its system prompt, so tool-routing decisions
-    // (ask_user, send_poll, send_message+buttons) are driven by what's
-    // actually available on the current channel instead of hard-coded names.
     readonly capabilities: readonly InteractiveCapability[] = [
         'buttons',
         'polls',
@@ -240,12 +225,6 @@ export class TelegramChannel extends BaseChannel {
                 await this.emit('onMessage', normalized);
             });
 
-            // Inline-keyboard button taps arrive as callback_query updates.
-            // We answer() immediately (dismisses the client's "loading"
-            // spinner + shows an optional toast), then emit onInteraction so
-            // the ChannelWorker can synthesize a user message from the
-            // button's callback_data. This lets the existing text-classifier
-            // handle approve/edit/reject without knowing about buttons.
             this.bot.on('callback_query:data', async (ctx) => {
                 const q = ctx.callbackQuery;
                 const data = q.data;
@@ -266,9 +245,7 @@ export class TelegramChannel extends BaseChannel {
                             : (chat as { title?: string }).title,
                 };
 
-                // Cheap acknowledgement — empty text is fine; using the
-                // button's label would duplicate the text the user already
-                // sees tapped.
+                // Empty acknowledgement — dismisses the client's loading spinner.
                 await ctx.answerCallbackQuery().catch(() => {});
 
                 const callback: InteractionCallback = {
@@ -323,6 +300,12 @@ export class TelegramChannel extends BaseChannel {
 
         const chatId = message.peer.id;
 
+        const _bodyPreview = (message.body ?? '').slice(0, 80);
+        this.log.debug(
+            { chatId, bodyLen: (message.body ?? '').length, preview: _bodyPreview, hasMedia: !!message.media?.length },
+            'telegram send: attempting',
+        );
+
         if (message.media?.length) {
             let lastId = 0;
             for (let i = 0; i < message.media.length; i++) {
@@ -373,34 +356,70 @@ export class TelegramChannel extends BaseChannel {
         const body = message.body ?? '';
         if (!body.trim()) return '';
 
-        // Interactive attachments — inline keyboard when the caller
-        // specified `buttons` / `select` blocks. `poll` blocks go through
-        // a different path (sendPoll). Drops silently if nothing fits
-        // Telegram's 64-byte callback_data cap.
         const keyboard = message.interactive
             ? buildInlineKeyboard(message.interactive)
             : undefined;
         const replyMarkup = keyboard ? { inline_keyboard: keyboard } : undefined;
 
-        const sent = await this.bot.api
-            .sendMessage(chatId, body, {
-                parse_mode: 'Markdown',
-                ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-            })
-            .catch(() =>
-                this.bot!.api.sendMessage(chatId, body, {
-                    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-                }),
-            );
-        return String(sent.message_id);
+        // Bad replyTo (gone / wrong chat / non-integer) makes sendMessage 400 —
+        // the catch below retries without it.
+        const replyParameters =
+            message.replyTo && /^\d+$/.test(message.replyTo)
+                ? { reply_parameters: { message_id: parseInt(message.replyTo, 10) } }
+                : undefined;
+
+        // Splitter is fence-aware. Reply markup + quote-reply attach to the
+        // last chunk so taps land on the most recent message.
+        const chunks = splitForTelegram(body);
+        let lastId = '';
+        for (let i = 0; i < chunks.length; i++) {
+            const isLast = i === chunks.length - 1;
+            const chunkBody = chunks[i]!;
+            const sent = await this.bot.api
+                .sendMessage(chatId, chunkBody, {
+                    parse_mode: 'Markdown',
+                    ...(isLast && replyMarkup ? { reply_markup: replyMarkup } : {}),
+                    ...(i === 0 ? (replyParameters ?? {}) : {}),
+                })
+                .catch((mdErr: unknown) => {
+                    // Markdown parse failure → retry as plain text.
+                    this.log.warn(
+                        {
+                            chatId,
+                            err: mdErr instanceof Error ? mdErr.message : String(mdErr),
+                            chunk: i,
+                            chunks: chunks.length,
+                        },
+                        'telegram send: markdown send failed, retrying plain',
+                    );
+                    return this.bot!.api.sendMessage(chatId, chunkBody, {
+                        ...(isLast && replyMarkup ? { reply_markup: replyMarkup } : {}),
+                    });
+                })
+                .catch((plainErr: unknown) => {
+                    // Plain-text retry failed (403 bot blocked / 400 chat
+                    // not found / 429 rate limit).
+                    this.log.error(
+                        {
+                            chatId,
+                            err: plainErr instanceof Error ? plainErr.message : String(plainErr),
+                            chunk: i,
+                            chunks: chunks.length,
+                        },
+                        'telegram send: BOTH markdown AND plain-text sends failed — message dropped',
+                    );
+                    throw plainErr;
+                });
+            lastId = String(sent.message_id);
+        }
+        this.log.debug({ chatId, messageId: lastId, chunks: chunks.length }, 'telegram send: ok');
+        return lastId;
     }
 
     /**
-     * Native Telegram poll. Limits per Telegram API:
+     * Native Telegram poll. Telegram caps:
      *   - question ≤ 300 chars, 2-10 options each ≤ 100 chars
-     *   - open_period (auto-close) is in SECONDS, range 5-600 (max 10 min)
-     *   - is_anonymous default true; we pass it through explicitly so the
-     *     agent can opt in to non-anonymous when it wants vote signals.
+     *   - open_period in SECONDS, range 5-600
      */
     async sendPoll(args: {
         peer: Peer;
@@ -417,9 +436,7 @@ export class TelegramChannel extends BaseChannel {
             allows_multiple_answers: args.allowMultiple ?? false,
         };
         if (args.durationHours !== undefined) {
-            // Telegram caps open_period at 600 seconds (10 minutes). Clamp
-            // to keep the call from failing on long durations the Discord
-            // API would accept.
+            // Clamp to Telegram's 5-600 second open_period range.
             const seconds = Math.min(600, Math.max(5, Math.round(args.durationHours * 3600)));
             pollOpts.open_period = seconds;
         }
@@ -434,11 +451,7 @@ export class TelegramChannel extends BaseChannel {
 
     async sendTyping(peer: Peer): Promise<void> {
         if (!this.bot) return;
-        // Typing indicators are fire-and-forget cosmetics — throttled by
-        // Telegram, fail benignly under rate limits or transient network
-        // blips. Deliberately silent to avoid log spam; a real connectivity
-        // issue surfaces elsewhere (sendMessage failures will log).
-        await this.bot.api.sendChatAction(peer.id, 'typing').catch(() => { /* intentionally silent */ });
+        await this.bot.api.sendChatAction(peer.id, 'typing').catch(() => { /* fire-and-forget */ });
     }
 
     async react(options: ReactionOptions): Promise<void> {
@@ -452,12 +465,6 @@ export class TelegramChannel extends BaseChannel {
             return;
         }
 
-        // Telegram only accepts reactions from a FIXED whitelist of emojis
-        // (see https://core.telegram.org/bots/api#reactiontypeemoji). Sending
-        // anything outside the set returns 400 `REACTION_INVALID`. Map common
-        // agent-emitted emojis (⏳, ✅, ❌, ⚙️, 📝, etc.) to close analogues in
-        // the whitelist; fall back to 👍 for anything else. Prevents log spam
-        // when the LLM picks a reasonable emoji that Telegram doesn't support.
         const emoji = mapToTelegramAllowedEmoji(options.emoji);
         await this.bot.api.setMessageReaction(chatId, messageId, [
             { type: 'emoji', emoji: emoji as never },
@@ -466,8 +473,14 @@ export class TelegramChannel extends BaseChannel {
 
     async editMessage(messageId: string, peer: Peer, body: string): Promise<void> {
         if (!this.bot) throw new Error('Telegram not connected');
+        // Telegram caps editMessageText at 4096; truncate the streaming
+        // preview. The final reply goes through `send` which chunks.
+        const TELEGRAM_EDIT_CAP = 4000;
+        const truncated = body.length > TELEGRAM_EDIT_CAP
+            ? body.slice(0, TELEGRAM_EDIT_CAP) + '\n\n_… (truncated preview; full reply incoming)_'
+            : body;
         await this.bot.api
-            .editMessageText(peer.id, parseInt(messageId, 10), body, { parse_mode: 'Markdown' })
-            .catch(() => this.bot!.api.editMessageText(peer.id, parseInt(messageId, 10), body));
+            .editMessageText(peer.id, parseInt(messageId, 10), truncated, { parse_mode: 'Markdown' })
+            .catch(() => this.bot!.api.editMessageText(peer.id, parseInt(messageId, 10), truncated));
     }
 }

@@ -276,13 +276,13 @@ function checkStateDirs(): CheckResult[] {
     // workspace helpers produce the same absolute paths the gateway
     // sees at boot — regardless of where the user ran `flopsy` from.
     const home = workspace.root();
-    const harness = workspace.state().replace(/\/state$/, '/harness');
-    const auth = workspace.credentials();
+    const state = workspace.state();
+    const auth = workspace.auth();
     const results: CheckResult[] = [];
     for (const [label, path] of [
-        ['.flopsy/', home],
-        ['.flopsy/harness/', harness],
-        ['.flopsy/auth/', auth],
+        ['.flopsy/',       home],
+        ['.flopsy/state/', state],
+        ['.flopsy/auth/',  auth],
     ] as const) {
         try {
             const s = statSync(path);
@@ -417,7 +417,7 @@ function groupByPrefix(results: readonly CheckResult[]): ReadonlyArray<[string, 
             prefix === 'main agent' ||
             prefix === 'env placeholders' ||
             prefix === '.flopsy/' ||
-            prefix === '.flopsy/harness/' ||
+            prefix === '.flopsy/state/' ||
             prefix === '.flopsy/auth/'
                 ? 'General'
                 : prefix.charAt(0).toUpperCase() + prefix.slice(1);

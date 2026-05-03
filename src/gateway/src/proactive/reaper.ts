@@ -3,30 +3,18 @@ import { SqliteCheckpointStore } from 'flopsygraph';
 
 const log = createLogger('proactive-reaper');
 
-const DEFAULT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;        // 5 min
-const DEFAULT_RETENTION_MS = 24 * 60 * 60 * 1000;        // 24 h
+const DEFAULT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+const DEFAULT_RETENTION_MS = 24 * 60 * 60 * 1000;
 const PROACTIVE_THREAD_PREFIX = 'proactive:';
 
 export interface ProactiveReaperConfig {
-    /** How often to run the sweep. Default 5 min (matches OpenClaw). */
     sweepIntervalMs?: number;
-    /** Drop ephemeral threads older than this. Default 24h. */
     retentionMs?: number;
-    /** Override the checkpoints.db path (otherwise resolved from workspace). */
     checkpointsDbPath?: string;
 }
 
-/**
- * Reaper for ephemeral `proactive:<jobId>:<timestamp>` checkpoint threads.
- *
- * Each heartbeat / cron fire creates a one-shot thread to execute the agent
- * in isolation (so the user's chat history isn't polluted). Per-fire cleanup
- * is "best-effort"; when it fails (network glitch, agent crash, abort), the
- * thread row stays in checkpoints.db forever. Over weeks this accumulates.
- *
- * OpenClaw runs an equivalent `sweepCronRunSessions()` every 5 min, retention
- * 24h. We follow the same convention.
- */
+// Sweeps ephemeral `proactive:<jobId>:<timestamp>` threads when per-fire
+// cleanup fails (crashes, aborts, network glitches).
 export class ProactiveReaper {
     private readonly store: SqliteCheckpointStore;
     private readonly sweepIntervalMs: number;
@@ -37,24 +25,26 @@ export class ProactiveReaper {
     constructor(config: ProactiveReaperConfig = {}) {
         this.sweepIntervalMs = config.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS;
         this.retentionMs = config.retentionMs ?? DEFAULT_RETENTION_MS;
-        const path = config.checkpointsDbPath ?? resolveWorkspacePath('harness', 'checkpoints.db');
-        // Reaper opens its own connection — better-sqlite3 in WAL mode
-        // handles multi-handle concurrency for short DELETEs without
-        // contending the team handler's writer.
+        const path = config.checkpointsDbPath ?? resolveWorkspacePath('state', 'checkpoints.db');
+        // Own connection: WAL mode handles concurrent DELETEs without contending the team handler's writer.
         this.store = new SqliteCheckpointStore({ path });
     }
 
-    start(): void {
+    // driveOwnTimer=false lets ProactiveEngine fold the sweep into its cron tick.
+    start(opts: { driveOwnTimer?: boolean } = {}): void {
         if (this.running) return;
         this.running = true;
-        // Fire-and-forget initial sweep so a fresh start cleans any
-        // accumulated cruft from prior runs that crashed before sweep.
         void this.sweep();
-        this.timer = setInterval(() => void this.sweep(), this.sweepIntervalMs);
-        // unref so the reaper never holds the process alive on shutdown.
-        this.timer.unref();
+        if (opts.driveOwnTimer !== false) {
+            this.timer = setInterval(() => void this.sweep(), this.sweepIntervalMs);
+            this.timer.unref();
+        }
         log.info(
-            { sweepIntervalMs: this.sweepIntervalMs, retentionMs: this.retentionMs },
+            {
+                sweepIntervalMs: this.sweepIntervalMs,
+                retentionMs: this.retentionMs,
+                ownTimer: opts.driveOwnTimer !== false,
+            },
             'proactive reaper started',
         );
     }
@@ -69,12 +59,11 @@ export class ProactiveReaper {
         try {
             this.store.close();
         } catch {
-            // ignore — close-on-shutdown errors are noise
+            // shutdown noise
         }
         log.info('proactive reaper stopped');
     }
 
-    /** Public for tests / CLI manual sweep. */
     async sweep(): Promise<number> {
         try {
             const deleted = await this.store.pruneByThreadPrefix(

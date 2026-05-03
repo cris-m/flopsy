@@ -29,13 +29,9 @@ async function downloadAsBase64(url: string): Promise<{ data: string; mimeType: 
     }
 }
 
-/**
- * Map our abstract button style to Discord's ButtonStyle enum values.
- * Imported lazily inside send() because discord.js is dynamic.
- */
+// Discord ButtonStyle: Primary=1, Secondary=2, Success=3, Danger=4.
+// Returning the numeric value avoids a build-time dependency.
 function mapDiscordButtonStyle(style: OurButtonStyle | undefined): number {
-    // Discord's ButtonStyle: Primary=1, Secondary=2, Success=3, Danger=4.
-    // Returning the numeric value avoids a build-time dependency on the enum.
     switch (style) {
         case 'success': return 3;
         case 'danger':  return 4;
@@ -45,13 +41,7 @@ function mapDiscordButtonStyle(style: OurButtonStyle | undefined): number {
     }
 }
 
-/**
- * Build Discord action-row components from our InteractiveReply. Discord
- * caps a row at 5 buttons and a message at 5 rows; we chunk generously
- * and drop any button whose `value` exceeds 100 chars (Discord's
- * custom_id limit). Returns undefined when nothing interactive was
- * specified — caller sends a plain text message.
- */
+// Discord caps: 5 buttons/row, 5 rows/message, custom_id ≤ 100 chars.
 function buildDiscordComponents(
     interactive: InteractiveReply,
 ): Array<{ type: 1; components: Array<{ type: 2; style: number; label: string; custom_id: string }> }> | undefined {
@@ -73,15 +63,13 @@ function buildDiscordComponents(
                 if (row.length > 0) rows.push({ type: 1, components: row });
             }
         } else if (block.type === 'select') {
-            // Render select options as a row of buttons — no native dropdown
-            // for now (StringSelectMenuBuilder could be a later add).
             for (let i = 0; i < block.options.length; i += ROW_SIZE) {
                 const row = block.options
                     .slice(i, i + ROW_SIZE)
                     .filter((o) => o.value.length <= 100)
                     .map((o) => ({
                         type: 2 as const,
-                        style: 2, // secondary for menu-like selects
+                        style: 2,
                         label: o.label.slice(0, 80),
                         custom_id: o.value,
                     }));
@@ -142,8 +130,7 @@ export class DiscordChannel extends BaseChannel {
                     GatewayIntentBits.DirectMessages,
                     GatewayIntentBits.MessageContent,
                     GatewayIntentBits.GuildMessageReactions,
-                    // Poll vote events — required for MessagePollVoteAdd to
-                    // fire. Without these the agent is blind to poll results.
+                    // Required for MessagePollVoteAdd to fire.
                     GatewayIntentBits.GuildMessagePolls,
                     GatewayIntentBits.DirectMessagePolls,
                 ],
@@ -216,10 +203,8 @@ export class DiscordChannel extends BaseChannel {
                 await this.emit('onMessage', normalized);
             });
 
-            // Poll votes round-trip as synthesized user messages
-            // `Voted "Option" in a poll.` — same pattern as button clicks.
-            // Lets the agent read vote signals through the normal message
-            // pipeline. Fires once per user, not per tally change.
+            // Poll votes round-trip as synthesized user messages so the
+            // agent reads vote signals via the normal pipeline.
             this.client.on(Events.MessagePollVoteAdd, async (pollAnswer, userId) => {
                 try {
                     const answerText =
@@ -262,12 +247,6 @@ export class DiscordChannel extends BaseChannel {
             });
 
             this.client.on(Events.InteractionCreate, async (interaction) => {
-                // Button taps arrive here as MessageComponent interactions
-                // with a `custom_id` equal to the button's value we set at
-                // send time. We ack immediately (avoids the "This
-                // interaction failed" toast after 3 seconds), then emit
-                // onInteraction so ChannelWorker can synthesize a user
-                // message from the custom_id.
                 if (interaction.isButton()) {
                     const isDM = !interaction.guildId;
                     const peerId = isDM ? interaction.user.id : interaction.channelId ?? interaction.user.id;
@@ -282,9 +261,7 @@ export class DiscordChannel extends BaseChannel {
                         return;
                     }
 
-                    // Silent deferUpdate acknowledges without posting
-                    // anything visible — the subsequent reply from the
-                    // agent carries the user-facing response.
+                    // Silent ack — agent's reply carries the response.
                     await interaction.deferUpdate().catch(() => {});
 
                     const callback: InteractionCallback = {
@@ -407,10 +384,7 @@ export class DiscordChannel extends BaseChannel {
             return sent.id;
         }
 
-        // Reply-threading is only useful in group/guild channels where
-        // multiple speakers make attribution ambiguous. In DMs it just adds
-        // visual clutter ("Bot replied to your message: ...") in a two-party
-        // conversation, so skip it there.
+        // Reply-threading is clutter in DMs (single counterparty).
         const isDM = message.peer.type === 'user';
         const sent = await channel.send({
             content: (message.body ?? '').slice(0, MAX_DISCORD_LENGTH),
@@ -421,14 +395,9 @@ export class DiscordChannel extends BaseChannel {
     }
 
     /**
-     * Native Discord poll. discord.js's `PollData` shape (camelCase,
-     * flat answers) — NOT the raw Discord API schema (snake_case +
-     * `poll_media` wrapper). Limits:
-     *   - question ≤ 300 chars, 2-10 options each ≤ 55 chars
-     *   - duration in HOURS, range 1-768 (32 days)
-     *   - layoutType 1 is the only shipped layout; discord.js currently
-     *     requires it explicitly for the payload to serialize.
-     *   - allowMultiselect (camelCase) controls multi-vote
+     * Native Discord poll using discord.js's `PollData` shape (camelCase, flat
+     * answers — NOT the raw API schema). Caps: question ≤ 300, 2-10 options
+     * ≤ 55 each, duration 1-768 hours.
      */
     async sendPoll(args: {
         peer: Peer;

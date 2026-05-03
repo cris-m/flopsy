@@ -72,13 +72,17 @@ describe('MessageQueue', () => {
 });
 
 describe('coalesce', () => {
-    it('should return empty string for empty batch', () => {
-        expect(coalesce([])).toBe('');
+    it('should return empty turn for empty batch', () => {
+        const result = coalesce([]);
+        expect(result.text).toBe('');
+        expect(result.media).toEqual([]);
     });
 
     it('should return text directly for single message', () => {
         const batch: QueuedMessage[] = [{ text: 'hello', enqueuedAt: Date.now() }];
-        expect(coalesce(batch)).toBe('hello');
+        const result = coalesce(batch);
+        expect(result.text).toBe('hello');
+        expect(result.media).toEqual([]);
     });
 
     it('should number multiple messages', () => {
@@ -88,7 +92,19 @@ describe('coalesce', () => {
             { text: 'bump version', enqueuedAt: Date.now() },
         ];
         const result = coalesce(batch);
-        expect(result).toBe('[1] fix the bug\n[2] update readme\n[3] bump version');
+        expect(result.text).toBe('[1] fix the bug\n[2] update readme\n[3] bump version');
+    });
+
+    it('should aggregate media across messages', () => {
+        const photo = { kind: 'photo', url: 'https://x/1.jpg' } as const;
+        const batch: QueuedMessage[] = [
+            { text: '[Image]', enqueuedAt: Date.now(), media: [photo], synthetic: true },
+            { text: 'caption here', enqueuedAt: Date.now() },
+        ];
+        const result = coalesce(batch);
+        // Synthetic [Image] is dropped in favor of the real caption text.
+        expect(result.text).toBe('caption here');
+        expect(result.media).toHaveLength(1);
     });
 });
 

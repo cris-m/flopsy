@@ -76,19 +76,22 @@ export function parseConfig(row: RuntimeScheduleRow): Record<string, unknown> {
     }
 }
 
-// ── Mgmt HTTP client ──────────────────────────────────────────────────────
-
 /** Resolve a mgmt endpoint URL from flopsy.json5, with a sane fallback. */
 export function mgmtUrl(path: string): string {
     try {
         const { config } = readFlopsyConfig();
         const gw = config.gateway ?? {};
+        // Explicit gateway.mgmt.port wins. Without it, fall back to
+        // gateway.port + 2 instead of +1 — the +1 default collides with
+        // webhook.port (also default 18790), routing every CLI command
+        // to the webhook server and producing "Missing signature" errors.
+        // +2 (= 18791) leaves room for the webhook server at +1.
         const port =
-            (gw as { mgmt?: { port?: number } }).mgmt?.port ?? ((gw.port ?? 18789) + 1);
+            (gw as { mgmt?: { port?: number } }).mgmt?.port ?? ((gw.port ?? 18789) + 2);
         const host = (gw as { mgmt?: { host?: string } }).mgmt?.host ?? '127.0.0.1';
         return `http://${host}:${port}${path}`;
     } catch {
-        return `http://127.0.0.1:18790${path}`;
+        return `http://127.0.0.1:18791${path}`;
     }
 }
 
@@ -181,8 +184,6 @@ function unreachableSoft(url: string, err: unknown): void {
         info(`gateway not running? start with \`flopsy gateway start\`. hint: ${hint}`),
     );
 }
-
-// ── Stats / fires ─────────────────────────────────────────────────────────
 
 export interface ProactiveStats {
     window: { sinceMs: number; windowMs: number };

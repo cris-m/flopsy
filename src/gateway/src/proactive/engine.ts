@@ -8,6 +8,7 @@ import { CronTrigger } from './triggers/cron';
 import { ChannelRouter } from './delivery/router';
 import { JobExecutor } from './pipeline/executor';
 import { ChannelHealthMonitor } from './health/monitor';
+import { CronHealthSweeper } from './health/cron-sweeper';
 import { PromptLoader } from './prompt-loader';
 import { ProactiveDedupStore } from './state/dedup-store';
 import { ProactiveReaper } from './reaper';
@@ -28,15 +29,6 @@ const log = createLogger('proactive');
 
 export interface ProactiveEmbedder {
     embed(text: string): Promise<number[]>;
-}
-
-/**
- * A raw BaseChatModel used for provider-enforced structured output in
- * conditional mode. Structurally typed so the gateway package doesn't need
- * a hard dep on flopsygraph's concrete types.
- */
-export interface ProactiveStructuredModel {
-    withStructuredOutput<T>(schema: unknown): unknown;
 }
 
 export interface ProactiveStatsSnapshot {
@@ -68,38 +60,24 @@ export interface ProactiveEngineConfig {
     /** Base directory for resolving relative promptFile paths. Defaults to cwd. */
     promptBaseDir?: string;
     /**
-     * When true, proactive messages without an explicit `delivery` route to
-     * the channel+peer of the user's most-recent inbound message (via the
-     * getActivePeer callback). Falls back to the static `delivery` target.
+     * Route proactive messages to the user's last-active channel+peer when
+     * no explicit `delivery` is configured. Falls back to the static target.
      */
     followActiveChannel?: boolean;
-    /** Returns the last-active channel+peer when follow-me is on. */
     getActivePeer?: () => { channelName: string; peer: DeliveryTarget['peer'] } | null;
-    /** Optional embedder — when present, cosine-similarity dedup is active. */
+    /** When present, cosine-similarity dedup is active. */
     embedder?: ProactiveEmbedder;
-    /**
-     * Optional raw chat model for structured-output reformatting of the
-     * agent's free-form reply in conditional mode. When present, the engine
-     * runs flopsygraph's `structuredLLM(model, schema)` as a second pass
-     * and treats its output as canonical.
-     */
+    /** Raw chat model for structured-output reformatting in conditional mode. */
     structuredOutputModel?: unknown;
-    /**
-     * Cosine-similarity threshold above which a candidate delivery is treated as
-     * a duplicate. nomic-embed-text on similar-topic summaries hits ~0.88–0.95.
-     * Default: 0.88.
-     */
+    /** nomic-embed-text on similar-topic summaries hits ~0.88–0.95. Default 0.88. */
     similarityThreshold?: number;
-    /** How far back to scan for similar deliveries. Default 48h. */
+    /** Default 48h. */
     similarityWindowMs?: number;
     healthMonitor?: Partial<ChannelHealthConfig>;
     /**
-     * Optional callback that resolves the effective threadId for a proactive
-     * fire targeting a known peer, using the peer+session model. When provided,
-     * heartbeat/cron fires reuse the peer's active session instead of creating
-     * an ephemeral `proactive:<jobId>:<timestamp>` thread.
-     *
-     * Supplied by the gateway from `agentHandler.resolveProactiveThreadId`.
+     * Resolves the threadId for a proactive fire targeting a known peer.
+     * Supplied by the gateway from `agentHandler.resolveProactiveThreadId`
+     * so heartbeat/cron fires reuse the peer's active session.
      */
     threadIdResolver?: (
         channelName: string,
@@ -110,6 +88,9 @@ export interface ProactiveEngineConfig {
 
 const RETRY_LOOP_INTERVAL_MS = 60_000;
 const PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+// Self-heal cadence — force-fires cron jobs whose lastRunAt is more than
+// 1.5× their period behind. 5min balances OOM recovery against CPU cost.
+const CRON_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 const DELIVERY_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 const REPORTED_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
 
@@ -134,6 +115,8 @@ export class ProactiveEngine {
     private healthMonitor: ChannelHealthMonitor;
     private retryTimer: ReturnType<typeof setTimeout> | null = null;
     private pruneTimer: ReturnType<typeof setInterval> | null = null;
+    private cronSweepTimer: ReturnType<typeof setInterval> | null = null;
+    private cronSweeper: CronHealthSweeper | null = null;
     private reaper: ProactiveReaper | null = null;
     private running = false;
     private threadIdResolver?: ProactiveEngineConfig['threadIdResolver'];
@@ -190,13 +173,13 @@ export class ProactiveEngine {
         this.healthMonitor.start(getChannels);
         this.startRetryLoop();
         this.startPruneLoop();
+        this.startCronSweepLoop();
 
-        // Sweep ephemeral `proactive:<jobId>:<timestamp>` checkpoint threads
-        // every 5 min, retention 24h. Without this, per-fire cleanup misses
-        // accumulate over weeks (the original 160 MB checkpoints.db was
-        // partly orphans from this path).
+        // Sweep ephemeral `proactive:<jobId>:<timestamp>` checkpoint rows.
+        // driveOwnTimer:false shares the cron-sweep tick — one timer covers
+        // both maintenance jobs.
         this.reaper = new ProactiveReaper();
-        this.reaper.start();
+        this.reaper.start({ driveOwnTimer: false });
         log.info(
             {
                 embedderEnabled: !!this.embedder,
@@ -216,11 +199,39 @@ export class ProactiveEngine {
         this.pruneTimer.unref();
     }
 
+    /**
+     * Force-fire cron jobs whose lastRunAt is overdue (daemon outage,
+     * post-fire registration, or upstream silent-swallow bugs).
+     */
+    private startCronSweepLoop(): void {
+        this.cronSweeper = new CronHealthSweeper(
+            () => this.cron,
+            this.store,
+        );
+        // Single tick drives both cron self-healing and reaper sweeps.
+        const tick = (): void => {
+            void this.cronSweeper!.sweep().catch((err) => {
+                log.error({ err, op: 'cron-sweep' }, 'cron sweep failed');
+            });
+            if (this.reaper) {
+                void this.reaper.sweep().catch((err) => {
+                    log.error({ err, op: 'proactive-reap' }, 'proactive reap failed');
+                });
+            }
+        };
+        // First sweep deferred by one interval to dodge startup races.
+        this.cronSweepTimer = setInterval(tick, CRON_SWEEP_INTERVAL_MS);
+        this.cronSweepTimer.unref();
+    }
+
+    async sweepCronHealth(): Promise<ReturnType<CronHealthSweeper['sweep']>> {
+        if (!this.cronSweeper) throw new Error('engine not started');
+        return this.cronSweeper.sweep();
+    }
+
     private startRetryLoop(): void {
-        // Use setTimeout + reschedule-after-completion instead of setInterval
-        // with an async callback, otherwise a slow retry tick overlaps with
-        // the next tick and the same due task gets retried 2-3x in parallel
-        // — the user receives duplicate notifications.
+        // setTimeout + reschedule-after-completion (NOT setInterval) so a
+        // slow tick can't overlap and double-fire retries.
         const tick = async (): Promise<void> => {
             if (!this.running) return;
             try {
@@ -278,17 +289,11 @@ export class ProactiveEngine {
             this.heartbeat.threadIdResolver = this.threadIdResolver;
         }
 
-        // Seed-from-config on first boot: if flopsy.json5 has heartbeats but
-        // proactive.db doesn't, import them once and set the seed marker.
-        // After that, flopsy.json5 is advisory — edits go via
-        // `flopsy schedule` CLI or the manage_schedule agent tool.
         this.seedSchedulesFromConfigIfNeeded({ heartbeats });
 
         const all = this.loadRuntimeHeartbeats();
         await this.heartbeat.start(all, defaultDelivery);
 
-        // Drain any heartbeat additions that arrived before this startup
-        // path completed (e.g. from catchupMissedFires racing the boot).
         this.flushPendingRegistrations('heartbeat');
     }
 
@@ -303,33 +308,22 @@ export class ProactiveEngine {
         if (this.threadIdResolver) {
             this.cron.threadIdResolver = this.threadIdResolver;
         }
-        // Let the trigger drop DB rows when one-shots complete — otherwise
-        // `flopsy cron list` accumulates phantom entries from fired oneshots.
+        // Drop DB rows when one-shots complete so `flopsy cron list` doesn't
+        // accumulate phantom entries.
         this.cron.deleteRuntimeRow = (id) => this.dedupStore.deleteRuntimeSchedule(id);
 
-        // Seed-from-config on first boot (symmetric with startHeartbeats).
         this.seedSchedulesFromConfigIfNeeded({ jobs });
 
         const all = this.loadRuntimeCronJobs();
         await this.cron.start(all, defaultDelivery);
 
-        // Symmetric with startHeartbeats: replay any cron adds that
-        // arrived before the trigger was up.
         this.flushPendingRegistrations('cron');
     }
 
     /**
-     * One-time import of config-defined heartbeats/cron jobs from
-     * flopsy.json5 into proactive.db. Runs on first boot only — the
-     * `configSeededAt` marker in proactive.json prevents re-runs so
-     * subsequent edits to flopsy.json5's proactive.heartbeats / .scheduler
-     * sections are advisory only. This is the Hermes/openclaw single-source
-     * model — DB is authoritative post-migration.
-     *
-     * Idempotent within a single boot: heartbeats and cron are registered
-     * via two separate engine methods (startHeartbeats / startCronJobs),
-     * both of which call this. The marker is only set once both halves
-     * have had a chance to import.
+     * First-boot import of config-defined schedules into proactive.db.
+     * `configSeededAt` marker prevents re-runs; flopsy.json5 schedule
+     * sections become advisory after seeding (DB is authoritative).
      */
     private seedSchedulesFromConfigIfNeeded(input: {
         heartbeats?: HeartbeatDefinition[];
@@ -362,9 +356,8 @@ export class ProactiveEngine {
                 imported++;
             }
         }
-        // Only write the seed marker AFTER both heartbeats + cron have had
-        // a chance to import. Set it after the cron call — cron is always
-        // invoked after heartbeats in the current bootstrap flow.
+        // Cron is always invoked after heartbeats — write marker once both
+        // halves have had a chance to import.
         if (input.jobs) {
             this.store.markConfigSeeded();
             if (imported > 0) {
@@ -414,18 +407,13 @@ export class ProactiveEngine {
         return out;
     }
 
-    /**
-     * Add a heartbeat at runtime (persists + registers). Used by the
-     * manage_schedule agent tool. Returns false if the engine hasn't been
-     * started or the heartbeat name collides.
-     */
+    /** Returns false if the engine isn't started or name collides. */
     addRuntimeHeartbeat(
         hb: HeartbeatDefinition,
         createdBy: { threadId?: string; agentName?: string } = {},
     ): boolean {
-        // Persist FIRST so the schedule survives even if live-register is
-        // deferred (engine still booting). startHeartbeats picks it up via
-        // loadRuntimeHeartbeats; the pending queue handles late additions.
+        // Persist first so the schedule survives boot races; the pending
+        // queue handles registrations that arrive before the trigger.
         const id = hb.id ?? `runtime-hb-${hb.name}`;
         const withId: HeartbeatDefinition = { ...hb, id };
         this.dedupStore.insertRuntimeSchedule({
@@ -448,6 +436,26 @@ export class ProactiveEngine {
         return this.heartbeat.addHeartbeat(withId, this.defaultDelivery);
     }
 
+    seedConfigWebhooks(
+        configs: Array<{ name: string; path: string; targetChannel: string; secret?: string; [k: string]: unknown }>,
+    ): void {
+        if (!configs.length) return;
+        let seeded = 0;
+        for (const cfg of configs) {
+            if (cfg['enabled'] === false) continue;
+            this.dedupStore.insertRuntimeSchedule({
+                id: cfg.name,
+                kind: 'webhook',
+                config: cfg,
+                enabled: true,
+            });
+            seeded++;
+        }
+        if (seeded > 0) {
+            log.debug({ seeded }, 'seeded config-defined webhooks into proactive.db');
+        }
+    }
+
     /**
      * Inject the WebhookRouter so `addRuntimeWebhook` / `removeRuntimeWebhook`
      * can register and tear down HTTP routes live. Called by the gateway
@@ -463,21 +471,71 @@ export class ProactiveEngine {
 
         // Replay any webhook adds that arrived before the router was wired.
         this.flushPendingRegistrations('webhook');
+
+        // Restore persisted webhook routes from proactive.db. Without this,
+        // every daemon restart silently loses every runtime webhook route
+        // even though they're still in the DB and visible in `flopsy
+        // webhook list`. Mirrors loadRuntimeHeartbeats/CronJobs which run
+        // during their respective startup paths; webhook has no separate
+        // start step, so we hook on the router-wire-up instead.
+        const liveRouter = this.webhookRouter;
+        if (liveRouter) {
+            const restored = this.loadRuntimeWebhooks();
+            let restoredCount = 0;
+            for (const cfg of restored) {
+                try {
+                    if (liveRouter.addRuntimeRoute(cfg)) {
+                        restoredCount += 1;
+                    }
+                } catch (err) {
+                    log.warn(
+                        { path: cfg['path'], err: err instanceof Error ? err.message : String(err) },
+                        'failed to restore persisted webhook route on boot',
+                    );
+                }
+            }
+            if (restored.length > 0) {
+                log.info(
+                    { count: restoredCount, total: restored.length },
+                    'restored persisted webhook routes',
+                );
+            }
+        }
+    }
+
+    private loadRuntimeWebhooks(): Array<Record<string, unknown>> {
+        const rows = this.dedupStore.listRuntimeSchedules().filter((r) => r.kind === 'webhook');
+        const out: Array<Record<string, unknown>> = [];
+        for (const row of rows) {
+            if (!row.enabled) continue;
+            try {
+                const cfg = JSON.parse(row.configJson) as Record<string, unknown>;
+                // Legacy rows stored only `secret` — retro-fill the
+                // signature config so ownsSignature works on restore.
+                if (typeof cfg['secret'] === 'string' && cfg['secret'] && !cfg['signature']) {
+                    cfg['signature'] = {
+                        header: 'x-hub-signature-256',
+                        algorithm: 'sha256',
+                        format: 'hex',
+                        prefix: 'sha256=',
+                    };
+                }
+                out.push(cfg);
+            } catch (err) {
+                log.warn(
+                    { id: row.id, err: err instanceof Error ? err.message : String(err) },
+                    'Failed to parse runtime webhook config — skipping',
+                );
+            }
+        }
+        return out;
     }
     private webhookRouter: { addRuntimeRoute(cfg: unknown): boolean; removeRuntimeRoute(path: string): boolean } | null = null;
 
     /**
-     * Queue of runtime additions made BEFORE the corresponding subsystem was
-     * up. Without this, calls during gateway boot — e.g. catchupMissedFires
-     * adding a heartbeat before startHeartbeats() runs, or an HTTP API hit
-     * arriving before setWebhookRouter() — get silently dropped (the old
-     * behaviour produced "addRuntimeX called before startX" errors and the
-     * schedule was lost).
-     *
-     * Now: every addRuntime* persists to DB unconditionally (so the data is
-     * never lost), and if the live-register infrastructure isn't ready yet,
-     * the registration is queued for replay. The start*() methods and
-     * setWebhookRouter() drain their queue partition at the end of init.
+     * Queue of runtime adds that arrived before their subsystem was up.
+     * Every addRuntime* persists to DB unconditionally; this queue handles
+     * the in-memory live-register replay once the subsystem starts.
      */
     private pendingRegistrations: Array<
         | { kind: 'heartbeat'; def: HeartbeatDefinition }
@@ -508,23 +566,12 @@ export class ProactiveEngine {
         log.info({ kind, flushed: drained.length }, 'flushed pending runtime registrations');
     }
 
-    /**
-     * Register a webhook endpoint at runtime — persists to proactive.db
-     * AND live-registers the HTTP route on the gateway's WebhookServer.
-     * Returns false if the WebhookRouter isn't wired (server not up) or
-     * a webhook with this id already exists.
-     *
-     * Unlike heartbeats/crons, webhooks don't fire on a timer — they fire
-     * when an external service hits the HTTP endpoint. So they don't need
-     * the executor / jobState / dedup embedding that schedules use.
-     */
+    /** Persists + live-registers an HTTP route. */
     addRuntimeWebhook(
-        cfg: { name: string; path: string; targetChannel: string; secret?: string; eventTypeHeader?: string },
+        cfg: { name: string; path: string; targetChannel: string; secret?: string; eventTypeHeader?: string; filterActions?: string[]; targetThread?: string; deliveryMode?: 'always' | 'conditional' | 'silent' },
         createdBy: { threadId?: string; agentName?: string } = {},
     ): boolean {
-        // Persist FIRST. setWebhookRouter drains the queue when the router
-        // becomes available (the gateway wires it after the engine is built
-        // but before HTTP traffic — this race can fire from catchup).
+        // Persist first; pending queue replays after setWebhookRouter wires.
         this.dedupStore.insertRuntimeSchedule({
             id: cfg.name,
             kind: 'webhook',
@@ -548,16 +595,10 @@ export class ProactiveEngine {
         return this.webhookRouter.addRuntimeRoute(cfg as unknown as Record<string, unknown>);
     }
 
-    /**
-     * Add a cron job at runtime (persists + registers).
-     */
     addRuntimeCronJob(
         job: JobDefinition,
         createdBy: { threadId?: string; agentName?: string } = {},
     ): boolean {
-        // Persist FIRST (see addRuntimeHeartbeat note). Pre-start adds are
-        // picked up by loadRuntimeCronJobs in startCronJobs; post-start adds
-        // before this turn would have raced an still-initialising trigger.
         this.dedupStore.insertRuntimeSchedule({
             id: job.id,
             kind: 'cron',
@@ -581,25 +622,16 @@ export class ProactiveEngine {
         return true;
     }
 
-    /**
-     * Delete a runtime-created schedule (persists removal + deregisters).
-     * Returns false if no runtime row matched the id.
-     */
+    /** Returns false if no runtime row matched. */
     removeRuntimeSchedule(id: string): boolean {
         const row = this.dedupStore.getRuntimeSchedule(id);
         if (!row) return false;
         this.dedupStore.deleteRuntimeSchedule(id);
 
-        // Drop orphan stats and oneshot-circuit-breaker from proactive.json
-        // so the schedule disappears completely (not just from the DB).
-        // Without this, `flopsy status` shows ghost entries for deleted
-        // schedules forever, and a re-created schedule with the same id
-        // would silently never fire (still on the do-not-fire list).
+        // Drop stats + oneshot-circuit-breaker so a re-created id can fire.
         this.store.deleteJobState(id);
         this.store.clearOneshotCompleted(id);
 
-        // DB is the source of truth — we've already committed the delete. A
-        // malformed config row makes the in-memory/HTTP cleanup best-effort.
         const cfg = safeParseConfig(row.configJson);
 
         const promptFile =
@@ -625,7 +657,6 @@ export class ProactiveEngine {
         return true;
     }
 
-    /** Exposed so the schedule facade can provide the base dir for prompt file copies. */
     getPromptBaseDir(): string {
         return this.promptBaseDir;
     }
@@ -633,8 +664,6 @@ export class ProactiveEngine {
     setRuntimeScheduleEnabled(id: string, enabled: boolean): boolean {
         const row = this.dedupStore.getRuntimeSchedule(id);
         if (!row) return false;
-        // Persist first so a crash between persist + hot-register can't leave
-        // the in-memory state ahead of disk.
         this.dedupStore.setRuntimeScheduleEnabled(id, enabled);
 
         try {
@@ -666,6 +695,57 @@ export class ProactiveEngine {
 
     listSchedules(): ReturnType<ProactiveDedupStore['listRuntimeSchedules']> {
         return this.dedupStore.listRuntimeSchedules();
+    }
+
+    /**
+     * Replace a schedule's config in place, preserving `enabled`, `created_at`,
+     * and run stats. Kind cannot change (heartbeat ↔ cron requires delete+create).
+     */
+    replaceRuntimeSchedule(
+        id: string,
+        newConfig: HeartbeatDefinition | JobDefinition,
+    ): boolean {
+        const existing = this.dedupStore.getRuntimeSchedule(id);
+        if (!existing) return false;
+
+        this.dedupStore.updateRuntimeScheduleConfig(id, newConfig);
+
+        try {
+            if (existing.kind === 'heartbeat') {
+                const oldCfg = JSON.parse(existing.configJson) as HeartbeatDefinition;
+                const newCfg = newConfig as HeartbeatDefinition;
+                // Heartbeats are keyed by name — always remove old first.
+                this.heartbeat?.removeHeartbeat(oldCfg.name);
+                if (existing.enabled && this.heartbeat && this.defaultDelivery) {
+                    this.heartbeat.addHeartbeat(newCfg, this.defaultDelivery);
+                }
+            } else if (existing.kind === 'cron') {
+                const newJob = newConfig as JobDefinition;
+                if (this.cron) {
+                    void this.cron.removeJob(id).then(() => {
+                        if (existing.enabled) {
+                            void this.cron!.addJob(newJob).catch((err) =>
+                                log.warn(
+                                    { id, err: err instanceof Error ? err.message : String(err) },
+                                    'Hot re-register on replaceRuntimeSchedule failed — will take effect on next restart',
+                                ),
+                            );
+                        }
+                    });
+                }
+            } else {
+                // Webhook update not supported — path/secret changes need
+                // route reregistration that's better expressed as
+                // delete+create.
+                return false;
+            }
+        } catch (err) {
+            log.warn(
+                { id, err: err instanceof Error ? err.message : String(err) },
+                'Hot reregister on replaceRuntimeSchedule failed — DB updated; takes effect on next restart',
+            );
+        }
+        return true;
     }
 
     /**
@@ -714,46 +794,19 @@ export class ProactiveEngine {
         };
     }
 
-    /**
-     * Recent delivery history for one schedule — newest-first, capped.
-     * Backs `flopsy heartbeat|cron|webhook fires <id>`.
-     */
+    /** Newest-first, capped. */
     getScheduleFires(id: string, limit = 20): Array<{ deliveredAt: number; content: string }> {
         return this.dedupStore.listDeliveriesBySource(id, limit);
     }
 
     /**
-     * Startup catchup — fire any heartbeats/cron jobs whose last run is far
-     * enough in the past that at least one scheduled fire was missed during
-     * gateway downtime. Modelled after openclaw's startup-catchup pipeline:
-     * a planned, capped, staggered replay so a multi-day outage doesn't
-     * flood the user with a backlog.
+     * Fire heartbeats/cron jobs whose lastRunAt indicates a missed scheduled
+     * fire during downtime. Capped + staggered to avoid post-outage flood.
      *
-     * Rules:
-     *   - Heartbeat is overdue when `now - jobState.lastRunAt > 1.5 × interval`.
-     *     The 1.5× multiplier avoids firing just because we JUST restarted
-     *     and missed one tick by a few seconds.
-     *   - Cron `"at"` is overdue when `atMs <= now` AND the oneshot id isn't
-     *     in `completedOneshots[]`. Delegated to normal path (no catchup
-     *     fire needed here; the cron trigger's "at" logic handles it on
-     *     register). We still include them in the `deferred` count for
-     *     transparency.
-     *   - Cron `"every"` is overdue when `now - lastRunAt > 1.5 × everyMs`.
-     *   - Cron `"cron"` expressions: use croner's `previousRun(now)` — if
-     *     it's after lastRunAt, we missed at least one scheduled fire.
-     *   - Skipped entirely: disabled rows, one-shots already completed,
-     *     heartbeats/crons with no `lastRunAt` (fresh schedules — normal
-     *     scheduler handles them), webhooks (push-driven, no "missed" concept).
-     *
-     * Guardrails:
-     *   - `maxPerRestart` (default 5) — cap to prevent flooding after long
-     *     downtime. Excess candidates land in the returned `deferred` count
-     *     and their next regular fire will happen normally.
-     *   - `staggerMs` (default 5_000) — sleep between catchup fires so they
-     *     don't all hit the LLM / channel in the same tick.
-     *
-     * Called once from `gateway.onStart()` after triggers are registered.
-     * Safe to call multiple times; becomes a no-op when no catchup needed.
+     * Overdue thresholds: heartbeat/every uses 1.5× interval to skip just-
+     * restarted-and-missed-by-seconds. Cron expressions use croner's
+     * `previousRun(now)`. `at` schedules are reported but delegated to the
+     * trigger's own at-on-register logic.
      */
     async catchupMissedFires(
         opts: { maxPerRestart?: number; staggerMs?: number } = {},
@@ -775,7 +828,6 @@ export class ProactiveEngine {
         };
         const candidates: Candidate[] = [];
 
-        // --- Heartbeats ------------------------------------------------
         if (this.heartbeat) {
             for (const hb of this.loadRuntimeHeartbeats()) {
                 if (hb.enabled === false) continue;
@@ -783,7 +835,7 @@ export class ProactiveEngine {
                 const intervalMs = parseDurationMs(hb.interval);
                 if (!intervalMs) continue;
                 const jobState = await this.store.getJobState(hb.id ?? `heartbeat-${hb.name}`);
-                if (!jobState.lastRunAt) continue; // never fired — scheduler handles first fire
+                if (!jobState.lastRunAt) continue;
                 const overdueByMs = now - jobState.lastRunAt;
                 if (overdueByMs > intervalMs * 1.5) {
                     candidates.push({
@@ -796,7 +848,6 @@ export class ProactiveEngine {
             }
         }
 
-        // --- Cron jobs ------------------------------------------------
         if (this.cron) {
             for (const job of this.loadRuntimeCronJobs()) {
                 if (job.enabled === false) continue;
@@ -822,8 +873,7 @@ export class ProactiveEngine {
             return { fired: 0, deferred: 0, totalOverdue: 0 };
         }
 
-        // Sort least-overdue first so we fire closest-to-scheduled misses first
-        // (more useful than the oldest missed reminder from a week ago).
+        // Least-overdue first — closest-to-scheduled misses are most useful.
         candidates.sort((a, b) => a.overdueByMs - b.overdueByMs);
         const toFire = candidates.slice(0, maxPerRestart);
         const deferred = candidates.length - toFire.length;
@@ -853,12 +903,7 @@ export class ProactiveEngine {
         return { fired, deferred, totalOverdue };
     }
 
-    /**
-     * Resolves the delivery target for a schedule fire. Called by triggers at
-     * fire time (not at register time) so `followActiveChannel` picks up the
-     * user's current channel — not wherever they were when the schedule was
-     * created. Returns null when no target can be resolved at all.
-     */
+    /** Called at fire time so followActiveChannel picks up the live channel. */
     resolveDelivery(override?: DeliveryTarget): DeliveryTarget | null {
         if (override) return override;
         if (this.followActiveChannel && this.getActivePeer) {
@@ -882,6 +927,11 @@ export class ProactiveEngine {
             clearInterval(this.pruneTimer);
             this.pruneTimer = null;
         }
+        if (this.cronSweepTimer) {
+            clearInterval(this.cronSweepTimer);
+            this.cronSweepTimer = null;
+        }
+        this.cronSweeper = null;
         if (this.reaper) {
             this.reaper.stop();
             this.reaper = null;
@@ -911,22 +961,20 @@ export class ProactiveEngine {
         return this.cron?.triggerNow(id) ?? false;
     }
 
+    /** Wired from FlopsyGateway.onUserActivity. */
+    async recordUserActivity(nowMs: number = Date.now()): Promise<void> {
+        await this.presence.recordUserActivity(nowMs);
+    }
+
     getPresence(): PresenceManager {
         return this.presence;
     }
-    /** Hot-path accessor for the synchronous status snapshot builder. */
     getStateStore(): StateStore {
         return this.store;
     }
-    /** Current depth of the transport-failure retry queue. */
     getRetryQueueDepth(): number {
         return this.retryQueue.size;
     }
-
-    // ── DND API ────────────────────────────────────────────────────────
-    // Thin proxies over PresenceManager — exposed on the engine so CLI +
-    // slash handlers can reach them without knowing PresenceManager's
-    // shape. All four return a snapshot usable in status rendering.
 
     async setDnd(durationMs: number, reason?: string): Promise<{
         until: number;
@@ -987,7 +1035,6 @@ export class ProactiveEngine {
     getHeartbeat(): HeartbeatTrigger | null {
         return this.heartbeat;
     }
-    /** Convenience for /status — millis of the last heartbeat fire, or undefined. */
     getLastHeartbeatAt(): number | undefined {
         return this.heartbeat?.getLastFiredAt();
     }
@@ -996,14 +1043,10 @@ export class ProactiveEngine {
     }
 }
 
-// ── Catchup helpers (module-level — called only by catchupMissedFires) ──
-
 /**
- * Decide whether a cron schedule missed a fire since `lastRunAt`. Returns
- * `null` when this kind of schedule has no "missed" notion (e.g. future `at`),
- * and a positive ms count otherwise. Callers compare the return against
- * their threshold — this function itself has no 1.5× guard because cron
- * expressions fire at specific instants (not every-N intervals).
+ * Returns positive ms overdue, 0 if not overdue, or null when the schedule
+ * shape has no "missed" notion (e.g. future `at`). No 1.5× guard for cron
+ * expressions — they fire at specific instants, not every-N intervals.
  */
 function detectCronOverdue(
     schedule:
@@ -1014,40 +1057,28 @@ function detectCronOverdue(
     nowMs: number,
 ): number | null {
     if (schedule.kind === 'at') {
-        // `at` fires exactly once. If the moment passed and we've never run,
-        // the trigger already handles it at register-time (picks up from
-        // persistence). We never catch up `at` here — returning null prevents
-        // accidental double-fire.
+        // `at` fires once at register-time from persistence; no catchup here.
         return null;
     }
 
     if (schedule.kind === 'every') {
         if (!lastRunAt) return null;
         const overdueByMs = nowMs - lastRunAt;
-        // Same 1.5× guard as heartbeats — avoid firing for a ≤1-interval miss
-        // that the regular scheduler will correct on its next natural tick.
         return overdueByMs > schedule.everyMs * 1.5 ? overdueByMs : 0;
     }
 
-    // Cron expression: ask croner whether it SHOULD have fired since lastRunAt.
-    // `previousRun()` uses wall-clock now, which matches our boot-time caller.
     try {
         const cron = new Cron(schedule.expr, { timezone: schedule.tz ?? 'UTC' });
         const prevFire = cron.previousRun();
         if (!prevFire) return null;
         const prevFireMs = prevFire.getTime();
-        if (!lastRunAt) return 0; // fresh job — scheduler handles first fire
+        if (!lastRunAt) return 0;
         return prevFireMs > lastRunAt ? nowMs - prevFireMs : 0;
     } catch {
-        return null; // malformed expression → skip rather than crash catchup
+        return null;
     }
 }
 
-/**
- * Parse a runtime-schedule row's configJson, returning an empty object if the
- * row is malformed. Callers pluck fields defensively since a bad row shouldn't
- * crash mutation paths that have already committed to the DB delete.
- */
 function safeParseConfig(json: string): Record<string, unknown> {
     try {
         const parsed = JSON.parse(json);

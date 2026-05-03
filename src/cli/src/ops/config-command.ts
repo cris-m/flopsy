@@ -106,8 +106,6 @@ export function registerConfigCommand(root: Command): void {
     });
 }
 
-// ---- path helpers --------------------------------------------------------
-
 /**
  * Walk a dotted path into an object. Numeric segments index arrays.
  * Returns `undefined` on any missing hop so callers can print a useful
@@ -203,8 +201,6 @@ function nextContainer(parts: string[], idx: number): unknown[] | Record<string,
     return next !== undefined && /^\d+$/.test(next) ? [] : {};
 }
 
-// ---- value parsing + printing --------------------------------------------
-
 function parseValue(raw: string): unknown {
     try {
         return JSON.parse(raw);
@@ -218,8 +214,6 @@ function prettyValue(v: unknown): string {
     if (typeof v === 'string') return v;
     return JSON.stringify(v, null, 2);
 }
-
-// ---- atomic write --------------------------------------------------------
 
 function atomicWrite(file: string, value: unknown): void {
     // Re-serialise as indented JSON. JSON5 round-trip with comments is

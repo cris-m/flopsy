@@ -114,8 +114,6 @@ export function styleRabbit(rich: boolean): string {
         .join('\n');
 }
 
-// --- ANSI-aware layout helpers ---------------------------------------------
-
 function visLen(s: string): number {
     return stripAnsi(s).length;
 }
@@ -166,7 +164,7 @@ function tildeHome(p: string): string {
  * Returns up to `limit` entries, newest first, each shaped as a
  * `<label> — <relative-time>` line. Returns `[]` when nothing exists.
  */
-interface ActivityEntry {
+export interface ActivityEntry {
     readonly label: string;
     readonly mtimeMs: number;
     /**
@@ -178,7 +176,7 @@ interface ActivityEntry {
     readonly priority: number;
 }
 
-function getRecentActivity(limit = 3): readonly ActivityEntry[] {
+export function getRecentActivity(limit = 3): readonly ActivityEntry[] {
     // Read real event sources (proactive deliveries, schedule creation,
     // credential refresh, etc.) instead of generic file-mtime noise.
     // Weighted priority sort: specific events (priority 10) always beat
@@ -187,7 +185,7 @@ function getRecentActivity(limit = 3): readonly ActivityEntry[] {
     const flopsyHome = workspace.root();
     const entries: ActivityEntry[] = [];
 
-    // ── HIGH-PRIORITY: specific, named events ────────────────────────
+    // High-priority: specific, named events.
     const proactiveJson = join(flopsyHome, 'state', 'proactive.json');
     if (existsSync(proactiveJson)) {
         try {
@@ -368,7 +366,7 @@ function getRecentActivity(limit = 3): readonly ActivityEntry[] {
         } catch { /* skip */ }
     }
 
-    // ── MEDIUM-PRIORITY: structural changes ───────────────────────────
+    // Medium-priority: structural changes.
     const pidfile = join(flopsyHome, 'gateway.pid');
     if (existsSync(pidfile)) {
         try {
@@ -391,12 +389,13 @@ function getRecentActivity(limit = 3): readonly ActivityEntry[] {
         } catch { /* skip */ }
     }
 
-    // ── LOW-PRIORITY: generic churn (last-resort fallback) ────────────
+    // Low-priority: generic churn — last-resort fallback.
+    // v2 layout: state DBs live under state/ (was harness/); state.db → learning.db
     const generic: ReadonlyArray<readonly [string, string]> = [
-        [join(flopsyHome, 'harness', 'checkpoints.db-wal'), 'turn completed'],
-        [join(flopsyHome, 'harness', 'checkpoints.db'), 'checkpoint written'],
-        [join(flopsyHome, 'harness', 'state.db'), 'state updated'],
-        [join(flopsyHome, 'harness', 'memory.db-wal'), 'memory write'],
+        [join(flopsyHome, 'state', 'checkpoints.db-wal'), 'turn completed'],
+        [join(flopsyHome, 'state', 'checkpoints.db'),     'checkpoint written'],
+        [join(flopsyHome, 'state', 'learning.db'),        'learning updated'],
+        [join(flopsyHome, 'state', 'memory.db-wal'),      'memory write'],
     ];
     for (const [path, label] of generic) {
         if (!existsSync(path)) continue;
@@ -446,7 +445,7 @@ function shortenSource(source: string): string {
  * Format a millisecond timestamp as "5m ago" / "2h ago" / "3d ago" —
  * short, scannable, no seconds.
  */
-function formatRelative(mtimeMs: number): string {
+export function formatRelative(mtimeMs: number): string {
     const diffMs = Date.now() - mtimeMs;
     if (diffMs < 60_000) return 'just now';
     const mins = Math.floor(diffMs / 60_000);
@@ -460,8 +459,6 @@ function formatRelative(mtimeMs: number): string {
     return `${Math.floor(days / 30)}mo ago`;
 }
 
-// --- one-liner (used by --version) -----------------------------------------
-
 export function formatBannerLine(opts: BannerOptions = {}): string {
     const rich = opts.color ?? isColorTty();
     const version = opts.version ?? '0.0.0';
@@ -472,8 +469,6 @@ export function formatBannerLine(opts: BannerOptions = {}): string {
     const sep = rich ? chalk.dim(' — ') : ' — ';
     return `${emoji}${title} ${versionStr}${sep}${styleTagline(tagline, rich)}`;
 }
-
-// --- main welcome panel ----------------------------------------------------
 
 /**
  * Two-column welcome panel:
@@ -558,8 +553,6 @@ export function printBanner(opts: BannerOptions = {}): void {
     // Row overhead inside innerWidth: " " + L + " " + "│" + " " + R + " " = 5
     const rightColWidth = innerWidth - leftColWidth - 5;
 
-    // --- left column -------------------------------------------------------
-
     const rabbitRaw = styleRabbit(rich)
         .split('\n')
         .filter((l) => l.length > 0);
@@ -586,8 +579,6 @@ export function printBanner(opts: BannerOptions = {}): void {
         centerVisible(rich ? chalk.dim(cwdTrimmed) : cwdTrimmed, leftColWidth),
         '',
     ];
-
-    // --- right column ------------------------------------------------------
 
     const h = (s: string): string => (rich ? chalk.bold(s) : s);
     const dim = (s: string): string => (rich ? chalk.dim(s) : s);
@@ -633,8 +624,6 @@ export function printBanner(opts: BannerOptions = {}): void {
         ...activityLines,
         '',
     ];
-
-    // --- assemble box ------------------------------------------------------
 
     // Top bar with embedded title: ╭── FlopsyBot v1.0.0 ────...─╮
     const titleInline = ` ${styleTitle(rich)} ${styleVersion(version, opts.commit, rich)} `;

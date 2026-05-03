@@ -1,8 +1,31 @@
 import type { StateStore } from './store';
-import type { ExplicitStatus } from '../types';
+import type { ActivityWindow, ExplicitStatus } from '../types';
+
+// Activity windows: active = defer to user, idle = most heartbeats fire,
+// away = smart-pulse / briefings become useful.
+const ACTIVE_WINDOW_MS = 10 * 60 * 1000;
+const IDLE_WINDOW_MS   = 2 * 60 * 60 * 1000;
+
+function computeActivityWindow(
+    nowMs: number,
+    lastMessageAtMs: number,
+): ActivityWindow {
+    if (lastMessageAtMs <= 0) return 'away';
+    const elapsed = nowMs - lastMessageAtMs;
+    if (elapsed < ACTIVE_WINDOW_MS) return 'active';
+    if (elapsed < IDLE_WINDOW_MS)   return 'idle';
+    return 'away';
+}
 
 export class PresenceManager {
     constructor(private store: StateStore) {}
+
+    async recordUserActivity(nowMs: number = Date.now()): Promise<void> {
+        await this.store.mutate((state) => {
+            state.presence.lastMessageAt = nowMs;
+            state.presence.activityWindow = computeActivityWindow(nowMs, nowMs);
+        });
+    }
 
     async setExplicitStatus(
         status: ExplicitStatus,

@@ -52,12 +52,32 @@ export function registerWebhookCommands(root: Command): void {
             '--event-type-header <header>',
             'Header carrying the event type (e.g. "x-github-event")',
         )
+        .option(
+            '--target-thread <routingKey>',
+            'EXACT routing-key destination (e.g. "telegram:dm:5257796557"). When set, the worker is auto-created on the first webhook fire — no need for the user to message the bot first. Recommended for production. Without this, the webhook falls back to "most-recently-active worker on --target-channel" which silently drops events at cold-start.',
+        )
+        .option(
+            '--filter-actions <actions>',
+            'Comma-separated list of `action` field values to forward (e.g. "completed,failure"). Only applies to webhook providers that include an `action` field (GitHub, Stripe, Shopify). All other actions are silently dropped.',
+        )
+        .option(
+            '--delivery-mode <mode>',
+            'How the agent delivers notifications: "always" (default — always send), "conditional" (agent decides based on importance), "silent" (log only, never send).',
+            'always',
+        )
         .action(async (opts) => {
+            const filterActions = opts.filterActions
+                ? (opts.filterActions as string).split(',').map((a: string) => a.trim()).filter(Boolean)
+                : undefined;
+            const deliveryMode = opts.deliveryMode as 'always' | 'conditional' | 'silent';
             await mgmtCreate({
                 kind: 'webhook',
                 name: opts.name,
                 path: opts.path,
                 targetChannel: opts.targetChannel,
+                ...(opts.targetThread ? { targetThread: opts.targetThread } : {}),
+                ...(filterActions ? { filterActions } : {}),
+                ...(deliveryMode !== 'always' ? { deliveryMode } : {}),
                 secret: opts.secret,
                 eventTypeHeader: opts.eventTypeHeader,
             });

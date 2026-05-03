@@ -10,6 +10,9 @@
  * Running `flopsy` with no subcommand prints the mascot banner + help.
  */
 
+// MUST stay first — sets LOG_LEVEL before any @flopsy/* module's top-level
+// createLogger() runs. See _silence-logs.ts for the why.
+import './ops/_silence-logs';
 import { Command } from 'commander';
 import { bootstrapCli } from './ops/config-reader';
 // Load .env + prime FLOPSY_HOME before any command reads process.env.
@@ -23,11 +26,14 @@ import { registerDndCommand } from './ops/dnd-command';
 import { registerDoctorCommand } from './ops/doctor-command';
 import { registerEnvCommands } from './ops/env-command';
 import { registerMemoryCommands } from './ops/memory-command';
+import { registerChatCommand } from './ops/chat-command';
 import { registerHeartbeatCommands } from './ops/heartbeat-command';
 import { registerMgmtCommands } from './ops/mgmt-command';
 import { registerModelCommand } from './ops/model-command';
 import { registerOnboardCommand } from './ops/onboard-command';
+import { registerPairingCommands } from './ops/pairing-command';
 import { registerRunCommands } from './ops/run-command';
+import { registerSandboxCommand } from './ops/sandbox-command';
 import { registerStatusCommand } from './ops/status-command';
 import { registerTasksCommand } from './ops/tasks-command';
 import { registerTeamCommands } from './ops/team-command';
@@ -55,9 +61,11 @@ registerMcpCommands(program);
 registerStatusCommand(program);
 registerDoctorCommand(program);
 registerDndCommand(program);
+registerPairingCommands(program);
 registerOnboardCommand(program);
 registerMgmtCommands(program);
 registerRunCommands(program);
+registerSandboxCommand(program);
 registerTeamCommands(program);
 registerChannelCommands(program);
 registerCronCommands(program);
@@ -68,6 +76,7 @@ registerConfigCommand(program);
 registerModelCommand(program);
 registerEnvCommands(program);
 registerMemoryCommands(program);
+registerChatCommand(program);
 
 // Colorize help output for every command + subcommand. Must run AFTER
 // all register*() calls so the formatter sees the fully-built tree.

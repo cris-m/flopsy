@@ -6,11 +6,12 @@ import type { MessageRouter } from './message-router';
 import type { WebhookSignatureConfig } from './security';
 
 const MAX_EVENT_BODY_LENGTH = 50_000;
+const DELIVERY_DEDUP_TTL_MS = 5 * 60 * 1_000; // 5 minutes
 
 /**
  * Configuration for an external webhook endpoint (GitHub, Stripe, etc.).
- * Each endpoint gets its own route on the webhook server and pushes
- * events into the agent via the channel worker's EventQueue.
+ * Each endpoint gets its own route and pushes events into the agent via
+ * the channel worker's EventQueue.
  */
 export interface ExternalWebhookConfig {
     /** Unique name for this webhook (used as taskId prefix). */
@@ -19,9 +20,15 @@ export interface ExternalWebhookConfig {
     path: string;
     /** Which channel's worker should receive the event. */
     targetChannel: string;
-    /** Secret for HMAC signature verification. If unset, requests are accepted unsigned. */
+    /**
+     * EXACT routing key. When set, delivers to this exact thread and
+     * auto-creates the worker if needed (survives daemon restart with no
+     * prior user message). When unset, falls back to most-recently-active
+     * worker on `targetChannel`.
+     */
+    targetThread?: string;
+    /** Secret for HMAC signature verification. Unsigned requests accepted when unset. */
     secret?: string;
-    /** Signature config (header name, algorithm, format). */
     signature?: {
         header: string;
         algorithm?: 'sha1' | 'sha256' | 'sha512';
@@ -30,26 +37,34 @@ export interface ExternalWebhookConfig {
     };
     /** Header name containing the event type (e.g. 'x-github-event'). */
     eventTypeHeader?: string;
-    /** Optional: extract a summary from the payload for the agent. */
+    /**
+     * Only forward events whose JSON `action` field matches one of these
+     * values (case-insensitive). Useful for GitHub/Stripe/Shopify; ignored
+     * for providers without an `action` field.
+     */
+    filterActions?: string[];
+    /**
+     *   always      — agent always sends a message (default)
+     *   conditional — agent decides; only notifies if newsworthy
+     *   silent      — no agent turn; event is logged and dropped
+     */
+    deliveryMode?: 'always' | 'conditional' | 'silent';
+    /** Extract a summary from the payload for the agent. */
     transform?: (body: unknown) => string;
 }
 
 /**
- * Routes external service webhooks (GitHub, Stripe, etc.) into the agent
- * system via ChannelWorker event queues. Not a messaging channel — these
- * are one-way notifications that the agent can act on.
+ * Routes external service webhooks into the agent system via ChannelWorker
+ * event queues. Not a messaging channel — one-way notifications.
  */
 export class WebhookRouter {
     private readonly log = createLogger('webhook-router');
     private readonly configs: ExternalWebhookConfig[];
-    /**
-     * Server + router refs captured on `register()` so runtime adds can
-     * register new routes without re-plumbing. Null until `register` runs.
-     */
     private webhookServer: WebhookServer | null = null;
     private messageRouter: MessageRouter | null = null;
-    /** Paths registered dynamically after start — tracked so we can unregister. */
     private readonly runtimeRoutes = new Set<string>();
+    // Dedup cache keyed by delivery id (x-github-delivery etc.).
+    private readonly recentDeliveries = new Map<string, number>();
 
     constructor(configs: ExternalWebhookConfig[]) {
         this.configs = configs;
@@ -63,12 +78,7 @@ export class WebhookRouter {
         }
     }
 
-    /**
-     * Register a webhook route created at runtime (via `flopsy schedule add
-     * webhook` or the `manage_schedule` agent tool). Relies on `register()`
-     * having already wired `webhookServer` + `messageRouter` at gateway
-     * start — runtime adds before that are a no-op returning false.
-     */
+    /** Returns false if `register()` hasn't run yet. */
     addRuntimeRoute(cfg: ExternalWebhookConfig): boolean {
         if (!this.webhookServer || !this.messageRouter) return false;
         this.registerEndpoint(this.webhookServer, this.messageRouter, cfg);
@@ -76,11 +86,7 @@ export class WebhookRouter {
         return true;
     }
 
-    /**
-     * Tear down a runtime-registered webhook route. Returns false if the
-     * path isn't runtime-tracked (e.g. config-defined route — those are
-     * immutable) or the server isn't up.
-     */
+    /** Returns false for config-defined paths (immutable) or when server is down. */
     removeRuntimeRoute(path: string): boolean {
         if (!this.webhookServer) return false;
         if (!this.runtimeRoutes.has(path)) return false;
@@ -94,10 +100,37 @@ export class WebhookRouter {
         messageRouter: MessageRouter,
         cfg: ExternalWebhookConfig,
     ): void {
+        // Skip the global secret check when this route has its own —
+        // otherwise per-route secrets are masked by the global mismatch.
+        const ownsSignature = !!(cfg.secret && cfg.signature);
         webhookServer.registerRoute(cfg.path, async (req, body, res) => {
             if (!this.verify(req, body, cfg)) {
                 webhookServer.respond(res, 401, { error: `Invalid ${cfg.name} webhook signature` });
                 return;
+            }
+
+            // Delivery dedup — suppress provider retries of the same event.
+            // Status responses are all 2xx (no retries):
+            //   200 — agent turn triggered
+            //   202 — accepted but won't reach agent (silent / no worker)
+            //   204 — suppressed entirely (duplicate / filtered)
+            const deliveryId = (
+                req.headers['x-github-delivery'] ??
+                req.headers['x-delivery-id'] ??
+                req.headers['x-request-id']
+            ) as string | undefined;
+            if (deliveryId) {
+                const now = Date.now();
+                for (const [k, t] of this.recentDeliveries) {
+                    if (now - t > DELIVERY_DEDUP_TTL_MS) this.recentDeliveries.delete(k);
+                }
+                const dedupKey = `${cfg.name}:${deliveryId}`;
+                if (this.recentDeliveries.has(dedupKey)) {
+                    this.log.debug({ webhook: cfg.name, deliveryId }, 'duplicate delivery suppressed');
+                    webhookServer.respond(res, 204, {});
+                    return;
+                }
+                this.recentDeliveries.set(dedupKey, now);
             }
 
             const parsed = webhookServer.parseJson(body);
@@ -106,14 +139,36 @@ export class WebhookRouter {
                 return;
             }
 
-            webhookServer.respond(res, 200, { status: 'ok' });
+            if (cfg.filterActions && cfg.filterActions.length > 0) {
+                const action = (parsed as Record<string, unknown>)['action'];
+                const allowed = cfg.filterActions.map((a) => a.toLowerCase());
+                if (typeof action !== 'string' || !allowed.includes(action.toLowerCase())) {
+                    this.log.debug(
+                        { webhook: cfg.name, action: action ?? '(none)', allowed },
+                        'webhook action filtered — skipping',
+                    );
+                    webhookServer.respond(res, 204, {});
+                    return;
+                }
+            }
 
-            const worker = messageRouter.getWorker(cfg.targetChannel);
+            // Prefer EXACT routing-key delivery; fall back to
+            // most-recently-active worker on the channel.
+            let worker = cfg.targetThread
+                ? messageRouter.getWorker(cfg.targetThread)
+                : messageRouter.getWorker(cfg.targetChannel);
+            if (!worker && cfg.targetThread) {
+                // Cold-start fix: auto-create from the routing key.
+                worker = messageRouter.getOrCreateWorkerForKey(cfg.targetThread);
+            }
             if (!worker) {
                 this.log.warn(
-                    { webhook: cfg.name, target: cfg.targetChannel },
-                    'target channel worker not found',
+                    { webhook: cfg.name, target: cfg.targetThread ?? cfg.targetChannel },
+                    'webhook delivery target not found. Either set --target-thread to a ' +
+                    'specific routing-key (preferred for cold-start) or send any message ' +
+                    'to the bot on this channel before redelivering.',
                 );
+                webhookServer.respond(res, 202, { status: 'no-target' });
                 return;
             }
 
@@ -126,6 +181,7 @@ export class WebhookRouter {
 
             if (!isSafeIdentifier(taskId)) {
                 this.log.warn({ taskId }, 'generated unsafe taskId — dropped');
+                webhookServer.respond(res, 202, { status: 'dropped-unsafe-id' });
                 return;
             }
 
@@ -134,16 +190,24 @@ export class WebhookRouter {
                 taskId,
                 result: `[${cfg.name}] ${eventType}\n${summary}`,
                 completedAt: Date.now(),
+                ...(cfg.deliveryMode ? { deliveryMode: cfg.deliveryMode } : {}),
             });
 
+            const isSilent = cfg.deliveryMode === 'silent';
+            webhookServer.respond(
+                res,
+                isSilent ? 202 : 200,
+                isSilent ? { status: 'queued-silent' } : { status: 'ok' },
+            );
+
             this.log.info(
-                { webhook: cfg.name, event: eventType, target: cfg.targetChannel },
+                { webhook: cfg.name, event: eventType, target: cfg.targetChannel, silent: isSilent },
                 'webhook event routed',
             );
-        });
+        }, { ownsSignature });
 
         this.log.debug(
-            { webhook: cfg.name, path: cfg.path, target: cfg.targetChannel },
+            { webhook: cfg.name, path: cfg.path, target: cfg.targetChannel, ownsSignature },
             'external webhook registered',
         );
     }

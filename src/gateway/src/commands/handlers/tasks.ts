@@ -1,13 +1,6 @@
-/**
- * `/tasks` slash command — in-flight and recent background tasks in the
- * current thread. The CLI `flopsy tasks` covers the cross-thread view.
- *
- * Scope intentionally mirrors /status: only this thread's activity, so the
- * command is useful in any channel without leaking other conversations'
- * state. Users who want system-wide visibility use the terminal CLI.
- */
-
+import { panel, row, STATE, agoLabel, truncate } from '@flopsy/shared';
 import type { CommandDef, CommandContext, TaskSummary } from '../types';
+import type { PanelSection } from '@flopsy/shared';
 
 export const tasksCommand: CommandDef = {
     name: 'tasks',
@@ -17,93 +10,52 @@ export const tasksCommand: CommandDef = {
         const ts = ctx.threadStatus;
         if (!ts) {
             return {
-                text:
-                    '*Tasks*\n_no agent instantiated here yet — send a message first._',
+                text: panel(
+                    [{ title: 'tasks', lines: [row('', 'no agent instantiated here yet — send a message first')] }],
+                    { header: 'TASKS' },
+                ),
             };
         }
-        return { text: renderTasks(ts.activeTasks, ts.recentTasks) };
+        return { text: render(ts.activeTasks, ts.recentTasks) };
     },
 };
 
-function renderTasks(
-    active: readonly TaskSummary[],
-    recent: readonly TaskSummary[],
-): string {
+function render(active: readonly TaskSummary[], recent: readonly TaskSummary[]): string {
     if (active.length === 0 && recent.length === 0) {
-        return '*Tasks*\n_idle — nothing in flight, nothing recent._';
+        return panel(
+            [{ title: 'tasks', lines: [row('', 'idle — nothing in flight, nothing recent')] }],
+            { header: 'TASKS' },
+        );
     }
 
-    const now = Date.now();
-    const lines: string[] = [];
-    lines.push(`*Tasks* — ${active.length} active · ${recent.length} recent`);
+    const summary = `TASKS · ${active.length} active · ${recent.length} recent`;
+    const sections: PanelSection[] = [];
 
     if (active.length > 0) {
-        lines.push('');
-        lines.push('_active:_');
-        for (const t of active) {
-            const icon = activeIcon(t.status);
-            const age = humanDuration(now - t.startedAtMs);
-            lines.push(
-                `${icon} \`${t.id}\` ${t.worker} — ${truncate(t.description, 60)} (${age})`,
-            );
-        }
+        sections.push({ title: 'active', lines: active.map(activeRow) });
     }
-
     if (recent.length > 0) {
-        lines.push('');
-        lines.push('_recent:_');
-        for (const t of recent) {
-            const icon = doneIcon(t.status);
-            const age = t.endedAtMs !== undefined ? agoLabel(now - t.endedAtMs) : '?';
-            const errBit = t.error ? ` — ${truncate(t.error, 50)}` : '';
-            lines.push(
-                `${icon} \`${t.id}\` ${t.worker} — ${truncate(t.description, 50)} (${t.status} ${age})${errBit}`,
-            );
-        }
+        sections.push({ title: 'recent', lines: recent.map(recentRow) });
     }
 
-    return lines.join('\n');
+    return panel(sections, { header: summary });
 }
 
-function activeIcon(status: TaskSummary['status']): string {
-    switch (status) {
-        case 'running': return '▶️';
-        case 'idle': return '⏸️';
-        case 'pending': return '⏳';
-        default: return '•';
-    }
+function activeRow(t: TaskSummary): string {
+    const glyph = t.status === 'running' ? STATE.on : STATE.bullet;
+    const age = agoLabel(Date.now() - t.startedAtMs).replace(' ago', '');
+    const desc = truncate(t.description, 40);
+    return row(`${glyph}  ${t.worker}`, `"${desc}" · ${age}`, 18);
 }
 
-function doneIcon(status: TaskSummary['status']): string {
-    switch (status) {
-        case 'completed': return '✅';
-        case 'failed': return '❌';
-        case 'killed': return '🛑';
-        default: return '•';
-    }
-}
-
-function truncate(s: string, max: number): string {
-    if (s.length <= max) return s;
-    return s.slice(0, max - 1) + '…';
-}
-
-function humanDuration(ms: number): string {
-    if (ms < 1000) return `${ms}ms`;
-    const s = Math.floor(ms / 1000);
-    if (s < 60) return `${s}s`;
-    const m = Math.floor(s / 60);
-    if (m < 60) return `${m}m ${s % 60}s`;
-    const h = Math.floor(m / 60);
-    return `${h}h ${m % 60}m`;
-}
-
-function agoLabel(ms: number): string {
-    if (ms < 60_000) return 'just now';
-    const m = Math.floor(ms / 60_000);
-    if (m < 60) return `${m}m ago`;
-    const h = Math.floor(m / 60);
-    if (h < 24) return `${h}h ago`;
-    const d = Math.floor(h / 24);
-    return `${d}d ago`;
+function recentRow(t: TaskSummary): string {
+    const glyph =
+        t.status === 'completed' ? STATE.ok :
+        t.status === 'failed'    ? STATE.fail :
+        t.status === 'killed'    ? STATE.fail :
+        STATE.bullet;
+    const age = t.endedAtMs !== undefined ? agoLabel(Date.now() - t.endedAtMs) : '?';
+    const desc = truncate(t.description, 36);
+    const errBit = t.error ? ` · ${truncate(t.error, 30)}` : '';
+    return row(`${glyph}  ${t.worker}`, `"${desc}" · ${t.status} · ${age}${errBit}`, 18);
 }

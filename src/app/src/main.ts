@@ -7,6 +7,7 @@
  */
 
 import { resolve, dirname } from 'path';
+import { mkdirSync, writeFileSync, unlinkSync } from 'fs';
 import { createRequire } from 'module';
 import { config as dotenv } from 'dotenv';
 import { Agent as UndiciAgent, setGlobalDispatcher } from 'undici';
@@ -16,7 +17,11 @@ import {
     createLogger,
     installWarningFilter,
     primeFlopsyHome,
+    resolveWorkspacePath,
+    seedWorkspaceTemplates,
+    workspace,
 } from '@flopsy/shared';
+import { teamTemplatesDir } from '@flopsy/team';
 
 // Node 18+'s global `fetch` is powered by undici. Defaults are:
 //   bodyTimeout:    5 min (between chunks — OK to tighten for SSE stalls)
@@ -48,7 +53,13 @@ if (process.env.MCP_ROOT && !/^([~/]|[A-Za-z]:)/.test(process.env.MCP_ROOT)) {
     process.env.MCP_ROOT = resolve(projectRoot, process.env.MCP_ROOT);
 }
 
-const config = loadConfig(resolve(projectRoot, 'flopsy.json5'));
+// Seed workspace templates BEFORE loadConfig — flopsy.json5 itself is one
+// of the seeded files now, so a fresh `.flopsy/` (just-deleted state DBs,
+// missing templates) gets a working config copied in from the bundled
+// template before we try to read it.
+seedWorkspaceTemplates(teamTemplatesDir());
+
+const config = loadConfig(resolveWorkspacePath('config', 'flopsy.json5'));
 setLogConfig(config.logging);
 
 const log = createLogger('flopsybot');
@@ -56,8 +67,14 @@ const log = createLogger('flopsybot');
 async function main(): Promise<void> {
     installWarningFilter();
 
-    // Dynamic imports so createLogger() calls in submodules pick up the log
-    // config set above.
+    // PID file: lets `flopsy run status` / banner detect a live daemon, and
+    // gives `flopsy run stop` a signal target without grepping `ps`.
+    // Cleared on graceful shutdown (best-effort — a hard kill leaves a stale
+    // file, which the consumers cross-check by signalling pid 0 anyway).
+    const pidPath = workspace.pidFile();
+    mkdirSync(dirname(pidPath), { recursive: true });
+    writeFileSync(pidPath, String(process.pid), { mode: 0o600 });
+
     const { FlopsyGateway } = await import('@flopsy/gateway');
     const { startFlopsyBot } = await import('@flopsy/team');
 
@@ -77,9 +94,11 @@ async function main(): Promise<void> {
             //   3) close shared SQLite → last so no in-flight write races it
             await gateway.stop();
             await teardown();
+            try { unlinkSync(pidPath); } catch { /* may already be gone */ }
             process.exit(0);
         } catch (err) {
             log.error({ err }, 'shutdown error');
+            try { unlinkSync(pidPath); } catch { /* best-effort */ }
             process.exit(1);
         }
     };

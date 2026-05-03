@@ -1,8 +1,6 @@
 import { z } from 'zod';
 
-// ============================================================================
-// MODEL CONFIGURATION (Simple provider:name references with per-model config)
-// ============================================================================
+// Model configuration: simple provider:name references with per-model config.
 
 const modelConfigSchema = z
     .object({
@@ -45,10 +43,6 @@ const modelSourceSchema = z.object({
 });
 
 const modelsConfigSchema = z.object({}).default({});
-
-// ============================================================================
-// CHANNELS & GATEWAY (existing)
-// ============================================================================
 
 const dmPolicySchema = z.enum(['pairing', 'allowlist', 'open', 'disabled']);
 const groupPolicySchema = z.enum(['allowlist', 'open', 'disabled']);
@@ -356,6 +350,26 @@ const proactiveSchema = z
          * `proactive.delivery` when no inbound activity has been recorded yet.
          */
         followActiveChannel: z.boolean().default(false),
+        /**
+         * Cosine-similarity threshold for delivery dedup. When an embedding
+         * matches a prior delivery above this value within `similarityWindowMs`,
+         * the message is suppressed.  nomic-embed-text hits ~0.88–0.95 on
+         * paraphrases of the same topic; raise toward 0.98 to allow more
+         * repetition, lower toward 0.80 to allow less.  Default: 0.88.
+         * Note: similarity dedup is bypassed entirely for deliveryMode 'always'.
+         */
+        similarityThreshold: z.number().min(0).max(1).default(0.88),
+        /**
+         * How far back (in ms) to scan for similar deliveries. Deliveries
+         * older than this window do not count against the similarity check.
+         * Default: 48 h.  Set lower (e.g. 14400000 = 4 h) for high-frequency
+         * heartbeats where the same topic naturally recurs every day.
+         */
+        similarityWindowMs: z
+            .number()
+            .int()
+            .positive()
+            .default(48 * 60 * 60 * 1000),
         heartbeats: z
             .object({
                 enabled: z.boolean().default(false),
@@ -399,10 +413,10 @@ const approvalsSchema = z.object({
 
 /**
  * Per-agent sandbox configuration. When `enabled: true` the agent gets
- * an `execute_code` tool. When `programmaticToolCalling: true` it also
- * gets `execute_code_with_tools` — the model can write Python/JS code
- * that calls ANY of the agent's tools as regular functions and only the
- * `print()` output enters the LLM context.
+ * an `execute_code` tool. When `programmaticToolCalling: true` the agent
+ * can pass `use_tools: true` on each call so the sandboxed code can
+ * call ANY of the agent's tools as regular functions; only the printed
+ * output enters the LLM context.
  *
  * Only `enabled` is required. All other fields carry sensible defaults
  * suitable for local development. For production set `backend: 'docker'`
@@ -410,7 +424,14 @@ const approvalsSchema = z.object({
  */
 const sandboxConfigSchema = z.object({
     enabled: z.boolean().default(false),
-    backend: z.enum(['local', 'docker', 'kubernetes']).default('local'),
+    /**
+     * Sandbox backend name. Built-ins: `local`, `docker`, `kubernetes`.
+     * Custom backends become valid here once registered via
+     * `registerSandboxBackend(name, ...)` at boot. Validated at runtime
+     * by `createSession` — a typo or unregistered name throws with the
+     * list of registered backends.
+     */
+    backend: z.string().default('local'),
     language: z.enum(['python', 'javascript', 'typescript', 'bash']).default('python'),
     /** Hard wall-clock cap on a single execution, in ms. */
     timeout: z.number().int().positive().default(30_000),
@@ -427,11 +448,36 @@ const sandboxConfigSchema = z.object({
     /** Reuse the session between invocations instead of tearing down. */
     keepAlive: z.boolean().default(true),
     /**
-     * Turn on the `execute_code_with_tools` tool — the model writes code
-     * that orchestrates multiple of this agent's tools in one pass,
-     * keeping intermediate data out of the LLM context.
+     * Enable the `use_tools: true` flag on `execute_code`. The model
+     * writes code that orchestrates multiple of this agent's tools in
+     * one pass, keeping intermediate data out of the LLM context.
      */
     programmaticToolCalling: z.boolean().default(false),
+    /**
+     * Treat the code being executed as untrusted (LLM-generated against
+     * an adversarial user, multi-tenant, or unaudited). When true, the
+     * `local` backend is REFUSED — only docker/kubernetes are accepted,
+     * because local has no kernel isolation and runs on the host UID
+     * with full network access.
+     *
+     * Default false to preserve back-compat. Set true for any
+     * production-facing deployment exposing the agent to non-trusted
+     * users. When unset and backend=local, the runtime emits a loud
+     * console.warn so an operator notices the security posture.
+     */
+    untrusted: z.boolean().default(false),
+    /**
+     * Tier-2 hardening for Docker/Kubernetes backends. When `true`, applies
+     * a hardened seccomp profile blocking namespace manipulation, eBPF,
+     * kernel keyring, ptrace, mount/pivot_root/chroot, kernel module
+     * loading, and reboot. Adds defense-in-depth on top of the default
+     * Tier-1 hardening (CapDrop ALL, no-new-privileges, read-only rootfs).
+     *
+     * Default `false` to preserve dev workflows. Recommended `true` for
+     * any production deployment running LLM-generated code against
+     * multiple users.
+     */
+    hardened: z.boolean().default(false),
 });
 
 const agentDefinitionSchema = z.object({
@@ -502,9 +548,17 @@ const agentDefinitionSchema = z.object({
 
     // Sandbox opt-in. Absent / disabled → agent has no code execution tools.
     // When enabled the agent gets `execute_code`; when programmaticToolCalling
-    // is also on it gets `execute_code_with_tools` that exposes every other
-    // tool this agent has as a function the model can call from sandbox code.
+    // is also on, `execute_code({use_tools:true})` exposes every other tool
+    // this agent has as a function the model can call from sandbox code.
     sandbox: sandboxConfigSchema.optional(),
+
+    // Default voice overlay applied when no per-turn override and no
+    // session-set value exists. Must match a key in personalities.yaml.
+    // Use this when the agent should always speak in a particular tone
+    // (e.g. a productivity-coach agent always defaults to "concise") so
+    // the user doesn't have to /personality after every /new. Per-session
+    // /personality choices and per-turn proactive overrides still win.
+    defaultPersonality: z.string().optional(),
 });
 
 /**
@@ -565,6 +619,13 @@ const mcpServerSchema = z.object({
     // timeout entirely — only do this if you trust the server not to hang,
     // since a stuck call will pin the agent's turn forever.
     callTimeoutMs: z.number().int().min(0).optional(),
+    // When true, this server's tools land in the agent's STATIC toolset
+    // (always bound) instead of the dynamic catalog (gated behind
+    // __load_tool__). Use for high-value, narrow
+    // toolsets that are central to a worker's job — e.g. gmail/calendar/
+    // drive on a "personal-assistant" worker. Trade-off: ~50-100 tokens
+    // of system prompt per pre-loaded tool. Default false.
+    preload: z.boolean().default(false),
     // Full OAuth redirect URI for provider auth flows that need a
     // dashboard-registered URI (e.g. Spotify). Must match exactly what
     // you register in the provider's developer dashboard. The CLI's

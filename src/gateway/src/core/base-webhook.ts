@@ -28,23 +28,30 @@ export class WebhookServer {
     private readonly processed = new Map<string, number>();
     private cleanupInterval: ReturnType<typeof setInterval> | null = null;
     private readonly routes = new Map<string, RouteHandler>();
+    // Paths registered with `ownsSignature: true` verify their own signature
+    // inline; the global-secret check is skipped for these so per-route
+    // secrets don't collide with `webhook.secret` from flopsy.json5.
+    private readonly routesOwnSignature = new Set<string>();
     private readonly rateLimiter = new RateLimiter();
 
-    registerRoute(pathPrefix: string, handler: RouteHandler): void {
+    registerRoute(
+        pathPrefix: string,
+        handler: RouteHandler,
+        opts?: { ownsSignature?: boolean },
+    ): void {
         this.routes.set(pathPrefix, handler);
+        if (opts?.ownsSignature) {
+            this.routesOwnSignature.add(pathPrefix);
+        } else {
+            this.routesOwnSignature.delete(pathPrefix);
+        }
     }
 
-    /**
-     * Remove a previously-registered route. Returns true if a route was
-     * removed. Used by `WebhookRouter.removeRuntimeRoute` when a runtime
-     * webhook is deleted via `flopsy schedule remove` — without it, routes
-     * would leak for the lifetime of the process.
-     */
     unregisterRoute(pathPrefix: string): boolean {
+        this.routesOwnSignature.delete(pathPrefix);
         return this.routes.delete(pathPrefix);
     }
 
-    /** User-safe snapshot accessors for `/status`. Never exposes the route paths themselves. */
     get isRunning(): boolean {
         return this.server !== null;
     }
@@ -123,6 +130,22 @@ export class WebhookServer {
             return this.respond(res, 200, { status: 'ok' });
         }
 
+        // GET/HEAD on registered paths return 200 for reachability probes
+        // (LINE, Slack tools). Unregistered paths 404 to avoid leaking the
+        // route table to scanners.
+        if (req.method === 'GET' || req.method === 'HEAD') {
+            const url = req.url ?? '/';
+            const matched = [...this.routes.keys()].some((prefix) => url.startsWith(prefix));
+            if (matched) {
+                return this.respond(res, 200, {
+                    status: 'ok',
+                    method: 'POST',
+                    info: 'webhook endpoint — send POST with JSON body to deliver an event',
+                });
+            }
+            return this.respond(res, 404, { error: 'Unknown webhook endpoint' });
+        }
+
         if (req.method !== 'POST') {
             return this.respond(res, 405, { error: 'Method not allowed' });
         }
@@ -158,15 +181,23 @@ export class WebhookServer {
             return this.respond(res, 400, { error: 'Empty body' });
         }
 
+        // Global signature check skipped when the matched route owns its own
+        // signature (route's own secret would 401 against the global secret).
         if (this.config?.secret) {
-            const sigHeader = this.findSignatureHeader(req);
-            if (!sigHeader) {
-                this.log.warn('missing webhook signature');
-                return this.respond(res, 401, { error: 'Missing signature' });
-            }
-            if (!verifyWebhookSignature(this.config.secret, body, sigHeader)) {
-                this.log.warn('invalid webhook signature');
-                return this.respond(res, 401, { error: 'Invalid signature' });
+            const reqUrl = req.url ?? '/';
+            const matchedRouteOwnsSig = [...this.routesOwnSignature].some((prefix) =>
+                reqUrl.startsWith(prefix),
+            );
+            if (!matchedRouteOwnsSig) {
+                const sigHeader = this.findSignatureHeader(req);
+                if (!sigHeader) {
+                    this.log.warn('missing webhook signature');
+                    return this.respond(res, 401, { error: 'Missing signature' });
+                }
+                if (!verifyWebhookSignature(this.config.secret, body, sigHeader)) {
+                    this.log.warn('invalid webhook signature');
+                    return this.respond(res, 401, { error: 'Invalid signature' });
+                }
             }
         }
 

@@ -6,9 +6,11 @@
  * a restart.
  */
 
+import { existsSync } from 'node:fs';
+import { resolve as resolvePath } from 'node:path';
 import { Command } from 'commander';
 import { truncate } from '@flopsy/shared';
-import { detail, dim } from '../ui/pretty';
+import { bad, detail, dim } from '../ui/pretty';
 import {
     mgmtCreate,
     mgmtDisable,
@@ -47,6 +49,17 @@ export function registerHeartbeatCommands(root: Command): void {
         .option('--oneshot', 'Fire once then auto-disable', false)
         .option('--id <id>', 'Stable id (defaults to runtime-hb-<name>)')
         .action(async (opts) => {
+            // Resolve --prompt-file to absolute against the user's CWD —
+            // the daemon runs in a different cwd and would otherwise hit
+            // ENOENT when it tries to copy the file into the workspace.
+            let absPromptFile: string | undefined;
+            if (opts.promptFile) {
+                absPromptFile = resolvePath(opts.promptFile);
+                if (!existsSync(absPromptFile)) {
+                    console.log(bad(`prompt-file not found: ${absPromptFile}`));
+                    process.exit(1);
+                }
+            }
             const scheduleId: string = opts.id ?? `runtime-hb-${opts.name as string}`;
             await mgmtCreate({
                 kind: 'heartbeat',
@@ -54,7 +67,7 @@ export function registerHeartbeatCommands(root: Command): void {
                 name: opts.name,
                 interval: opts.interval,
                 prompt: opts.prompt,
-                promptFile: opts.promptFile,
+                promptFile: absPromptFile,
                 deliveryMode: opts.deliveryMode,
                 oneshot: opts.oneshot,
             });

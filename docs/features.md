@@ -148,9 +148,10 @@ See [proactive.md](./proactive.md).
 
 Flopsygraph's sandbox wired into each agent on demand (`sandbox` block in `flopsy.json5 → agents[]`).
 
-Two tools per opt-in agent:
+One unified tool per opt-in agent:
 - **`execute_code`** — run Python/JS/TS/bash in isolation. Backends: `local` (dev), `docker` (prod), `kubernetes` (enterprise).
-- **`execute_code_with_tools`** — write code that calls *every other agent tool as a function*. HTTP bridge (per-session auth token) exposes `weather(city="Tokyo")`, `web_search(query="...")`, etc. to the sandbox. Only `print()` output enters LLM context — intermediate results stay in code. Massive token + latency savings on multi-tool queries.
+  - `run_in_background: true` — long-running daemons (`npm run dev`, watchers); returns a task id. Read with `get_task_output`, kill with `stop_task`, list with `list_tasks`.
+  - `use_tools: true` — code can call *every other agent tool as a function*. HTTP bridge (per-session auth token) exposes `weather(city="Tokyo")`, `web_search(query="...")`, etc. to the sandbox. Only `print()` output enters LLM context — massive token + latency savings on multi-tool queries.
 
 Config:
 ```json5
@@ -377,7 +378,7 @@ Defense-in-depth patterns borrowed from Hermes:
 ├── credentials/                        # OAuth tokens (chmod 600)
 ├── auth/                               # per-provider pairing material
 ├── logs/
-│   └── gateway-stdio.log               # daemon stdout/stderr
+│   └── gateway.out.log                 # daemon stdout/stderr
 └── gateway.pid                         # running daemon marker
 ```
 

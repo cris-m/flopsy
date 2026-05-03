@@ -61,6 +61,16 @@ function findConfigFile(explicitPath?: string): string | null {
         if (existsSync(resolved)) return resolved;
     }
 
+    // Workspace-first: the canonical config lives at .flopsy/config/flopsy.json5
+    // (seeded from src/team/templates/flopsy.json5 on first boot). The cwd
+    // fallback below catches running the tool from inside a repo dir with a
+    // local flopsy.json5 (developer convenience).
+    const wsPath = resolveFlopsyHome();
+    for (const name of DEFAULT_CONFIG_PATHS) {
+        const resolved = resolve(wsPath, 'config', name);
+        if (existsSync(resolved)) return resolved;
+    }
+
     for (const candidate of DEFAULT_CONFIG_PATHS) {
         const resolved = resolve(candidate);
         if (existsSync(resolved)) return resolved;

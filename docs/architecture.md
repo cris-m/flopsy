@@ -142,6 +142,46 @@ stateDiagram-v2
 - **Draining**: new messages 503; in-flight turns finish. Checkpoints ensure nothing is lost if a turn is mid-LLM when the signal arrives.
 - **Stopped**: databases closed, pid file removed.
 
+## Background mechanics
+
+Three subsystems shape every turn but are easy to miss in a one-pass read.
+
+### Session extraction (post-turn LLM pass)
+
+When a session closes (`/new`, idle timeout, or branch fork), the `SessionExtractor` (`src/team/src/harness/review/session-extractor.ts`) runs an async LLM call over the transcript and extracts:
+
+- A 1–3 sentence **summary** → stored on the session row, surfaced as `<last_session>` recap in the next session's harness block.
+- **Profile patches** (stable preferences) → appended to `profiles.<peerId>`.
+- **Note upserts/deletes** (atomic facts with confidence × recency decay) → upserted into `notes` for the peer.
+- **New directives** (rules the user explicitly stated) → inserted into `directives`.
+- A possible **skill proposal** (kebab-case name + body) → written to `~/.flopsy/skills/proposed/<name>/SKILL.md`. Proposed skills are NOT auto-loaded — review with `/skills review`.
+- **Skill lessons** → appended to existing skills' `LESSONS` block.
+
+Trivial sessions (low message count + no tool-call signal) are skipped to keep LLM costs bounded.
+
+### Personality resolution (per turn)
+
+The active voice overlay is resolved on every turn from a four-tier priority chain in `src/team/src/personalities.ts`:
+
+1. **Override** — `cfg.personality` set by a proactive fire (heartbeat/cron/webhook) that wants a specific voice for this fire.
+2. **Session-bound** — `sessions.active_personality` set by the user with `/personality <name>`. Survives across turns until `/new` or `/personality reset`.
+3. **Default** — `def.defaultPersonality` from the agent's YAML config. Lets fresh sessions start with a voice instead of bare SOUL.md.
+4. **None** — plain SOUL.md baseline.
+
+The chosen overlay is rendered as the **final** block of the system prompt (after SOUL.md, AGENTS.md, and `<runtime>`) so recency-bias gives it maximum influence on tone. Body content is HTML-escaped before injection so a malicious `personalities.yaml` can't smuggle fake system instructions. Workers do not currently inherit the active personality — a delegated worker reply will land in a neutral voice (this is on the roadmap to fix).
+
+### Model selection: three coexisting layers
+
+These look redundant at a glance but each handles a different question. Don't collapse them.
+
+| Layer | When it runs | Question it answers | Source |
+|---|---|---|---|
+| `model:` field | Construction time | Which model is the *primary* for this agent? | `flopsy.json5` per-agent |
+| `ModelRouter` tiers | Construction time | Should we route this agent to fast / balanced / powerful tier? | `routing.tiers` in config → `bootstrap.ts` |
+| `fallback_models` | Runtime | When the primary fails (429/5xx/network), what do we retry with? | `flopsy.json5` per-agent → `factory.ts` interceptor |
+
+A request goes: ModelRouter picks a tier from the agent's config → resolves to `model:` for the chosen tier → on call failure, walks the `fallback_models` list. Construction-time tier selection ≠ runtime retry — both are needed.
+
 ## Cross-reference
 
 - **Want to extend the agent?** → [Agents](./agents.md), [Tools](./tools.md), [Skills](./skills.md)

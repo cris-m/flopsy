@@ -14,3 +14,4 @@ export {
 } from './format';
 export { renderCliCompact, renderCliVerbose, plainTheme, type CliTheme } from './render-cli';
 export { renderChannelMarkdown, renderChannelPlain } from './render-channel';
+export { panel, row, cols, line, STATE, type PanelSection, type PanelOptions } from './chat-panel';

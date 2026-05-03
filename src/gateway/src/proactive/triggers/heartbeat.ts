@@ -11,34 +11,19 @@ const log = createLogger('heartbeat');
 interface HeartbeatEntry {
     definition: HeartbeatDefinition;
     timer: ReturnType<typeof setInterval> | null;
-    /** Per-schedule override of the default delivery target. Undefined means
-     * "resolve at fire time via engine.resolveDelivery()" — picks up the
-     * live followActiveChannel state instead of baking the static default. */
+    // Undefined means "resolve at fire time via engine.resolveDelivery()".
     deliveryOverride: DeliveryTarget | undefined;
-    /** True while a fire() is in flight — prevents overlapping ticks when the
-     * executor runs longer than the heartbeat interval (JobExecutor already
-     * guards via isExecuting, but skipping here avoids noisy warn logs). */
     firing: boolean;
 }
 
 export class HeartbeatTrigger {
     private entries: Map<string, HeartbeatEntry> = new Map();
     private running = false;
-    /** Wall-clock ms of the most recent fire() call. Surfaced by /status. */
     private lastFiredAt: number | null = null;
-    /**
-     * Resolves the effective delivery target at fire time. Called per-fire
-     * (not per-register) so followActiveChannel sees current user activity.
-     * Engine sets this at construction; falls back to static default.
-     */
+    /** Set by engine; resolved per-fire so followActiveChannel sees live state. */
     resolveDelivery: (override?: DeliveryTarget) => DeliveryTarget | null = (o) => o ?? null;
 
-    /**
-     * Optional resolver that maps a delivery target to the peer's active
-     * session threadId (`<peerId>#<sessionId>`). Set by the engine from
-     * `agentHandler.resolveProactiveThreadId`. When present, fires reuse
-     * the peer's session instead of creating ephemeral proactive threads.
-     */
+    /** Maps a fire to the peer's active session threadId. */
     threadIdResolver?: (
         channelName: string,
         peer: { id: string; type: 'user' | 'group' | 'channel' },
@@ -52,7 +37,6 @@ export class HeartbeatTrigger {
         private readonly promptLoader?: PromptLoader,
     ) {}
 
-    /** For /status — returns undefined when no heartbeat has fired yet. */
     getLastFiredAt(): number | undefined {
         return this.lastFiredAt ?? undefined;
     }
@@ -66,11 +50,7 @@ export class HeartbeatTrigger {
         }
     }
 
-    /**
-     * Register a single heartbeat after `start()`. Used by manage_schedule
-     * tool for agent-created heartbeats. Returns true if registered, false
-     * if skipped (disabled / already-fired oneshot / invalid interval / dup).
-     */
+    /** Returns false if skipped (disabled / already-fired oneshot / invalid / dup). */
     addHeartbeat(hb: HeartbeatDefinition, _defaultDelivery: DeliveryTarget): boolean {
         if (this.entries.has(hb.name)) {
             log.warn({ name: hb.name }, 'Heartbeat already registered — skipping');
@@ -79,11 +59,7 @@ export class HeartbeatTrigger {
         return this.registerOne(hb);
     }
 
-    /**
-     * Stop + deregister a heartbeat by name. Does NOT remove any persisted
-     * runtime-schedule row — callers own that. Returns true if a timer was
-     * cleared, false if the name wasn't known.
-     */
+    /** Does NOT remove the persisted runtime-schedule row. */
     removeHeartbeat(name: string): boolean {
         const entry = this.entries.get(name);
         if (!entry) return false;
@@ -111,8 +87,6 @@ export class HeartbeatTrigger {
         const entry: HeartbeatEntry = {
             definition: { ...hb },
             timer: null,
-            // Hold just the override (if any); defaultDelivery is applied
-            // lazily at fire time via this.resolveDelivery.
             deliveryOverride: hb.delivery,
             firing: false,
         };
@@ -179,28 +153,25 @@ export class HeartbeatTrigger {
             }
         }
 
-        // Resolve delivery AT FIRE TIME so followActiveChannel picks up the
-        // user's current channel, not wherever they were when this schedule
-        // was registered. Returns null if nothing can be resolved.
         const delivery = this.resolveDelivery(entry.deliveryOverride);
         if (!delivery) {
             log.warn(
                 { name: hb.name },
-                'No delivery target (no override, no active peer, no fallback) — skipping fire',
+                'No delivery target — skipping fire',
             );
             return;
         }
 
-        // Stamp BEFORE executor.execute so an in-flight heartbeat is still
-        // visible as "just fired" in /status even while its job runs.
+        // Stamp before execute so /status shows in-flight heartbeats.
         this.lastFiredAt = Date.now();
 
         const prompt = this.promptLoader
-            ? await this.promptLoader.resolve(hb.prompt, hb.promptFile).catch((err) => {
-                  log.warn({ name: hb.name, err }, 'Failed to load promptFile, using inline prompt');
-                  return hb.prompt;
+            ? await this.promptLoader.resolve(hb.prompt, hb.promptFile, 'heartbeat').catch((err) => {
+                  log.error({ name: hb.name, err }, 'Failed to load promptFile — skipping fire');
+                  return null;
               })
             : hb.prompt;
+        if (prompt === null) return;
 
         const resolvedThreadId = this.threadIdResolver?.(delivery.channelName, delivery.peer, 'heartbeat');
         const job: ExecutionJob = {
@@ -222,8 +193,8 @@ export class HeartbeatTrigger {
     private async fireOnce(entry: HeartbeatEntry): Promise<void> {
         await this.fire(entry);
         entry.definition.enabled = false;
-        // Persist the completion so a gateway restart doesn't re-fire this
-        // heartbeat (the config still says oneshot:true, enabled:true).
+        // Persist completion so a restart doesn't re-fire (config still
+        // says oneshot:true, enabled:true).
         const oneshotKey = entry.definition.id ?? `heartbeat-${entry.definition.name}`;
         this.store.markOneshotCompleted(oneshotKey);
         log.info(
