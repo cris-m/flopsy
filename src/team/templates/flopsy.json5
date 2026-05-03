@@ -113,11 +113,14 @@
                 "args": [
                     "-y",
                     "@playwright/mcp@latest",
+                    "--browser",
+                    "chromium",
                     "--headless"
                 ],
                 "assignTo": [
                     "gandalf",
-                    "legolas"
+                    "legolas",
+                    "saruman"
                 ],
                 "description": "Playwright-based browser automation. Set `enabled: true` after running `npx playwright install chromium`."
             },
@@ -468,7 +471,7 @@
             "role": "worker",
             "graph": "deep-research",
             "domain": "deep-research",
-            "toolsets": [],
+            "toolsets": ["research", "web", "news"],
             "model": "nvidia:meta/llama-3.3-70b-instruct",
             "model_config": {
                 "temperature": 0.3,
