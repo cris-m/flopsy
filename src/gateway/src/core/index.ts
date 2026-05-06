@@ -4,6 +4,7 @@ export { WebhookServer, type RouteHandler, type WebhookConfig } from './base-web
 export { ChannelWorker } from './channel-worker';
 export { EventQueue } from './event-queue';
 export { MessageQueue, coalesce, type QueuedMessage } from './message-queue';
+export { globalMessageQueue, type GlobalQueueEntry, type QueuePriority } from './global-message-queue';
 export { MessageRouter, type MessageRouterConfig } from './message-router';
 export {
     RateLimiter,
