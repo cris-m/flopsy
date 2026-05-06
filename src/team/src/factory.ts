@@ -5,11 +5,14 @@ import {
     createReactAgent,
     filesystem,
     humanApproval,
+    memorySnapshot,
     messageQueue,
     modelFallback,
     planning,
     skills,
     todoList,
+    rateLimiter,
+    RetryModel,
     createSession as createSandboxSession,
     BaseSandboxSession,
 } from 'flopsygraph';
@@ -29,8 +32,15 @@ import type {
 } from 'flopsygraph';
 import type { AgentDefinition } from '@flopsy/shared';
 import { createLogger, resolveWorkspacePath } from '@flopsy/shared';
-import { HarnessInterceptor, toolLoopDedup, sanitizeToolCallNoise, reflectionNudge } from './harness';
+import {
+    HarnessInterceptor,
+    toolLoopDedup,
+    sanitizeToolCallNoise,
+    reflectionNudge,
+} from './harness';
+import { CorrectionInterceptor, setCorrectionStore } from './harness';
 import type { LearningStore } from './harness';
+import { SkillUsageStore } from './harness/review';
 import type { PersonalityRegistry } from './personalities';
 import { resolvePersonality } from './personalities';
 import { compactor } from './compactor';
@@ -39,7 +49,7 @@ import { askUserTool } from './tools/ask-user';
 import { connectServiceTool } from './tools/connect-service';
 import { sendMessageTool } from './tools/send-message';
 import { sendPollTool } from './tools/send-poll';
-import { searchPastConversationsTool } from './tools/search-past-conversations';
+import { searchConversationHistoryTool } from './tools/search-conversation-history';
 import { spawnBackgroundTaskTool } from './tools/spawn-background-task';
 import { delegateTaskTool } from './tools/delegate-task';
 import { reactTool } from './tools/react';
@@ -89,6 +99,7 @@ export interface TeamMember {
     readonly tools: ReadonlyArray<BaseTool>;
     readonly sandboxSession?: BaseSandboxSession;
     readonly planningController?: PlanningInterceptor;
+    readonly skillUsageStore?: SkillUsageStore;
 }
 
 export function resolveRole(def: AgentDefinition): 'main' | 'worker' {
@@ -115,7 +126,7 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
                   reactTool,
                   spawnBackgroundTaskTool,
                   delegateTaskTool,
-                  searchPastConversationsTool,
+                  searchConversationHistoryTool,
                   connectServiceTool,
                   skillManageTool,
                   manageScheduleTool,
@@ -155,6 +166,7 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
         opts.teamRoster,
         opts.personalities,
         opts.isProactive,
+        tools,
     );
 
     const harnessInterceptor = new HarnessInterceptor({
@@ -169,6 +181,13 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
     interceptors.push(toolLoopDedup());
     interceptors.push(sanitizeToolCallNoise());
     interceptors.push(reflectionNudge());
+
+    // Correction feedback — persists user corrections to memory for future retrieval.
+    // Only on main agent (workers don't interact directly with the user).
+    if (role === 'main' && opts.memoryStore) {
+        setCorrectionStore(opts.memoryStore);
+        interceptors.push(new CorrectionInterceptor());
+    }
 
     if (def.fallback_models?.length) {
         const fallbacks = def.fallback_models.map(
@@ -211,6 +230,7 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
     // skills() throws on readdir failure, so the directory MUST exist.
     const skillsPath = resolveWorkspacePath('skills');
     mkdirSync(skillsPath, { recursive: true });
+    const skillUsageStore = new SkillUsageStore(skillsPath);
     interceptors.push(
         skills(skillsPath, {
             // deltaOnly:false — the skill-catalog injection is per-call (not state-persisted),
@@ -218,10 +238,27 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
             deltaOnly: false,
             onError: (err) =>
                 log.warn({ agent: def.name, err }, 'skill load error'),
+            onSkillRead: (name) => skillUsageStore.bumpUse(name),
         }),
     );
 
     interceptors.push(todoList());
+
+    // Hermes-style frozen snapshot of the agent's persistent memory.
+    // Reads `memory` and `user` namespaces once per thread, injects them as
+    // a <memory> block in the system prompt. Writes via the `memory` tool
+    // land in the store immediately but only appear in the prompt next session.
+    if (opts.memoryStore) {
+        interceptors.push(
+            memorySnapshot({
+                store: opts.memoryStore,
+                namespaces: [
+                    { name: 'memory', label: 'MEMORY (your persistent notes)', cap: 2200 },
+                    { name: 'user',   label: 'USER PROFILE',                   cap: 1375 },
+                ],
+            }),
+        );
+    }
 
     let planningController: PlanningInterceptor | undefined;
 
@@ -280,6 +317,9 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
         }),
     );
 
+    // Rate limit: max 10 model calls per 60s, wait on limit (don't hard-block)
+    interceptors.push(rateLimiter({ maxCalls: 10, windowMs: 60_000, scope: 'per-run', onLimit: 'wait' }));
+
     const staticNames = new Set(tools.map((t) => t.name));
     const dynamicTools = [...spilledTools, ...(opts.extraDynamicTools ?? [])].filter(
         (t) => !staticNames.has(t.name),
@@ -288,7 +328,7 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
     const sandboxOpts = buildSandboxOptions(def);
 
     const agent = createReactAgent({
-        model: opts.model,
+        model: new RetryModel(opts.model, { maxRetries: 3, baseDelayMs: 1000, maxDelayMs: 60000 }),
         tools,
         dynamicTools,
         systemPrompt,
@@ -297,7 +337,7 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
         ...(opts.observability ? { observability: opts.observability } : {}),
         ...(opts.checkpointer ? { checkpointer: opts.checkpointer } : {}),
         ...(opts.memoryStore ? { memoryStore: opts.memoryStore } : {}),
-        memoryNamespace: opts.memoryNamespace ?? `memories:${def.name}`,
+        memoryNamespace: opts.memoryNamespace ?? 'memory',
         ...(opts.modelCallTimeoutMs !== undefined
             ? { modelCallTimeoutMs: opts.modelCallTimeoutMs }
             : {}),
@@ -343,6 +383,7 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
         agent,
         harnessInterceptor,
         tools,
+        skillUsageStore,
         ...(sandboxOpts.session ? { sandboxSession: sandboxOpts.session } : {}),
         ...(planningController ? { planningController } : {}),
     };
@@ -445,7 +486,19 @@ function loadRoleDelta(role: 'main' | 'worker', type: string): string | undefine
 
 const ROLE_DELTA: Record<'main' | 'worker', Partial<Record<string, string>>> = { main: {}, worker: {} };
 
-const IDENTITY_OPENER = `You are Flopsy — not "an AI assistant", a teammate someone trusted with their accounts, calendar, notes, and inbox. You run on their gateway, talk to them across the channels they already use, remember what matters about them across sessions, and delegate to specialist workers when a task is in someone else's lane. Your persona and operations are loaded below.`;
+const IDENTITY_OPENER = `You are Flopsy — not "an AI assistant", a teammate someone trusted with their accounts, calendar, notes, and inbox. You run on their gateway, talk to them across the channels they already use, remember what matters about them across sessions, and delegate to specialist workers when a task is in someone else's lane.
+
+## How you work
+
+**Compose, don't ask permission.** When no single tool fits a task, combine the ones you have — most jobs are 2-3 tools chained. If still no fit, write the script you need with \`execute_code\` (Python for data, Bash for shell ops) and run it. With \`execute_code({use_tools: true})\` your script can call other agent tools as native functions. Never tell the user "I don't have a tool for that" without first trying these steps. The execute_code sandbox is your tool factory.
+
+**Diagnose, don't blindly retry.** When something fails, read the error, check your assumptions, try a focused fix. Don't loop on the same failure expecting different output. Escalate to the user only after investigation.
+
+**Time is a tool, not a guess.** Never assume the current date, hour, or timezone. Call \`time({action: "current", timezone: "<IANA>"})\` when you need the wall-clock time. Hallucinated timestamps poison memory and trigger wrong decisions.
+
+**Parallel where you can, sequential where you must.** Independent tool calls go in one response in parallel. Dependent calls (one's output feeds the next) run sequentially.
+
+Your persona and operations are loaded below.`;
 
 function buildSystemPrompt(
     def: AgentDefinition,
@@ -455,6 +508,7 @@ function buildSystemPrompt(
     teamRoster?: ReadonlyArray<TeamRosterEntry>,
     personalities?: PersonalityRegistry,
     isProactive?: boolean,
+    tools?: ReadonlyArray<BaseTool>,
 ): SystemPromptFn {
     const staticParts: string[] = [IDENTITY_OPENER];
     const sources: string[] = ['code:identity'];
@@ -521,6 +575,21 @@ function buildSystemPrompt(
         }
     }
 
+    // Tool-contributed prompt fragments (each tool may inject a usage rule via
+    // `BaseTool.prompt()`). Sorted by tool name for byte-stability across builds.
+    if (tools && tools.length > 0) {
+        const fragments: string[] = [];
+        const sorted = [...tools].sort((a, b) => a.name.localeCompare(b.name));
+        for (const tool of sorted) {
+            const fragment = tool.prompt?.()?.trim();
+            if (fragment) fragments.push(fragment);
+        }
+        if (fragments.length > 0) {
+            staticParts.push(['## Tool guidance', '', ...fragments].join('\n\n'));
+            sources.push(`tool-prompts(${fragments.length})`);
+        }
+    }
+
     // CACHE BOUNDARY: staticParts above is byte-stable for prefix caching;
     // the per-invocation <runtime> block below MUST stay after this line.
     (buildSystemPrompt as unknown as { _lastSources: string[] })._lastSources = sources;
@@ -537,10 +606,13 @@ function buildSystemPrompt(
             personality?: string;
             runtimeHints?: readonly string[];
         };
+        const now = new Date();
+        const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
         const lines = [
             '<runtime>',
-            `current-date: ${new Date().toISOString().slice(0, 10)}`,
-            `current-time: ${new Date().toISOString()}`,
+            `current-date: ${now.toISOString().slice(0, 10)}`,
+            `current-time: ${now.toISOString()}`,
+            `timezone: ${tz}`,
             `channel: ${cfg.channelName ?? 'unknown'}`,
             `capabilities: ${
                 cfg.channelCapabilities && cfg.channelCapabilities.length > 0
@@ -644,6 +716,24 @@ function buildSandboxOptions(def: AgentDefinition): {
     void _e;
 
     const fgConfig = rest as FlopsygraphSandboxConfig;
+
+    // Default workDir to FLOPSY_HOME so execute_code runs with the workspace
+    // as cwd (local) or bind-mounted at /workspace (docker). Without this,
+    // every backend gets an isolated temp dir and sandboxed code can't access
+    // workspace files. Users can still override via sandbox.workDir in flopsy.json5.
+    if (!fgConfig.workDir) {
+        fgConfig.workDir = resolveWorkspacePath('');
+    }
+
+    if (!fgConfig.user && fgConfig.backend === 'docker') {
+        const uid = process.getuid?.();
+        const gid = process.getgid?.();
+        if (uid != null && gid != null) fgConfig.user = `${uid}:${gid}`;
+    }
+
+    if (!fgConfig.restrictedPaths?.length) {
+        fgConfig.restrictedPaths = ['auth/**', 'state/**', '*.key', '*.pem', '.env*'];
+    }
 
     // Container NetworkMode is baked at creation; programmaticToolCalling needs DNS to reach
     // host.docker.internal, so we MUST flip networkEnabled before createSandboxSession runs.

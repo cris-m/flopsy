@@ -32,6 +32,8 @@ import {
     scanExistingSkills,
     writeSkillFile,
     appendLessonsToSkill,
+    SkillUsageStore,
+    runSkillCurator,
 } from './harness/review';
 import { join as pathJoin } from 'path';
 import type { PersonalityRegistry } from './personalities';
@@ -263,7 +265,7 @@ export class TeamHandler implements AgentHandler {
         this.checkpointer = new SqliteCheckpointStore({
             path: resolveWorkspacePath('state', 'checkpoints.db'),
             compress: true,
-            keepLatestPerThread: 30,
+            keepLatestPerThread: 60,
         });
 
         const memoryCfg = config.memory ?? {};
@@ -278,8 +280,14 @@ export class TeamHandler implements AgentHandler {
                       embedderCfg.baseUrl,
                   )
                 : undefined;
+        // softCapPerNamespace: rough bound on entry COUNT per namespace so the
+        // memory tool's overThreshold flag fires and prompts consolidation.
+        // Hermes-style namespaces (memory, user) are content-bounded by the
+        // memorySnapshot interceptor's character caps; this is a complementary
+        // entry-count guardrail across all namespaces.
         this.memoryStore = new SqliteMemoryStore({
             path: resolveWorkspacePath('state', 'memory.db'),
+            softCapPerNamespace: 50,
             ...(embedder ? { embedder } : {}),
         });
         log.info(
@@ -411,6 +419,7 @@ export class TeamHandler implements AgentHandler {
                 threadId,
                 userId: entry.identity.userId,
                 store: this.store,
+                summaryModel: this.config.model,
                 channelName: callbacks.channelName,
                 channelCapabilities: callbacks.channelCapabilities,
                 peer: callbacks.peer,
@@ -419,6 +428,7 @@ export class TeamHandler implements AgentHandler {
                 personality: callbacks.personality,
                 runtimeHints: callbacks.runtimeHints,
                 taskStore: this.store,
+                skillUsageStore: entry.entry.skillUsageStore,
                 onAuthSuccess: async (provider: string) => {
                     if (!this.mcpServersCfg || Object.keys(this.mcpServersCfg).length === 0) return;
                     let affected: string[] = [];
@@ -631,8 +641,17 @@ export class TeamHandler implements AgentHandler {
         return this.threads.size;
     }
 
-    queryStatus(threadId: string): ThreadStatusSnapshot | undefined {
-        const entry = this.threads.get(threadId);
+    queryStatus(rawKey: string): ThreadStatusSnapshot | undefined {
+        // Exact match first (caller may already hold the resolved session key).
+        // Fall back to prefix search: threads are stored as "rawKey#sessionId" but
+        // the channel-worker passes the unresolved raw key.
+        let entry = this.threads.get(rawKey);
+        if (!entry) {
+            for (const [threadId, e] of this.threads) {
+                if (isThreadForRawKey(threadId, rawKey)) { entry = e; break; }
+            }
+        }
+        const threadId = rawKey;
 
         if (!entry) {
             const today = localDateString();
@@ -656,11 +675,27 @@ export class TeamHandler implements AgentHandler {
                     ...staticConfigFields(def),
                 }));
 
+            const persistedTasks = this.store.listBackgroundTasksForThread(
+                threadId,
+                ['completed', 'delivered', 'failed', 'killed'],
+            )
+                .slice(-5)
+                .reverse()
+                .map((t): TaskStatusSummary => ({
+                    id: t.taskId,
+                    worker: t.workerName,
+                    description: t.description ?? t.taskPrompt.slice(0, 80),
+                    status: t.status === 'delivered' ? 'completed' : t.status,
+                    startedAtMs: t.createdAt,
+                    endedAtMs: t.endedAt ?? undefined,
+                    error: t.error ?? undefined,
+                }));
+
             return {
                 threadId,
                 entryAgent: this.entryDef.name,
                 activeTasks: [],
-                recentTasks: [],
+                recentTasks: persistedTasks,
                 tokens:
                     todayTotal.calls > 0
                         ? {
@@ -1358,6 +1393,10 @@ export class TeamHandler implements AgentHandler {
         );
         if (!result) return null;
 
+        // Shared store instance for provenance tracking — file-backed, safe to
+        // instantiate ad-hoc since atomic writes prevent partial reads.
+        const usageStore = new SkillUsageStore(skillsPath);
+
         try {
             this.store.setSessionSummary(closedSessionId, result.summary);
 
@@ -1372,7 +1411,10 @@ export class TeamHandler implements AgentHandler {
                         proposed.name,
                         renderProposedSkillBody(proposed),
                     );
-                    if (written) proposedSkillName = proposed.name;
+                    if (written) {
+                        proposedSkillName = proposed.name;
+                        usageStore.markAgentCreated(proposed.name);
+                    }
                 } catch (err) {
                     log.warn(
                         { err: (err as Error).message, name: proposed.name, peerId },
@@ -1390,7 +1432,10 @@ export class TeamHandler implements AgentHandler {
                             entry.name,
                             entry.lessons,
                         );
-                        if (ok) skillsImproved.push(entry.name);
+                        if (ok) {
+                            skillsImproved.push(entry.name);
+                            usageStore.bumpPatch(entry.name);
+                        }
                     } catch (err) {
                         log.warn(
                             { err: (err as Error).message, skill: entry.name, peerId },
@@ -1398,6 +1443,19 @@ export class TeamHandler implements AgentHandler {
                         );
                     }
                 }
+            }
+
+            // Run curator after all writes so new skills aren't immediately stale-marked.
+            try {
+                const curated = runSkillCurator(skillsPath, usageStore);
+                if (curated.markedStale.length > 0 || curated.markedArchived.length > 0) {
+                    log.info(
+                        { markedStale: curated.markedStale, markedArchived: curated.markedArchived },
+                        'skill curator swept',
+                    );
+                }
+            } catch (err) {
+                log.debug({ err: (err as Error).message }, 'skill curator failed (non-fatal)');
             }
 
             log.info(

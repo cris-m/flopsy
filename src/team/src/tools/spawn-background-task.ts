@@ -1,3 +1,5 @@
+import { writeFileSync, mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { z } from 'zod';
 import { defineTool } from 'flopsygraph';
 import {
@@ -52,6 +54,8 @@ export interface BackgroundTaskEvent {
     readonly error?: string;
     readonly progress?: string;
     readonly completedAt: number;
+    /** Set for internal worker tasks so ChannelWorker can use <task-notification> format. */
+    readonly workerName?: string;
 }
 
 /** Implementations MUST honour `signal` for cancellation. */
@@ -118,6 +122,12 @@ const schema = z.object({
         .optional()
         .describe(
             `Hard ceiling in ms for how long the teammate can run. Default ${DEFAULT_SPAWN_TIMEOUT_MS} (30 min); max ${MAX_SPAWN_TIMEOUT_MS} (2 h). If it elapses, the teammate is aborted and a task_error event fires — user gets notified.`,
+        ),
+    outputFile: z
+        .string()
+        .optional()
+        .describe(
+            'Absolute path to write the task output to when complete. Use for large outputs that should not be inlined in the notification (e.g. "/workspace/reports/pq-crypto.md"). Read with read_file after task completion. When omitted, output is delivered inline.',
         ),
 });
 
@@ -321,6 +331,7 @@ function launch(
         logger,
         timeoutTimer,
         taskStore,
+        outputFile: args.outputFile,
     });
 
     logger?.info?.(
@@ -349,8 +360,9 @@ async function runInBackground(args: {
     logger: SpawnBackgroundTaskConfigurable['logger'];
     timeoutTimer: NodeJS.Timeout;
     taskStore: BackgroundTaskStore | undefined;
+    outputFile: string | undefined;
 }): Promise<void> {
-    const { taskId, registry, eventQueue, runner, logger, timeoutTimer, taskStore } = args;
+    const { taskId, workerName, registry, eventQueue, runner, logger, timeoutTimer, taskStore, outputFile } = args;
     const startedAt = Date.now();
 
     const persistStatus = (
@@ -380,22 +392,41 @@ async function runInBackground(args: {
             signal: args.abortSignal,
         });
 
+        let deliveredResult = result;
+        if (outputFile) {
+            try {
+                mkdirSync(dirname(outputFile), { recursive: true });
+                writeFileSync(outputFile, result, 'utf8');
+                deliveredResult = `Output written to ${outputFile} (${result.length} chars). Read it with read_file.`;
+            } catch (writeErr) {
+                logger?.warn?.(
+                    {
+                        taskId,
+                        outputFile,
+                        err: writeErr instanceof Error ? writeErr.message : String(writeErr),
+                    },
+                    'failed to write outputFile — falling back to inline delivery',
+                );
+            }
+        }
+
         const current = registry.get(taskId);
         if (current) {
-            const done = toTerminal(current, 'completed', { result });
+            const done = toTerminal(current, 'completed', { result: deliveredResult });
             if (done.ok) registry.replace(done.task);
         }
 
         // Persist BEFORE eventQueue.push so a crash between the two doesn't strand the row as `running`.
-        persistStatus('completed', { result });
+        persistStatus('completed', { result: deliveredResult });
 
         eventQueue.push({
             type: 'task_complete',
             taskId,
-            result,
+            result: deliveredResult,
             completedAt: Date.now(),
+            workerName,
         });
-        logger?.info?.({ taskId, durationMs: Date.now() - startedAt }, 'spawn: completed');
+        logger?.info?.({ taskId, durationMs: Date.now() - startedAt, outputFile: outputFile ?? null }, 'spawn: completed');
     } catch (err) {
         const aborted = args.abortSignal.aborted;
         const status: 'failed' | 'killed' = aborted ? 'killed' : 'failed';
@@ -414,6 +445,7 @@ async function runInBackground(args: {
             taskId,
             error: message,
             completedAt: Date.now(),
+            workerName,
         });
         logger?.warn?.(
             { taskId, durationMs: Date.now() - startedAt, err: message, aborted },

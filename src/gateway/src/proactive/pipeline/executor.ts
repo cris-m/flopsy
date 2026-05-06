@@ -22,6 +22,65 @@ import {
     stripReportedLines,
 } from './context';
 
+/**
+ * Inject real date/time/timezone so the agent never has to guess.
+ * This is a `<fire_context>` block prepended to EVERY proactive prompt.
+ * For jobs that need more (weather, calendar), this is the seed; the agent
+ * uses its tools to gather the rest.
+ */
+function buildDateContext(): string {
+    const now = new Date();
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const date = now.toLocaleDateString('en-US', {
+        weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: tz,
+    });
+    const time = now.toLocaleTimeString('en-US', {
+        hour: '2-digit', minute: '2-digit', hour12: false, timeZone: tz,
+    });
+    return `<fire_context>\ndate: ${date}\ntime: ${time}\ntimezone: ${tz}\n</fire_context>\n\n`;
+}
+
+/**
+ * Injects output-quality guidance and recent conversation topics so the
+ * proactive agent produces specific, actionable notifications rather than
+ * generic filler.
+ */
+function buildQualityGuidance(store: StateStore): string {
+    const recentTopics = store.getRecentTopics().slice(0, 8);
+    const lines = [
+        '<output_quality>',
+        'A good proactive notification is:',
+        '  - Specific: mentions concrete names, numbers, or dates — not vague summaries',
+        '  - Actionable: the user can act on it immediately (reply, check, schedule)',
+        '  - Concise: 1-3 sentences for most messages; longer only when complexity demands it',
+        '  - Timely: lead with what changed or is due, not with background',
+        '',
+        'Anti-patterns to avoid:',
+        '  - Opening with "Just wanted to let you know…" or "I noticed that…"',
+        '  - Restating what the user already knows',
+        '  - Padding with caveats and hedges instead of the actual information',
+    ];
+    if (recentTopics.length > 0) {
+        const seen = new Set<string>();
+        const unique: string[] = [];
+        for (const t of recentTopics) {
+            if (t.topic && !seen.has(t.topic)) {
+                seen.add(t.topic);
+                unique.push(t.topic);
+            }
+        }
+        if (unique.length > 0) {
+            lines.push('');
+            lines.push('Recent topics already covered (avoid repetition):');
+            for (const topic of unique.slice(0, 6)) {
+                lines.push(`  - ${topic}`);
+            }
+        }
+    }
+    lines.push('</output_quality>');
+    return lines.join('\n') + '\n\n';
+}
+
 const reportedIdsSchema = z.object({
     emails: z.array(z.string()).optional(),
     meetings: z.array(z.string()).optional(),
@@ -124,7 +183,12 @@ export class JobExecutor {
 
             const threadId = job.threadId ?? `proactive:${job.id}:${Date.now()}`;
             const contextBlock = buildAntiRepetitionContext(this.store, this.dedupStore);
-            const augmentedPrompt = contextBlock ? contextBlock + job.prompt : job.prompt;
+            const dateContext = buildDateContext();
+            const qualityBlock = buildQualityGuidance(this.store);
+            const augmentedPrompt =
+                dateContext +
+                qualityBlock +
+                (contextBlock ? contextBlock + job.prompt : job.prompt);
             let response: string;
             // `structured` is populated via one of two paths:
             //  1. StructuredLLM second pass (preferred — provider-enforced JSON
@@ -142,6 +206,7 @@ export class JobExecutor {
                     threadId,
                     responseSchema: proactiveOutputSchema,
                     ...(job.personality ? { personality: job.personality } : {}),
+                    ...(job.useTeamAgent ? { useTeamAgent: true as const } : {}),
                 };
                 const result = await this.agentCaller(augmentedPrompt, agentOptions);
                 response = result.response;
@@ -389,6 +454,10 @@ export class JobExecutor {
         job: ExecutionJob,
     ): Promise<ProactiveOutput> {
         const llm = structuredLLM(this.structuredOutputModel!, proactiveOutputSchema);
+        log.debug(
+            { jobId: job.id, rawResponsePreview: rawResponse.slice(0, 200) },
+            'Reformatting raw response through StructuredLLM',
+        );
         const systemPrompt =
             `You are a formatter. The agent reply below came from a scheduled ` +
             `proactive job named "${job.name}". Convert it into the target JSON schema:\n\n` +
@@ -509,6 +578,7 @@ export class JobExecutor {
         const durationMs = Date.now() - startedAt;
 
         jobState.lastRunAt = Date.now();
+        jobState.lastStatusAt = Date.now();
         jobState.lastStatus = 'success';
         jobState.lastAction = action;
         jobState.lastError = undefined;
@@ -547,6 +617,7 @@ export class JobExecutor {
         const durationMs = Date.now() - startedAt;
 
         jobState.lastRunAt = Date.now();
+        jobState.lastStatusAt = Date.now();
         jobState.lastStatus = 'error';
         jobState.lastAction = 'error';
         jobState.lastError = error;
@@ -566,30 +637,84 @@ export class JobExecutor {
 
 /**
  * Parse a conditional-mode agent response into a structured decision.
- * Accepts either raw JSON or JSON inside a ```json fenced code block —
- * Anthropic and Llama-tuned agents both reach for fences when emitting
- * structured output even though the system prompt asked for raw JSON.
  *
- * Returns null when the response is unparseable or has an unknown
- * `status` field; callers treat null as "fall back to suppress" so a
- * malformed reply never accidentally fires off a delivery.
+ * Accepts THREE shapes the agent may emit:
+ *   1. Modern: `{shouldDeliver: bool, message?, reason?, topics?}` — what
+ *      smart-pulse.md and the structured-output schema produce.
+ *   2. Legacy: `{status: 'promote'|'suppress', reason, content?}`.
+ *   3. Either of the above wrapped in ```json fences, ``` plain fences, or
+ *      `single backticks` (DeepSeek and a few smaller models lean toward
+ *      single-backtick wrapping even when the prompt says raw).
+ *
+ * Returns null only when nothing parses — callers treat null as
+ * "fall back to suppress" so a malformed reply never accidentally fires
+ * a delivery.
  */
 export function parseConditionalResponse(text: string): ConditionalResponse | null {
-    try {
-        const parsed = JSON.parse(text);
-        if (parsed?.status === 'promote' || parsed?.status === 'suppress') {
-            return parsed as ConditionalResponse;
-        }
-    } catch {
-        const match = text.match(/```json\s*\n([\s\S]*?)\n```/);
-        if (match?.[1]) {
-            try {
-                const parsed = JSON.parse(match[1]);
-                if (parsed?.status === 'promote' || parsed?.status === 'suppress') {
-                    return parsed as ConditionalResponse;
-                }
-            } catch {}
-        }
+    // Try every candidate JSON region we can extract.
+    for (const candidate of extractJsonCandidates(text)) {
+        const adapted = tryParseEither(candidate);
+        if (adapted) return adapted;
     }
+    return null;
+}
+
+/**
+ * Yield every plausible JSON substring of the agent's response, ordered
+ * most-likely first: raw, triple-backtick fence, single-backtick wrap,
+ * first balanced `{...}` slice.
+ */
+function* extractJsonCandidates(text: string): IterableIterator<string> {
+    const trimmed = text.trim();
+    yield trimmed;
+
+    const tripleFence = trimmed.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
+    if (tripleFence?.[1]) yield tripleFence[1].trim();
+
+    // Single-backtick wrap: `{"shouldDeliver":true,...}`
+    const singleBacktick = trimmed.match(/^`(.+)`$/s);
+    if (singleBacktick?.[1]) yield singleBacktick[1].trim();
+
+    // Fallback: greedy match of the outermost {...} so prose preambles
+    // ("Here's the JSON: { ... }") still parse.
+    const firstBrace = trimmed.indexOf('{');
+    const lastBrace = trimmed.lastIndexOf('}');
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+        yield trimmed.slice(firstBrace, lastBrace + 1);
+    }
+}
+
+/**
+ * Try parsing one candidate as either the modern or legacy shape and
+ * return a `ConditionalResponse` if it works.
+ */
+function tryParseEither(jsonText: string): ConditionalResponse | null {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(jsonText);
+    } catch {
+        return null;
+    }
+    if (!parsed || typeof parsed !== 'object') return null;
+    const obj = parsed as Record<string, unknown>;
+
+    // Modern shape: {shouldDeliver, message?, reason?, topics?}
+    if (typeof obj.shouldDeliver === 'boolean') {
+        const reason = typeof obj.reason === 'string' ? obj.reason : '';
+        const message = typeof obj.message === 'string' ? obj.message : undefined;
+        return obj.shouldDeliver
+            ? { status: 'promote', reason, ...(message !== undefined ? { content: message } : {}) }
+            : { status: 'suppress', reason };
+    }
+
+    // Legacy shape: {status: 'promote'|'suppress', reason, content?}
+    if (obj.status === 'promote' || obj.status === 'suppress') {
+        const reason = typeof obj.reason === 'string' ? obj.reason : '';
+        const content = typeof obj.content === 'string' ? obj.content : undefined;
+        return content !== undefined
+            ? { status: obj.status, reason, content }
+            : { status: obj.status, reason };
+    }
+
     return null;
 }
