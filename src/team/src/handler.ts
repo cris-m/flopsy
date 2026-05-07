@@ -521,6 +521,11 @@ export class TeamHandler implements AgentHandler {
                 { threadId, signal: callbacks.signal, configurable },
             );
 
+            // Snapshot pre-turn token totals so we can compute the per-turn delta.
+            // tokenCounter accumulates cumulatively per threadId; we want just this turn.
+            const tokensBefore = this.tokens.getTotals(threadId)
+                ?? { input: 0, output: 0, reasoning: 0, cached: 0, calls: 0 };
+
             for await (const event of stream) {
                 if (event.type === 'message-chunk') {
                     const c = (event as ChunkEvent).chunk;
@@ -586,9 +591,21 @@ export class TeamHandler implements AgentHandler {
                     ? `${baseReply}\n\n_(I stopped after ${toolStepCount ?? 'too many'} tool calls — say "continue" if you want me to keep going.)_`
                     : baseReply;
 
-            const usage = result.tokenUsage as unknown as
-                | { promptTokens: number; completionTokens: number }
+            // Compute the turn's delta from the tokenCounter interceptor's
+            // cumulative totals. Falls back to whatever the graph state happens
+            // to expose, which is currently always undefined.
+            const tokensAfter = this.tokens.getTotals(threadId)
+                ?? { input: 0, output: 0, reasoning: 0, cached: 0, calls: 0 };
+            const turnDelta = {
+                promptTokens: Math.max(0, tokensAfter.input - tokensBefore.input),
+                completionTokens: Math.max(0, tokensAfter.output - tokensBefore.output),
+                reasoningTokens: Math.max(0, tokensAfter.reasoning - tokensBefore.reasoning),
+                cachedTokens: Math.max(0, tokensAfter.cached - tokensBefore.cached),
+            };
+            const stateUsage = result.tokenUsage as unknown as
+                | { promptTokens: number; completionTokens: number; reasoningTokens?: number; cachedTokens?: number }
                 | undefined;
+            const usage = stateUsage ?? (turnDelta.promptTokens + turnDelta.completionTokens > 0 ? turnDelta : undefined);
 
             if (reply && reply.trim().length > 0) {
                 try {
@@ -622,7 +639,12 @@ export class TeamHandler implements AgentHandler {
                 reply,
                 didSendViaTool: false,
                 tokenUsage: usage
-                    ? { input: usage.promptTokens, output: usage.completionTokens }
+                    ? {
+                        input: usage.promptTokens,
+                        output: usage.completionTokens,
+                        ...(usage.reasoningTokens ? { reasoning: usage.reasoningTokens } : {}),
+                        ...(usage.cachedTokens ? { cached: usage.cachedTokens } : {}),
+                    }
                     : undefined,
             };
         } catch (err) {

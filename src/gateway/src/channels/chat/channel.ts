@@ -10,10 +10,19 @@ export type ChatWsEvent =
     | { type: 'ready'; threadId: string; model?: string }
     | { type: 'chunk'; chunk: AgentChunk }
     | { type: 'task'; event: 'start' | 'progress' | 'complete' | 'error'; taskId: string; description?: string; result?: string; error?: string }
-    | { type: 'done'; text: string | null }
+    | { type: 'done'; text: string | null; usage?: { input: number; output: number; reasoning?: number; cached?: number; contextTokens?: number; contextLimit?: number } }
     | { type: 'error'; message: string };
 
 export type ChatSendFn = (event: ChatWsEvent) => void;
+
+const WS_OPEN = 1;
+
+export class ChatPeerUnavailableError extends Error {
+    constructor(public readonly peerId: string, public readonly reason: 'no-session' | 'ws-closed') {
+        super(`chat peer "${peerId}" unavailable: ${reason}`);
+        this.name = 'ChatPeerUnavailableError';
+    }
+}
 
 /** First-class channel for the `flopsy chat` CLI TUI. */
 export class ChatChannel extends BaseChannel {
@@ -21,6 +30,14 @@ export class ChatChannel extends BaseChannel {
     readonly authType = 'none' as const;
 
     private readonly peers = new Map<string, { ws: WebSocket; send: ChatSendFn }>();
+
+    /** Per-peer token usage — set by channel-worker after agent turn, flushed on next done. */
+    private readonly pendingUsage = new Map<string, { input: number; output: number; reasoning?: number; cached?: number; contextTokens?: number; contextLimit?: number }>();
+
+    /** Store token + context usage for a peer to be sent with the next done event. */
+    setPeerUsage(peerId: string, usage: { input: number; output: number; reasoning?: number; cached?: number; contextTokens?: number; contextLimit?: number }): void {
+        this.pendingUsage.set(peerId, usage);
+    }
 
     /** Returns the active main-agent model name, when known. */
     getMainModel: () => string | undefined = () => undefined;
@@ -40,9 +57,25 @@ export class ChatChannel extends BaseChannel {
 
     async send(message: OutboundMessage): Promise<string> {
         const session = this.peers.get(message.peer.id);
-        if (!session) return '';
-        session.send({ type: 'done', text: message.body ?? null });
-        return '';
+        if (!session) {
+            this.log.warn(
+                { peerId: message.peer.id, bodyLen: (message.body ?? '').length },
+                'chat send: peer has no live WS session — dropping reply',
+            );
+            throw new ChatPeerUnavailableError(message.peer.id, 'no-session');
+        }
+        if (session.ws.readyState !== WS_OPEN) {
+            this.peers.delete(message.peer.id);
+            this.log.warn(
+                { peerId: message.peer.id, readyState: session.ws.readyState, bodyLen: (message.body ?? '').length },
+                'chat send: WS not OPEN — dropping reply and unregistering peer',
+            );
+            throw new ChatPeerUnavailableError(message.peer.id, 'ws-closed');
+        }
+        const usage = this.pendingUsage.get(message.peer.id);
+        this.pendingUsage.delete(message.peer.id);
+        session.send({ type: 'done', text: message.body ?? null, ...(usage ? { usage } : {}) });
+        return `ws:${message.peer.id}`;
     }
 
     async sendTyping(_peer: Peer): Promise<void> {}
@@ -63,9 +96,19 @@ export class ChatChannel extends BaseChannel {
         void this.emit('onMessage', message);
     }
 
+    // Chunks are best-effort — final send({type:'done', ...}) carries the full text.
+    // Never evict the peer here: a transient non-OPEN state (e.g. mid-reconnect)
+    // would kill the peer registration so the final 'done' delivery also fails.
     forwardChunk(peer: Peer, chunk: AgentChunk): void {
         const session = this.peers.get(peer.id);
-        if (!session) return;
+        if (!session) {
+            this.log.debug({ peerId: peer.id }, 'chat forwardChunk: no session — chunk dropped');
+            return;
+        }
+        if (session.ws.readyState !== WS_OPEN) {
+            this.log.debug({ peerId: peer.id, readyState: session.ws.readyState }, 'chat forwardChunk: WS not OPEN — chunk dropped');
+            return;
+        }
         session.send({ type: 'chunk', chunk });
     }
 
@@ -74,7 +117,14 @@ export class ChatChannel extends BaseChannel {
         event: { event: 'start' | 'progress' | 'complete' | 'error'; taskId: string; description?: string; result?: string; error?: string },
     ): void {
         const session = this.peers.get(peer.id);
-        if (!session) return;
+        if (!session) {
+            this.log.debug({ peerId: peer.id, taskId: event.taskId }, 'chat forwardTaskEvent: no session — event dropped');
+            return;
+        }
+        if (session.ws.readyState !== WS_OPEN) {
+            this.log.debug({ peerId: peer.id, taskId: event.taskId, readyState: session.ws.readyState }, 'chat forwardTaskEvent: WS not OPEN — event dropped');
+            return;
+        }
         session.send({ type: 'task', ...event });
     }
 }

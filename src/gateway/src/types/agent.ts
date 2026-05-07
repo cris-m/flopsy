@@ -22,6 +22,13 @@ export interface ChannelEvent {
      *   silent      — no agent turn (side-effect only)
      */
     readonly deliveryMode?: 'always' | 'conditional' | 'silent';
+    /**
+     * Set for internal worker tasks (spawn_background_task). When present,
+     * the completion is delivered as a <task-notification> XML block so the
+     * coordinator agent can match it to the spawn call. Absent for external
+     * webhook events, which use <untrusted-data> wrapping instead.
+     */
+    readonly workerName?: string;
 }
 
 export interface BackgroundTask {
@@ -151,7 +158,7 @@ export type AgentChunk =
 export interface AgentResult {
     readonly reply: string | null;
     readonly didSendViaTool: boolean;
-    readonly tokenUsage?: { readonly input: number; readonly output: number };
+    readonly tokenUsage?: { readonly input: number; readonly output: number; readonly reasoning?: number; readonly cached?: number };
 }
 
 export interface InboundMedia {

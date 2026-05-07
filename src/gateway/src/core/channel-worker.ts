@@ -807,7 +807,7 @@ export class ChannelWorker {
                 const contextTokens = result.tokenUsage.input;
                 const contextLimit = 0;
                 const c = this.channel as unknown as {
-                    setPeerUsage?: (id: string, u: { input: number; output: number; contextTokens?: number; contextLimit?: number }) => void;
+                    setPeerUsage?: (id: string, u: { input: number; output: number; reasoning?: number; cached?: number; contextTokens?: number; contextLimit?: number }) => void;
                 };
                 if (typeof c.setPeerUsage === 'function') {
                     c.setPeerUsage(peer.id, {
