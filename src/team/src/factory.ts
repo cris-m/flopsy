@@ -43,7 +43,7 @@ import type { LearningStore } from './harness';
 import { SkillUsageStore } from './harness/review';
 import type { PersonalityRegistry } from './personalities';
 import { resolvePersonality } from './personalities';
-import { compactor } from './compactor';
+import { compactor } from 'flopsygraph';
 import { resolveToolsets } from './toolsets';
 import { askUserTool } from './tools/ask-user';
 import { connectServiceTool } from './tools/connect-service';
@@ -310,10 +310,18 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
     }
 
     // Proactive threads use 64K so compaction fires before fire-history accumulation hits 128K.
+    // 80% of the budget triggers compaction (matching the previous behaviour).
+    const compactionTokenThreshold = opts.isProactive ? 51_200 : 102_400;
     interceptors.push(
         compactor({
-            summaryModel: opts.model,
-            contextWindowTokens: opts.isProactive ? 64_000 : 128_000,
+            tokenThreshold: compactionTokenThreshold,
+            summarize: async (msgs) => {
+                const res = await opts.model.invoke([
+                    { role: 'system', content: 'Summarize this conversation concisely while preserving key facts, decisions, and the user\'s most recent ask. The summary will replace older turns to free context window.' },
+                    ...msgs,
+                ]);
+                return typeof res.content === 'string' ? res.content : '';
+            },
         }),
     );
 
