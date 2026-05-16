@@ -370,11 +370,21 @@ describe('JobExecutor — semantic dedup (recordDelivery + findSimilar)', () => 
     beforeEach(() => (h = makeHarness()));
 
     it('suppresses a delivery whose embedding is too similar to a recent one', async () => {
-        // Embedder returns the same vector twice → identical → similarity 1.0.
+        // Dedup runs under `conditional` mode (and any other non-`always`
+        // mode) — `always` deliveries are an explicit contract that fires
+        // on every tick (executor.ts:449). Use conditional + a parseable
+        // structured response so the agent's "shouldDeliver:true" decision
+        // reaches the dedup check.
         const exec = new JobExecutor(
             (m, o) => {
                 h.agentCalls.push({ message: m, threadId: o?.threadId });
-                return Promise.resolve({ response: 'duplicate body' });
+                return Promise.resolve({
+                    response: JSON.stringify({
+                        shouldDeliver: true,
+                        message: 'duplicate body',
+                        reason: 'test',
+                    }),
+                });
             },
             async (id) => {
                 h.cleanups.push(id);
@@ -397,8 +407,8 @@ describe('JobExecutor — semantic dedup (recordDelivery + findSimilar)', () => 
             },
         );
 
-        const first = await exec.execute(makeJob({ id: 'sim-1' }));
-        const second = await exec.execute(makeJob({ id: 'sim-2' }));
+        const first = await exec.execute(makeJob({ id: 'sim-1', deliveryMode: 'conditional' }));
+        const second = await exec.execute(makeJob({ id: 'sim-2', deliveryMode: 'conditional' }));
 
         expect(first.action).toBe('delivered');
         expect(second.action).toBe('suppressed');

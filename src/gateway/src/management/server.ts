@@ -1,14 +1,29 @@
 /**
  * Read-only management HTTP server bound to 127.0.0.1 only. Auth via
- * `FLOPSY_MGMT_TOKEN`; unset = accept any loopback request.
+ * `FLOPSY_MGMT_TOKEN` env or <FLOPSY_HOME>/mgmt-token file
+ * (auto-generated on first gateway boot). Unauthenticated requests get 401.
  */
 
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { createLogger } from '@flopsy/shared';
+import { sanitizeErrorHint } from '@gateway/core/security';
 import type { ChatHandler } from './chat-handler';
 
-const log = createLogger('mgmt-server');
+const log = createLogger('management-server');
+
+const MAX_WINDOW_MS = 30 * 86_400_000;
+
+function safeErrorBody(err: unknown): { error: string } {
+    const raw = err instanceof Error ? err.message : String(err);
+    return { error: sanitizeErrorHint(raw) ?? 'internal-error' };
+}
+
+/** Fire a synthetic event so an operator can verify a hook works without
+ *  waiting for the natural event to occur. */
+export interface HooksMgmtHandlers {
+    test(event: string, payload: Record<string, unknown>): { ok: boolean; matched: number; message?: string };
+}
 
 /** Unset → schedule routes return 501. */
 export interface ScheduleMgmtHandlers {
@@ -17,16 +32,22 @@ export interface ScheduleMgmtHandlers {
     ): Promise<{ ok: true; id: string; message: string } | { ok: false; error: string }>;
     remove(id: string): { ok: boolean; message?: string };
     setEnabled(id: string, enabled: boolean): { ok: boolean; message?: string };
+    /** REPLACE semantics — caller provides the full new array. */
+    setSkills(id: string, skills: string[]): { ok: boolean; message?: string };
     list(): Array<Record<string, unknown>>;
+    trigger(id: string): Promise<{ ok: boolean; message?: string }>;
+    /** Fire every enabled schedule of a kind right now. Returns the dispatched ids. */
+    tick(kind: 'cron' | 'heartbeat'): { ok: boolean; dispatched: string[] };
 }
 
-export interface MgmtServerOptions {
+export interface ManagementServerOptions {
     readonly host?: string;
     readonly port: number;
     readonly token?: string;
     readonly snapshotFn: () => unknown;
     readonly pingFn?: () => Record<string, unknown>;
     readonly scheduleHandlers?: ScheduleMgmtHandlers;
+    readonly hooksHandlers?: HooksMgmtHandlers;
     readonly tasksFn?: (query: URLSearchParams) => unknown;
     readonly dndHandlers?: {
         status(): Promise<unknown>;
@@ -41,12 +62,12 @@ export interface MgmtServerOptions {
     readonly chatHandler?: ChatHandler;
 }
 
-export class MgmtServer {
+export class ManagementServer {
     private server: Server | null = null;
-    private readonly opts: MgmtServerOptions;
+    private readonly opts: ManagementServerOptions;
     private startedAt = Date.now();
 
-    constructor(opts: MgmtServerOptions) {
+    constructor(opts: ManagementServerOptions) {
         this.opts = opts;
     }
 
@@ -55,10 +76,10 @@ export class MgmtServer {
         this.startedAt = Date.now();
         this.server = createServer((req, res) => {
             this.onRequest(req, res).catch((err) => {
-                log.error({ err }, 'mgmt request handler threw');
+                log.error({ err }, 'management request handler threw');
                 if (!res.headersSent) {
                     this.reply(res, 500, {
-                        error: err instanceof Error ? err.message : String(err),
+                        ...safeErrorBody(err),
                     });
                 }
             });
@@ -73,7 +94,11 @@ export class MgmtServer {
             this.server!.once('error', reject);
             this.server!.listen(port, host, () => resolve());
         });
-        log.info({ host, port, auth: this.opts.token ? 'bearer' : 'open', chat: !!this.opts.chatHandler }, 'mgmt server listening');
+        if (this.opts.token) {
+            log.info({ host, port, auth: 'bearer', chat: !!this.opts.chatHandler }, 'management server listening');
+        } else {
+            log.warn({ host, port, chat: !!this.opts.chatHandler }, 'management server listening WITHOUT auth — set FLOPSY_MGMT_TOKEN in production');
+        }
     }
 
     async stop(): Promise<void> {
@@ -84,7 +109,7 @@ export class MgmtServer {
 
     private async onRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
         // Bearer token check — when FLOPSY_MGMT_TOKEN is set, require it
-        // on every non-ping request. Ping stays open so `flopsy mgmt
+        // on every non-ping request. Ping stays open so `flopsy management
         // ping` works before the user sets a token.
         let path: string;
         let query: URLSearchParams;
@@ -96,14 +121,25 @@ export class MgmtServer {
             return this.reply(res, 400, { error: 'bad-request' });
         }
 
-        if (this.opts.token && path !== '/mgmt/ping') {
+        // `/ping` is the one unauthenticated route — used by `flopsy doctor`
+        // and similar liveness probes that shouldn't need to ship a token.
+        // Everything else (including read-only `/status` and `/snapshot`)
+        // requires a valid bearer. The token is auto-generated by
+        // resolveOrCreateMgmtToken() at startup so this is never "fails open".
+        if (path !== '/management/ping') {
+            if (!this.opts.token) {
+                // Defensive: opts.token should always be set now, but a
+                // future caller may pass undefined explicitly. Treat that
+                // as misconfiguration, not as "open API".
+                return this.reply(res, 503, { error: 'mgmt token not configured' });
+            }
             const auth = req.headers['authorization'] ?? '';
             if (!isValidBearer(auth, this.opts.token)) {
                 return this.reply(res, 401, { error: 'unauthorized' });
             }
         }
 
-        if (req.method === 'GET' && path === '/mgmt/ping') {
+        if (req.method === 'GET' && path === '/management/ping') {
             return this.reply(
                 res,
                 200,
@@ -113,23 +149,23 @@ export class MgmtServer {
             );
         }
 
-        if (req.method === 'GET' && path === '/mgmt/status') {
+        if (req.method === 'GET' && path === '/management/status') {
             try {
                 return this.reply(res, 200, this.opts.snapshotFn());
             } catch (err) {
                 return this.reply(res, 500, {
-                    error: err instanceof Error ? err.message : String(err),
+                    ...safeErrorBody(err),
                 });
             }
         }
 
         const dnd = this.opts.dndHandlers;
-        if (dnd && path.startsWith('/mgmt/dnd')) {
+        if (dnd && path.startsWith('/management/dnd')) {
             try {
-                if (req.method === 'GET' && path === '/mgmt/dnd') {
+                if (req.method === 'GET' && path === '/management/dnd') {
                     return this.reply(res, 200, await dnd.status());
                 }
-                if (req.method === 'POST' && path === '/mgmt/dnd/on') {
+                if (req.method === 'POST' && path === '/management/dnd/on') {
                     const body = (await readJsonBody(req)) as {
                         durationMs?: number;
                         reason?: string;
@@ -139,11 +175,11 @@ export class MgmtServer {
                     }
                     return this.reply(res, 200, await dnd.setDnd(body as { durationMs: number; reason?: string }));
                 }
-                if (req.method === 'POST' && path === '/mgmt/dnd/off') {
+                if (req.method === 'POST' && path === '/management/dnd/off') {
                     await dnd.clearDnd();
                     return this.reply(res, 200, { ok: true, message: 'DND cleared' });
                 }
-                if (req.method === 'POST' && path === '/mgmt/dnd/quiet') {
+                if (req.method === 'POST' && path === '/management/dnd/quiet') {
                     const body = (await readJsonBody(req)) as { untilMs?: number };
                     if (typeof body.untilMs !== 'number' || body.untilMs <= Date.now()) {
                         return this.reply(res, 400, { error: 'untilMs must be a future epoch-ms' });
@@ -152,19 +188,22 @@ export class MgmtServer {
                 }
             } catch (err) {
                 return this.reply(res, 500, {
-                    error: err instanceof Error ? err.message : String(err),
+                    ...safeErrorBody(err),
                 });
             }
             return this.reply(res, 405, { error: 'method not allowed', path });
         }
 
         const proactive = this.opts.proactiveStatsHandlers;
-        if (proactive && path.startsWith('/mgmt/proactive')) {
-            if (req.method === 'GET' && path === '/mgmt/proactive/stats') {
+        if (proactive && path.startsWith('/management/proactive')) {
+            if (req.method === 'GET' && path === '/management/proactive/stats') {
                 const windowMs = Number(query.get('windowMs') ?? 86_400_000);
+                if (!Number.isFinite(windowMs) || windowMs <= 0 || windowMs > MAX_WINDOW_MS) {
+                    return this.reply(res, 400, { error: 'windowMs out of range' });
+                }
                 return this.reply(res, 200, await proactive.getStats(windowMs));
             }
-            const firesMatch = path.match(/^\/mgmt\/proactive\/fires\/([^/]+)$/);
+            const firesMatch = path.match(/^\/management\/proactive\/fires\/([^/]+)$/);
             if (req.method === 'GET' && firesMatch) {
                 const id = decodeURIComponent(firesMatch[1]!);
                 const limit = Number(query.get('limit') ?? 20);
@@ -173,7 +212,7 @@ export class MgmtServer {
             return this.reply(res, 404, { error: 'not found', path });
         }
 
-        if (req.method === 'GET' && path === '/mgmt/tasks') {
+        if (req.method === 'GET' && path === '/management/tasks') {
             if (!this.opts.tasksFn) {
                 return this.reply(res, 501, { error: 'tasks endpoint not wired' });
             }
@@ -181,13 +220,31 @@ export class MgmtServer {
                 return this.reply(res, 200, this.opts.tasksFn(query));
             } catch (err) {
                 return this.reply(res, 500, {
-                    error: err instanceof Error ? err.message : String(err),
+                    ...safeErrorBody(err),
                 });
             }
         }
 
         const handlers = this.opts.scheduleHandlers;
-        if (path === '/mgmt/schedule' || path.startsWith('/mgmt/schedule/')) {
+        // POST /management/hooks/test — synthetic event firing for the
+        if (req.method === 'POST' && path === '/management/hooks/test') {
+            const handlers = this.opts.hooksHandlers;
+            if (!handlers) {
+                return this.reply(res, 501, { error: 'hooks handlers not wired' });
+            }
+            const body = await readJsonBody(req).catch((err: unknown) => {
+                this.reply(res, 400, { ...safeErrorBody(err) });
+                return null;
+            });
+            if (body === null) return;
+            const { event, payload } = (body as { event?: string; payload?: Record<string, unknown> });
+            if (!event || typeof event !== 'string') {
+                return this.reply(res, 400, { error: 'body must include `event` (string)' });
+            }
+            const result = handlers.test(event, payload ?? {});
+            return this.reply(res, 200, result);
+        }
+        if (path === '/management/schedule' || path.startsWith('/management/schedule/')) {
             if (!handlers) {
                 return this.reply(res, 501, { error: 'schedule handlers not wired' });
             }
@@ -203,13 +260,13 @@ export class MgmtServer {
         path: string,
         h: ScheduleMgmtHandlers,
     ): Promise<void> {
-        if (req.method === 'GET' && path === '/mgmt/schedule') {
+        if (req.method === 'GET' && path === '/management/schedule') {
             return this.reply(res, 200, { schedules: h.list() });
         }
-        if (req.method === 'POST' && path === '/mgmt/schedule') {
+        if (req.method === 'POST' && path === '/management/schedule') {
             const body = await readJsonBody(req).catch((err: unknown) => {
                 this.reply(res, 400, {
-                    error: err instanceof Error ? err.message : String(err),
+                    ...safeErrorBody(err),
                 });
                 return null;
             });
@@ -219,7 +276,21 @@ export class MgmtServer {
                 ? this.reply(res, 201, result)
                 : this.reply(res, 400, result);
         }
-        const match = path.match(/^\/mgmt\/schedule\/([^/]+)(?:\/(disable|enable))?$/);
+        // `/tick` is a kind-scoped admin: trigger every enabled schedule of
+        // the given kind. Lives at a sibling path (not /schedule/<id>/...)
+        // because there's no id involved. The kind is read from the query
+        // string (re-parsed here because the outer handler doesn't pass
+        // its parsed URL down — keeps this route self-contained).
+        if (req.method === 'POST' && path === '/management/schedule/tick') {
+            const search = req.url?.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
+            const kind = new URLSearchParams(search).get('kind');
+            if (kind !== 'cron' && kind !== 'heartbeat') {
+                return this.reply(res, 400, { error: 'kind must be "cron" or "heartbeat"' });
+            }
+            const result = h.tick(kind);
+            return this.reply(res, 200, result);
+        }
+        const match = path.match(/^\/management\/schedule\/([^/]+)(?:\/(disable|enable|trigger|skills))?$/);
         if (match) {
             const id = decodeURIComponent(match[1]!);
             const action = match[2];
@@ -231,6 +302,37 @@ export class MgmtServer {
             }
             if (req.method === 'POST' && (action === 'disable' || action === 'enable')) {
                 const result = h.setEnabled(id, action === 'enable');
+                return result.ok
+                    ? this.reply(res, 200, result)
+                    : this.reply(res, 404, result);
+            }
+            if (req.method === 'POST' && action === 'trigger') {
+                const result = await h.trigger(id);
+                return result.ok
+                    ? this.reply(res, 200, result)
+                    : this.reply(res, 404, result);
+            }
+            if (req.method === 'POST' && action === 'skills') {
+                // Body: `{ skills: ["foo", "bar"] }` — REPLACE semantics.
+                // Client decides add/remove/clear; we just take the new list.
+                const body = await readJsonBody(req).catch((err: unknown) => {
+                    this.reply(res, 400, {
+                        ...safeErrorBody(err),
+                    });
+                    return null;
+                });
+                if (body === null) return;
+                const raw = (body as { skills?: unknown }).skills;
+                if (!Array.isArray(raw)) {
+                    return this.reply(res, 400, {
+                        error: 'body must be { skills: string[] }',
+                    });
+                }
+                const cleaned = raw
+                    .filter((v): v is string => typeof v === 'string')
+                    .map((v) => v.trim())
+                    .filter((v) => v.length > 0);
+                const result = h.setSkills(id, cleaned);
                 return result.ok
                     ? this.reply(res, 200, result)
                     : this.reply(res, 404, result);

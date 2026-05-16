@@ -14,6 +14,7 @@ import type {
     BaseChannelConfig,
 } from '@gateway/types';
 import { getPairingFacade } from '@gateway/commands/pairing-facade';
+import { sanitizeInbound } from './security';
 
 const RECONNECT_BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 30_000, 60_000];
 const MAX_RECONNECT_ATTEMPTS = 6;
@@ -79,6 +80,41 @@ export abstract class BaseChannel implements Channel {
     ): ReturnType<ChannelEvents[K]> | undefined {
         const handler = this.handlers[event];
         if (!handler) return undefined;
+        // Inbound messages are sanitized centrally here so every channel
+        // adapter gets the benefit without per-adapter wiring. `sanitizeInbound`
+        // strips null bytes and clamps body/peer/sender lengths — defense
+        // against an adversarial inbound (a Telegram user with a 1MB name,
+        // a webhook with a NUL-injected id, etc.) reaching the router and
+        // downstream agent. The function preserves the Message shape so
+        // subclasses see identical types.
+        if (event === 'onMessage' && args[0] && typeof args[0] === 'object') {
+            // Two casts via `unknown` because the args tuple is typed as
+            // the union `Error | Message | InteractionCallback`; we narrowed
+            // to "object" but TS still wants explicit erasure.
+            const raw = args[0] as unknown as {
+                id?: string;
+                channelName?: string;
+                body?: string;
+                peer?: { id: string; type: 'user' | 'group' | 'channel'; name?: string };
+                sender?: { id: string; name?: string };
+                [k: string]: unknown;
+            };
+            if (typeof raw.id === 'string' && typeof raw.channelName === 'string' && typeof raw.body === 'string') {
+                const sanitized = sanitizeInbound({
+                    id: raw.id,
+                    channelName: raw.channelName,
+                    body: raw.body,
+                    ...(raw.peer ? { peer: raw.peer } : {}),
+                    ...(raw.sender ? { sender: raw.sender } : {}),
+                });
+                // Merge sanitized fields back into the original object so
+                // any adapter-specific extras (media, raw provider payload,
+                // platform-native ids) survive. We mutate args via the
+                // generic `unknown[]` view so TS doesn't complain about
+                // the variadic-args narrowing.
+                (args as unknown as unknown[])[0] = { ...raw, ...sanitized };
+            }
+        }
         return (handler as (...a: unknown[]) => ReturnType<ChannelEvents[K]>)(...args);
     }
 

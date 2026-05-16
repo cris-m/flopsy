@@ -1,6 +1,7 @@
 import { createLogger } from '@flopsy/shared';
 import { z } from 'zod';
 import { structuredLLM, type BaseChatModel } from 'flopsygraph';
+import { compactionEvents, type CompactionEventWithAgent } from '@flopsy/team';
 
 import type {
     Channel,
@@ -18,6 +19,7 @@ import { EventQueue } from './event-queue';
 import { globalMessageQueue } from './global-message-queue';
 import { MessageQueue, coalesce, type CoalescedTurn } from './message-queue';
 import { isSafeIdentifier, sanitize } from './security';
+import { DEFAULT_PRESENCE_EMOJIS } from './presence-emojis';
 
 const webhookDecisionSchema = z.object({
     shouldDeliver: z.boolean(),
@@ -41,9 +43,8 @@ interface CategorizedError {
     userMessage: string;
 }
 
-// Order matters: more specific matches first.
-function categorizeError(err: unknown, timeoutMs: number): CategorizedError {
-    // Our own timeout signal (rejectAfterTimeout).
+// `elapsedMs` distinguishes inner-fallback timeouts from the outer envelope value.
+function categorizeError(err: unknown, timeoutMs: number, elapsedMs?: number): CategorizedError {
     if (err instanceof Error && err.message === 'Agent invocation timed out') {
         const seconds = Math.round(timeoutMs / 1000);
         return {
@@ -51,17 +52,16 @@ function categorizeError(err: unknown, timeoutMs: number): CategorizedError {
             userMessage: `I ran out of time after ${seconds}s. Try again or send "/cancel" if I get stuck.`,
         };
     }
-    // DOMException TimeoutError — AbortController.abort() on some runtimes
-    // produces a DOMException whose name is "TimeoutError" (code 23 / TIMEOUT_ERR).
-    // DOMException does NOT extend Error, so instanceof Error is false.
+    // DOMException TimeoutError from inner AbortSignal.timeout() — report actual elapsed.
     if (
         (typeof DOMException !== 'undefined' && err instanceof DOMException && err.name === 'TimeoutError') ||
         (err != null && typeof err === 'object' && (err as Record<string, unknown>).name === 'TimeoutError' && (err as Record<string, unknown>).code === 23)
     ) {
-        const seconds = Math.round(timeoutMs / 1000);
+        const reportMs = elapsedMs && elapsedMs > 0 && elapsedMs < timeoutMs ? elapsedMs : timeoutMs;
+        const seconds = Math.round(reportMs / 1000);
         return {
             kind: 'timeout',
-            userMessage: `I ran out of time after ${seconds}s. Try again or send "/cancel" if I get stuck.`,
+            userMessage: `Took too long (${seconds}s) — provider timed out. Try again or send "/cancel".`,
         };
     }
     const status = (err as { status?: unknown })?.status;
@@ -79,7 +79,16 @@ function categorizeError(err: unknown, timeoutMs: number): CategorizedError {
             userMessage: 'Looks like an auth/credential issue. Try /doctor or re-authorize the affected service.',
         };
     }
-    if (lower.includes('econnreset') || lower.includes('econnrefused') || lower.includes('etimedout') || lower.includes('enotfound') || lower.includes('fetch failed') || lower.includes('socket hang up')) {
+    if (
+        lower.includes('econnreset') ||
+        lower.includes('econnrefused') ||
+        lower.includes('etimedout') ||
+        lower.includes('enotfound') ||
+        lower.includes('fetch failed') ||
+        lower.includes('socket hang up') ||
+        lower.includes('terminated') ||
+        lower.includes('other side closed')
+    ) {
         return {
             kind: 'network',
             userMessage: 'Network hiccup talking to the model. Try again.',
@@ -91,7 +100,6 @@ function categorizeError(err: unknown, timeoutMs: number): CategorizedError {
             userMessage: 'This conversation got too long for me to hold in one go. Try /new to start a fresh thread.',
         };
     }
-    // Surface a sanitized snippet so successive failures don't read identical.
     const hint = sanitizeErrorHint(msg);
     return {
         kind: 'unknown',
@@ -101,9 +109,7 @@ function categorizeError(err: unknown, timeoutMs: number): CategorizedError {
     };
 }
 
-// Strip credentials and absolute paths from raw error messages before
-// surfacing them in chat. LLM/MCP/tool errors often embed bearer tokens
-// or machine-layout-leaking paths.
+// Strip credentials and absolute paths before surfacing error messages in chat.
 function sanitizeErrorHint(msg: string): string | null {
     if (!msg) return null;
     let s = msg
@@ -122,6 +128,8 @@ const AGENT_TIMEOUT_MS = 600_000; // 10 min
 const BACKGROUND_TURN_TIMEOUT_MS = 900_000; // 15 min
 
 const STOP_TIMEOUT_MS = 5_000;
+/** Grace period for in-flight turns to finish before stop() aborts. */
+const DRAIN_TIMEOUT_MS = 10_000;
 const MAX_TASK_RESULT_LENGTH = 10_000;
 
 export class ChannelWorker {
@@ -158,6 +166,8 @@ export class ChannelWorker {
     private readonly agentTimeoutMs: number;
     private readonly backgroundTurnTimeoutMs: number;
     private readonly getGatewayStatus: ChannelWorkerConfig['getGatewayStatus'];
+    /** Running indicator emoji set by gateway.ackReact(); swapped for ✅/❌ on finish. */
+    private readonly ackEmoji: string | undefined;
     private structuredOutputModel: BaseChatModel | null;
 
     private running = false;
@@ -185,6 +195,7 @@ export class ChannelWorker {
         this.agentTimeoutMs = config.agentTimeoutMs ?? AGENT_TIMEOUT_MS;
         this.backgroundTurnTimeoutMs = config.backgroundTurnTimeoutMs ?? BACKGROUND_TURN_TIMEOUT_MS;
         this.getGatewayStatus = config.getGatewayStatus;
+        this.ackEmoji = config.ackEmoji;
         this.structuredOutputModel = config.structuredOutputModel
             ? (config.structuredOutputModel as BaseChatModel)
             : null;
@@ -223,6 +234,16 @@ export class ChannelWorker {
 
     get isRunning(): boolean {
         return this.running;
+    }
+
+    /** True when no turn is active and no messages or tasks are pending. */
+    get isIdle(): boolean {
+        return (
+            !this.turnActive &&
+            this.pending.length === 0 &&
+            this.msgQueue.size === 0 &&
+            this.taskMessageIds.size === 0
+        );
     }
 
     public lastActiveAt = 0;
@@ -278,8 +299,10 @@ export class ChannelWorker {
                 );
             }
         } else {
-            this.msgQueue.enqueue(text, incomingMedia, message.synthetic);
-            this.queuedGlobalIds.push(this.enqueueGlobal(text, 'next'));
+            // Only push global-id when msgQueue accepts; otherwise overflow leaves phantom ids.
+            if (this.msgQueue.enqueue(text, incomingMedia, message.synthetic)) {
+                this.queuedGlobalIds.push(this.enqueueGlobal(text, 'next'));
+            }
         }
     }
 
@@ -288,19 +311,12 @@ export class ChannelWorker {
         return globalMessageQueue.enqueue({ threadId: this.threadId, text, priority });
     }
 
-    /**
-     * Surface queue state to the user when a message arrives mid-turn.
-     * Reaction-based so it doesn't pollute the conversation with a
-     * "[Message queued]" send. Channels that don't support reactions
-     * silently no-op; the log line still fires for ops visibility.
-     */
+    /** Best-effort reaction signaling that a mid-turn message was queued. */
     private notifyQueued(message: Message): void {
-        // Best-effort. Reaction failures are not user-visible and are
-        // common (rate limits, message age limits on some channels).
         void this.channel.react({
             messageId: message.id,
             peer: message.peer,
-            emoji: '⏳',
+            emoji: DEFAULT_PRESENCE_EMOJIS.turnQueued,
         }).catch((err: unknown) => {
             this.log.debug(
                 { err, channel: this.channel.name, op: 'react:queued' },
@@ -331,7 +347,17 @@ export class ChannelWorker {
             });
 
             if (result) {
-                await this.sendReply(result.text, message.peer, message.id);
+                // sendReply failures must not block forwardToAgent enqueue.
+                let replySent = true;
+                try {
+                    await this.sendReply(result.text, message.peer, message.id);
+                } catch (sendErr) {
+                    replySent = false;
+                    this.log.warn(
+                        { command: parsed.name, err: sendErr instanceof Error ? sendErr.message : String(sendErr) },
+                        'slash-command reply send failed — proceeding with forwardToAgent anyway',
+                    );
+                }
                 if (result.forwardToAgent) {
                     this.currentPeer = message.peer;
                     this.currentSender = message.sender;
@@ -340,11 +366,12 @@ export class ChannelWorker {
                         if (this.pending.length < MAX_PENDING) {
                             this.pending.push(result.forwardToAgent);
                             this.pendingGlobalIds.push(this.enqueueGlobal(result.forwardToAgent, 'next'));
-                            this.notifyQueued(message);
+                            if (replySent) this.notifyQueued(message);
                         }
                     } else {
-                        this.msgQueue.enqueue(result.forwardToAgent, undefined, false);
-                        this.queuedGlobalIds.push(this.enqueueGlobal(result.forwardToAgent, 'next'));
+                        if (this.msgQueue.enqueue(result.forwardToAgent, undefined, false)) {
+                            this.queuedGlobalIds.push(this.enqueueGlobal(result.forwardToAgent, 'next'));
+                        }
                     }
                 }
                 return;
@@ -364,8 +391,9 @@ export class ChannelWorker {
                     this.notifyQueued(message);
                 }
             } else {
-                this.msgQueue.enqueue(message.body, message.media?.length ? message.media : undefined, message.synthetic);
-                this.queuedGlobalIds.push(this.enqueueGlobal(message.body, 'next'));
+                if (this.msgQueue.enqueue(message.body, message.media?.length ? message.media : undefined, message.synthetic)) {
+                    this.queuedGlobalIds.push(this.enqueueGlobal(message.body, 'next'));
+                }
             }
         } catch (err) {
             this.log.error(
@@ -398,11 +426,37 @@ export class ChannelWorker {
         if (this.running) return;
         this.running = true;
         this.loopPromise = this.loop();
+        this.subscribeToCompaction();
+    }
+
+    private compactionListener?: (e: CompactionEventWithAgent) => void;
+    private subscribeToCompaction(): void {
+        const c = this.channel as unknown as { notifyCompaction?: (peerId: string, event: CompactionEventWithAgent) => void };
+        if (typeof c.notifyCompaction !== 'function') return;
+        this.compactionListener = (event) => {
+            if (event.threadId !== this.threadId) return;
+            const peer = this.currentPeer;
+            if (!peer) return;
+            try { c.notifyCompaction!(peer.id, event); }
+            catch (err) { this.log.warn({ err: String(err) }, 'channel notifyCompaction threw'); }
+        };
+        compactionEvents.on('compaction', this.compactionListener);
     }
 
     async stop(): Promise<void> {
         this.log.debug({ channel: this.channel.name, threadId: this.threadId }, 'worker stopping');
         this.running = false;
+
+        // Wait DRAIN_TIMEOUT_MS for an in-flight turn to ship its reply before aborting.
+        // msgQueue is not drained — those messages would be dropped anyway after stop.
+        if (this.turnActive && this.loopPromise) {
+            this.log.info(
+                { channel: this.channel.name, threadId: this.threadId, drainMs: DRAIN_TIMEOUT_MS },
+                'worker stop: draining in-flight turn',
+            );
+            await Promise.race([this.loopPromise, sleep(DRAIN_TIMEOUT_MS)]);
+        }
+
         this.currentAbort?.abort();
         this.msgQueue.clear();
         this.eventQueue.clear();
@@ -414,6 +468,10 @@ export class ChannelWorker {
         this.cancelWait();
         this.stopTypingLoop();
         this.taskMessageIds.clear();
+        if (this.compactionListener) {
+            compactionEvents.off('compaction', this.compactionListener);
+            this.compactionListener = undefined;
+        }
         if (this.loopPromise) {
             await Promise.race([this.loopPromise, sleep(STOP_TIMEOUT_MS)]);
             this.loopPromise = null;
@@ -453,7 +511,6 @@ export class ChannelWorker {
 
                 if (!batch || batch.length === 0) continue;
 
-                // Remove the corresponding global-queue entries as we drain.
                 const consumed = this.queuedGlobalIds.splice(0, batch.length);
                 for (const id of consumed) globalMessageQueue.remove(id);
 
@@ -500,13 +557,59 @@ export class ChannelWorker {
 
         let didSendViaTool = false;
         const peer = this.currentPeer;
-        const replyTo = this.lastMessageId ?? undefined;
+        // reactTargetId — for emoji reactions (DM or group, always the latest message).
+        // replyTo       — quote-thread anchor on send; group-only by default.
+        const isGroup = peer ? (peer.type === 'group' || peer.type === 'channel') : false;
+        const reactTargetId = this.lastMessageId ?? undefined;
+        const replyTo = isGroup ? reactTargetId : undefined;
 
         if (!peer) {
             this.log.error({ channel: this.channel.name, threadId: this.threadId }, 'no peer for agent turn');
             this.turnActive = false;
             return;
         }
+
+        // Turn presence: place running emoji on start (or reuse ackReaction), swap
+        // for ✅/❌/🛑 on finish. Same target for DM and group.
+        const turnPresenceMessageId = reactTargetId;
+        const supportsReactions = (this.channel.capabilities ?? []).includes('reactions');
+        const runningEmoji = this.ackEmoji ?? DEFAULT_PRESENCE_EMOJIS.turnRunning;
+        const turnPresenceArmed = !!(supportsReactions && turnPresenceMessageId);
+        let armed = turnPresenceArmed;
+        // No ackEmoji configured: place ⏳ ourselves so user always sees a working indicator.
+        if (turnPresenceArmed && !this.ackEmoji) {
+            this.channel
+                .react({ messageId: turnPresenceMessageId, peer, emoji: runningEmoji })
+                .catch((err: unknown) => {
+                    this.log.debug(
+                        { err, channel: this.channel.name, op: 'react:turn-start' },
+                        'turn-start reaction failed (non-fatal)',
+                    );
+                });
+        }
+        // When the agent reacts during the turn, skip lifecycle swap — Telegram's
+        // single-slot reaction would clobber the agent's deliberate choice.
+        let agentReactedThisTurn = false;
+        const finishTurnPresence = (kind: 'ok' | 'error' | 'aborted'): void => {
+            if (!armed || !turnPresenceMessageId) return;
+            armed = false;
+            if (agentReactedThisTurn) return;
+            const finalEmoji =
+                kind === 'ok'      ? DEFAULT_PRESENCE_EMOJIS.turnOk      :
+                kind === 'aborted' ? DEFAULT_PRESENCE_EMOJIS.turnAborted :
+                                     DEFAULT_PRESENCE_EMOJIS.turnError;
+            this.channel
+                .react({ messageId: turnPresenceMessageId, peer, emoji: runningEmoji, remove: true })
+                .catch(() => { /* non-fatal; finalEmoji is what the user notices */ });
+            this.channel
+                .react({ messageId: turnPresenceMessageId, peer, emoji: finalEmoji })
+                .catch((err: unknown) => {
+                    this.log.debug(
+                        { err, channel: this.channel.name, emoji: finalEmoji, op: 'react:turn-end' },
+                        'turn-end reaction failed (non-fatal)',
+                    );
+                });
+        };
 
         this.log.debug(
             {
@@ -526,27 +629,110 @@ export class ChannelWorker {
         const streaming = this.channel.streaming;
         const useStreamPreview =
             !!streaming?.editBased && typeof this.channel.editMessage === 'function';
-        const editIntervalMs = streaming?.minEditIntervalMs ?? 1000;
+        const baseEditIntervalMs = streaming?.minEditIntervalMs ?? 1000;
+        // Exponential backoff on 429s (1s→2s→4s→10s); resets to base on success.
+        let currentEditIntervalMs = baseEditIntervalMs;
+        const MAX_EDIT_INTERVAL_MS = 10_000;
+        const MAX_FLOOD_STRIKES = 3;
+        // Edit fires when time gate OR buffer threshold passes — keeps edits/min bounded
+        // regardless of chunk shape. ~40 chars ≈ half a line of text.
+        const EDIT_BUFFER_THRESHOLD = 40;
+        let charsSinceLastEdit = 0;
+        let floodStrikes = 0;
+        // Circuit-breaker: after MAX_FLOOD_STRIKES 429s in a row, disable streaming
+        // preview for the turn and deliver the final reply as a fresh send.
+        let editsDisabledForTurn = false;
         let previewMessageId: string | null = null;
         let streamBuffer = '';
         let statusLine = '';
+        // Reasoning ('thinking') tokens accumulated separately from the answer.
+        let thinkingBuffer = '';
         let lastEditAt = 0;
         let lastSentPreview = '';
         let editInFlight: Promise<void> | null = null;
-        // Deferred trailing-flush timer. Set when a chunk arrives within the
-        // rate-limit window so we don't lose buffered text if the stream goes
-        // silent (e.g. a long tool call). Cleared on the next dirty chunk
-        // that flushes synchronously, and on turn cleanup.
+        // Trailing-flush timer: guards buffered text if the stream goes silent.
         let pendingFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+        // Reasoning lane: independent message edited in parallel with the answer.
+        // Throttled to REASONING_EDIT_THROTTLE_MS to stay under per-chat rate.
+        let reasoningMessageId: string | null = null;
+        let reasoningLastEditAt = 0;
+        let reasoningLastSent = '';
+        let reasoningEditInFlight: Promise<void> | null = null;
+        let reasoningPendingTimer: ReturnType<typeof setTimeout> | null = null;
+        const REASONING_EDIT_THROTTLE_MS = 3000;
+        const REASONING_MIN_LENGTH = 40;
+
+        const flushReasoning = async (force = false): Promise<void> => {
+            if (!this.channel.editMessage) return;
+            if (reasoningEditInFlight) return;
+
+            const content = thinkingBuffer.trim();
+            if (content.length < REASONING_MIN_LENGTH) return;
+
+            const body = `💭 Reasoning:\n${content}`;
+            if (body === reasoningLastSent) return;
+
+            const now = Date.now();
+            const sinceLastEdit = now - reasoningLastEditAt;
+            if (
+                !force
+                && reasoningMessageId !== null
+                && sinceLastEdit < REASONING_EDIT_THROTTLE_MS
+            ) {
+                if (reasoningPendingTimer === null) {
+                    const wait = REASONING_EDIT_THROTTLE_MS - sinceLastEdit;
+                    reasoningPendingTimer = setTimeout(() => {
+                        reasoningPendingTimer = null;
+                        void flushReasoning();
+                    }, wait);
+                }
+                return;
+            }
+
+            if (reasoningPendingTimer !== null) {
+                clearTimeout(reasoningPendingTimer);
+                reasoningPendingTimer = null;
+            }
+
+            reasoningLastEditAt = now;
+            reasoningEditInFlight = (async () => {
+                try {
+                    if (reasoningMessageId === null) {
+                        const id = await this.channel.send({ peer, body, replyTo });
+                        reasoningMessageId = id;
+                    } else {
+                        await this.channel.editMessage!(reasoningMessageId, peer, body);
+                    }
+                    reasoningLastSent = body;
+                } catch (err) {
+                    this.log.debug(
+                        {
+                            err,
+                            channel: this.channel.name,
+                            threadId: this.threadId,
+                            op: 'reasoning-lane:flush',
+                        },
+                        'reasoning lane edit failed (continuing)',
+                    );
+                }
+            })();
+
+            try { await reasoningEditInFlight; } finally { reasoningEditInFlight = null; }
+        };
 
         const composePreview = (): string => {
             const body = streamBuffer || '';
-            if (statusLine && body) return `${statusLine}\n\n${body} …`;
-            if (statusLine) return statusLine;
-            return body + ' …';
+            // Reasoning is intentionally excluded — per-token edits would flood
+            // Telegram's ~1/sec per-chat rate limit. Routed to a separate lane instead.
+            const parts: string[] = [];
+            if (statusLine) parts.push(statusLine);
+            if (body) parts.push(body + ' …');
+            return parts.length > 0 ? parts.join('\n\n') : ' …';
         };
 
         const flushPreviewEdit = async (): Promise<void> => {
+            if (editsDisabledForTurn) return;
             if (!previewMessageId || !this.channel.editMessage) return;
             const next = composePreview();
             // Telegram returns 400 "message is not modified" on no-op edits.
@@ -554,15 +740,53 @@ export class ChannelWorker {
             try {
                 await this.channel.editMessage(previewMessageId, peer, next);
                 lastSentPreview = next;
-                // Single source of truth for the rate-limit anchor — set
-                // here so deferred-flush timers and direct flushes both
-                // honour the editIntervalMs window correctly.
                 lastEditAt = Date.now();
+                charsSinceLastEdit = 0;
+                // Reset flood backoff on a healthy edit.
+                if (floodStrikes > 0) {
+                    floodStrikes = 0;
+                    currentEditIntervalMs = baseEditIntervalMs;
+                }
             } catch (err) {
                 // Race: two flushes pass equality before either updates lastSentPreview.
                 if (isMessageNotModifiedError(err)) {
                     lastSentPreview = next;
                     lastEditAt = Date.now();
+                    return;
+                }
+                // 429 backoff: exponential interval growth + 3-strike circuit breaker.
+                const retryAfterMs = extract429RetryAfterMs(err);
+                if (retryAfterMs !== undefined) {
+                    floodStrikes += 1;
+                    currentEditIntervalMs = Math.min(
+                        currentEditIntervalMs * 2,
+                        MAX_EDIT_INTERVAL_MS,
+                    );
+                    // Anchor next edit past cooldown + 250ms cushion for clock drift.
+                    lastEditAt = Date.now() - currentEditIntervalMs + retryAfterMs + 250;
+                    if (floodStrikes >= MAX_FLOOD_STRIKES) {
+                        editsDisabledForTurn = true;
+                        this.log.warn(
+                            {
+                                channel: this.channel.name,
+                                retryAfterMs,
+                                strikes: floodStrikes,
+                                op: 'streamPreview:circuit-open',
+                            },
+                            'streaming preview disabled for turn after consecutive flood-control hits — final reply will land as a fresh send',
+                        );
+                        return;
+                    }
+                    this.log.debug(
+                        {
+                            channel: this.channel.name,
+                            retryAfterMs,
+                            strikes: floodStrikes,
+                            backoffMs: currentEditIntervalMs,
+                            op: 'streamPreview:rate-limit',
+                        },
+                        'channel rate-limited streaming edit; backing off',
+                    );
                     return;
                 }
                 this.log.debug(
@@ -575,22 +799,14 @@ export class ChannelWorker {
         const ensurePreview = (): void => {
             if (previewMessageId || editInFlight) return;
             const initialBody = composePreview();
-            // Capture the buffer length at send time so we know whether
-            // any chunks accumulated during the async send and need an
-            // immediate post-send flush.
+            // Capture buffer length to detect chunks accumulated during the async send.
             const bufferAtSend = streamBuffer.length;
             editInFlight = this.channel
                 .send({ peer, body: initialBody, replyTo })
                 .then((id: string) => {
                     previewMessageId = id;
                     lastEditAt = Date.now();
-                    // Seed dedup cache so the first flush doesn't re-send
-                    // an unchanged body (Telegram "message is not modified").
                     lastSentPreview = initialBody;
-                    // If chunks arrived during the placeholder send, flush
-                    // them now — without this, every chunk during the send
-                    // hits `if (!previewMessageId)` and bails, leaving
-                    // buffered text invisible until the next dirty chunk.
                     if (streamBuffer.length > bufferAtSend) {
                         void flushPreviewEdit();
                     }
@@ -603,33 +819,39 @@ export class ChannelWorker {
                 });
         };
 
-        // System-role turns have no user message to reply to — skip the
-        // stream preview to avoid stray placeholders.
+        // System-role turns: no user message to reply to — skip stream preview.
         const editBasedChunkHandler = useStreamPreview && role !== 'system'
             ? (chunk: AgentChunk): void => {
                 let dirty = false;
                 switch (chunk.type) {
                     case 'text_delta':
                         streamBuffer += chunk.text;
+                        charsSinceLastEdit += chunk.text.length;
                         dirty = true;
                         break;
                     case 'thinking':
-                        // Thinking is private — show only a status header.
-                        if (statusLine !== '💭 thinking…') {
-                            statusLine = '💭 thinking…';
-                            dirty = true;
+                        thinkingBuffer += chunk.text;
+                        // Route thinking to the separate reasoning lane (does NOT mark
+                        // answer-preview dirty — that would trigger per-token edit floods).
+                        if (this.channel.editMessage) {
+                            void flushReasoning();
                         }
                         break;
                     case 'tool_start':
                         statusLine = `${toolCategoryEmoji(chunk.toolName)} ${chunk.toolName}…`;
+                        // Force-flush so the user sees the tool indicator within ~1s.
+                        charsSinceLastEdit = Math.max(charsSinceLastEdit, EDIT_BUFFER_THRESHOLD);
                         dirty = true;
                         break;
                     case 'tool_result':
                         statusLine = '';
+                        charsSinceLastEdit = Math.max(charsSinceLastEdit, EDIT_BUFFER_THRESHOLD);
                         dirty = true;
                         break;
                 }
                 if (!dirty) return;
+                // Circuit-open: stop queueing edits; chunks still accumulate for finalize.
+                if (editsDisabledForTurn) return;
 
                 if (!previewMessageId) {
                     ensurePreview();
@@ -637,16 +859,17 @@ export class ChannelWorker {
                 }
                 const now = Date.now();
                 const elapsed = now - lastEditAt;
-                if (elapsed < editIntervalMs) {
-                    // Schedule a single trailing flush so buffered text
+                // Edit fires when EITHER the time gate OR the buffer-threshold gate passes.
+                const timeGatePassed = elapsed >= currentEditIntervalMs;
+                const bufferGatePassed = charsSinceLastEdit >= EDIT_BUFFER_THRESHOLD;
+                if (!timeGatePassed && !bufferGatePassed) {
+                    // Neither gate passed — schedule a trailing flush so buffered text
                     // doesn't sit invisible if the stream goes silent.
-                    // Coalesces — the next dirty chunk that flushes
-                    // synchronously clears the timer below.
                     if (pendingFlushTimer === null) {
                         pendingFlushTimer = setTimeout(() => {
                             pendingFlushTimer = null;
                             void flushPreviewEdit();
-                        }, editIntervalMs - elapsed);
+                        }, Math.max(currentEditIntervalMs - elapsed, 50));
                     }
                     return;
                 }
@@ -654,14 +877,12 @@ export class ChannelWorker {
                     clearTimeout(pendingFlushTimer);
                     pendingFlushTimer = null;
                 }
-                // flushPreviewEdit owns the lastEditAt anchor — don't
-                // bump it here, or two flushes can race past the gate.
+                // flushPreviewEdit owns the lastEditAt anchor — don't bump it here.
                 void flushPreviewEdit();
             }
             : undefined;
 
-        // Channels opting into raw chunk forwarding (e.g. local chat TUI)
-        // bypass the edit-based aggregation.
+        // Channels opting into raw chunk forwarding (e.g. local chat TUI).
         const channelForward = this.channel.forwardChunk
             ? this.channel.forwardChunk.bind(this.channel)
             : undefined;
@@ -675,13 +896,15 @@ export class ChannelWorker {
 
         const callbacks: AgentCallbacks = {
             onReply: async (reply, options): Promise<void> => {
-                await this.sendReply(reply, peer, replyTo, options);
+                // Agent opts into quote-reply via send_message({replyTo: true}).
+                const wantsQuote = options?.quoteUserMessage === true;
+                const targetReplyTo = wantsQuote ? replyTo : undefined;
+                await this.sendReply(reply, peer, targetReplyTo, options);
             },
             sendPoll: async (question, pollOptions, pollSettings): Promise<void> => {
                 await this.sendPollFn(peer, question, pollOptions, pollSettings);
             },
-            // Atomic drain — read+clear in one op so the interceptor can't
-            // double-process mid-turn sends.
+            // Atomic drain prevents the interceptor from double-processing mid-turn sends.
             drainPending: (): string[] => {
                 for (const id of this.pendingGlobalIds) globalMessageQueue.remove(id);
                 this.pendingGlobalIds.length = 0;
@@ -709,10 +932,10 @@ export class ChannelWorker {
             channelCapabilities: this.channel.capabilities ?? [],
             peer,
             sender,
-            messageId: replyTo,
+            messageId: reactTargetId,
 
             reactToUserMessage: async (emoji: string, messageId?: string): Promise<void> => {
-                const target = messageId ?? replyTo;
+                const target = messageId ?? reactTargetId;
                 if (!target) {
                     this.log.debug(
                         { channel: this.channel.name },
@@ -722,8 +945,11 @@ export class ChannelWorker {
                 }
                 try {
                     await this.channel.react({ messageId: target, peer, emoji });
+                    // Skip lifecycle ✅/❌ swap so we don't clobber agent's choice on Telegram.
+                    if (target === reactTargetId) {
+                        agentReactedThisTurn = true;
+                    }
                 } catch (err) {
-                    // Channels lacking reaction support throw — never crash on this.
                     this.log.debug(
                         { err, channel: this.channel.name, emoji, messageId: target },
                         'react failed (channel may not support reactions)',
@@ -746,10 +972,7 @@ export class ChannelWorker {
                 timeoutPromise,
             ]);
 
-            // Cancel any pending trailing-flush timer — the final reply
-            // edit (or send_message tool cleanup) below is the last write
-            // to the preview message; a timer firing after it would
-            // overwrite the final content with a stale intermediate body.
+            // Cancel pending trailing-flush; the final write below must not be overwritten.
             if (pendingFlushTimer !== null) {
                 clearTimeout(pendingFlushTimer);
                 pendingFlushTimer = null;
@@ -759,16 +982,79 @@ export class ChannelWorker {
                 try { await editInFlight; } catch { /* already logged */ }
             }
 
+            // Finalize the reasoning lane: stream-mode does one final flush;
+            // on-mode (no editMessage support) sends the whole trace as one message.
+            // Both require an actual answer is being delivered.
+            if (reasoningPendingTimer !== null) {
+                clearTimeout(reasoningPendingTimer);
+                reasoningPendingTimer = null;
+            }
+            if (reasoningEditInFlight) {
+                try { await reasoningEditInFlight; } catch { /* logged inside */ }
+            }
+            const hasAnswer = !!(result.reply || didSendViaTool || result.didSendViaTool);
+            const reasoningTrimmed = thinkingBuffer.trim();
+            if (hasAnswer && reasoningTrimmed.length >= REASONING_MIN_LENGTH) {
+                if (this.channel.editMessage && reasoningMessageId !== null) {
+                    await flushReasoning(true);
+                } else if (!this.channel.editMessage) {
+                    try {
+                        await this.sendReply(`💭 Reasoning:\n${reasoningTrimmed}`, peer);
+                    } catch (err) {
+                        this.log.debug(
+                            {
+                                err,
+                                channel: this.channel.name,
+                                threadId: this.threadId,
+                                op: 'reasoning-lane:on-mode-send',
+                            },
+                            'reasoning-lane on-mode send failed (continuing)',
+                        );
+                    }
+                } else {
+                    // Stream-capable channel where reasoning arrived too late to clear
+                    // the min-length gate during streaming. Send as fresh.
+                    try {
+                        await this.sendReply(`💭 Reasoning:\n${reasoningTrimmed}`, peer);
+                    } catch (err) {
+                        this.log.debug(
+                            {
+                                err,
+                                channel: this.channel.name,
+                                threadId: this.threadId,
+                                op: 'reasoning-lane:late-send',
+                            },
+                            'reasoning-lane late-send failed (continuing)',
+                        );
+                    }
+                }
+            }
+
             if (!didSendViaTool && !result.didSendViaTool && result.reply) {
-                if (previewMessageId && this.channel.editMessage) {
+                // Circuit-open: delete the orphan preview before sending the clean reply.
+                if (editsDisabledForTurn && previewMessageId && this.channel.deleteMessage) {
+                    try {
+                        await this.channel.deleteMessage(previewMessageId, peer);
+                    } catch (err) {
+                        this.log.debug(
+                            { err, channel: this.channel.name, op: 'streamPreview:delete-orphan' },
+                            'orphan preview delete failed (continuing)',
+                        );
+                    }
+                    await this.sendReply(result.reply, peer, replyTo);
+                } else if (previewMessageId && this.channel.editMessage) {
                     try {
                         await this.channel.editMessage(previewMessageId, peer, result.reply);
                     } catch (err) {
-                        // Fall back to a fresh send so the user still gets the reply.
                         this.log.warn(
                             { err, channel: this.channel.name, op: 'streamPreview:finalize' },
-                            'preview finalize edit failed — falling back to fresh send',
+                            'preview finalize edit failed — deleting orphan and falling back to fresh send',
                         );
+                        if (this.channel.deleteMessage) {
+                            try {
+                                await this.channel.deleteMessage(previewMessageId, peer);
+                            } catch { /* best-effort */ }
+                        }
                         await this.sendReply(result.reply, peer, replyTo);
                     }
                 } else {
@@ -798,14 +1084,12 @@ export class ChannelWorker {
                 },
                 'agent turn completed',
             );
-            // Chat channel: flush token + context usage so the CLI TUI can render it.
-            // Must happen BEFORE the reply send — otherwise the done event has no usage.
+            // Flush token + context usage for CLI TUI rendering before reply send.
             if (result.tokenUsage && peer) {
-                // input tokens = exact context size billed for this turn.
-                // We don't know the model's context window from the response,
-                // so contextLimit is left unset — the TUI shows raw tokens only.
-                const contextTokens = result.tokenUsage.input;
-                const contextLimit = 0;
+                // Prefer compactor's view (knows model-specific threshold).
+                const compactorState = this.agentHandler.getCompactorStatus?.(this.threadId);
+                const contextTokens = compactorState?.tokens ?? result.tokenUsage.input;
+                const contextLimit = compactorState?.threshold ?? 0;
                 const c = this.channel as unknown as {
                     setPeerUsage?: (id: string, u: { input: number; output: number; reasoning?: number; cached?: number; contextTokens?: number; contextLimit?: number }) => void;
                 };
@@ -817,10 +1101,12 @@ export class ChannelWorker {
                     });
                 }
             }
+            finishTurnPresence('ok');
         } catch (err: unknown) {
             const durationMs = Date.now() - turnStartedAt;
             const ctx = { channel: this.channel.name, threadId: this.threadId, durationMs };
             if (err instanceof Error && err.name === 'AbortError') {
+                finishTurnPresence('aborted');
                 this.log.info(ctx, 'agent turn aborted by user');
                 if (!didSendViaTool) {
                     await this.sendReply('Stopped. What would you like instead?', peer).catch(
@@ -833,13 +1119,10 @@ export class ChannelWorker {
                     );
                 }
             } else {
-                const category = categorizeError(err, timeoutMs);
+                const category = categorizeError(err, timeoutMs, durationMs);
                 if (category.kind === 'timeout') {
-                    this.log.warn({ ...ctx, timeoutMs }, 'agent turn timed out');
-                    // Surface partial output captured before the timeout fired,
-                    // rather than a bare "I ran out of time" apology. Prefer
-                    // editing the existing preview if present so the user sees
-                    // their reply continue in place.
+                    this.log.warn({ ...ctx, timeoutMs, elapsedMs: durationMs }, 'agent turn timed out');
+                    // Surface partial stream output rather than a bare timeout apology.
                     const partial = streamBuffer.trim();
                     if (partial && !didSendViaTool) {
                         const seconds = Math.round(timeoutMs / 1000);
@@ -864,27 +1147,40 @@ export class ChannelWorker {
                                 );
                             });
                         }
-                        // Partial delivered — skip the canned error message.
                         return;
                     }
                 } else {
                     this.log.error({ ...ctx, err, errKind: category.kind }, 'agent turn failed');
                 }
-                await this.sendReply(category.userMessage, peer).catch((sendErr: unknown) => {
-                    this.log.error(
-                        { ...ctx, err: sendErr, op: 'sendReply:failure-notice', errKind: category.kind },
-                        'failure notification send failed — user is left hanging',
+                // Skip failure notice on a 429 — another message would extend the cooldown.
+                const original429Ms = extract429RetryAfterMs(err);
+                if (original429Ms !== undefined) {
+                    this.log.warn(
+                        { ...ctx, retryAfterMs: original429Ms, op: 'sendReply:failure-notice:skipped-429' },
+                        'failure notification skipped — original error was 429, would compound the cooldown',
                     );
-                });
+                } else {
+                    await this.sendReply(category.userMessage, peer).catch((sendErr: unknown) => {
+                        this.log.error(
+                            { ...ctx, err: sendErr, op: 'sendReply:failure-notice', errKind: category.kind },
+                            'failure notification send failed — user is left hanging',
+                        );
+                    });
+                }
+                finishTurnPresence('error');
             }
         } finally {
-            // Defensive: clear any pending trailing-flush timer on every
-            // exit path (success, error, abort, timeout). Already cleared
-            // on the success path before the final edit, but error paths
-            // skip that cleanup.
+            // Fallback presence clear so a missed finish doesn't leave ⏳ stuck.
+            if (armed) finishTurnPresence('ok');
+
+            // Defensive timer cleanup on every exit path.
             if (pendingFlushTimer !== null) {
                 clearTimeout(pendingFlushTimer);
                 pendingFlushTimer = null;
+            }
+            if (reasoningPendingTimer !== null) {
+                clearTimeout(reasoningPendingTimer);
+                reasoningPendingTimer = null;
             }
             timeoutCleanup();
             this.currentAbort = null;
@@ -937,15 +1233,14 @@ export class ChannelWorker {
         }
 
         if (event.type === 'task_start') {
-            // Reaction + typing indicator is the working signal — no chat
-            // message, to keep mobile notifications quiet.
+            // Reaction + typing is the working signal — no chat message keeps mobile quiet.
             this.beginTaskPresence(event.taskId, peer);
             this.channel.forwardTaskEvent?.(peer, { event: 'start', taskId: event.taskId });
             return;
         }
 
         if (event.type === 'task_progress') {
-            // Deliberately not a chat message (would spam mobile users).
+            // Not a chat message — would spam mobile users.
             const safeProgress = sanitize(event.progress ?? '', 200);
             this.log.debug(
                 {
@@ -970,7 +1265,7 @@ export class ChannelWorker {
                 { taskId: event.taskId, error: event.error, channel: this.channel.name, threadId: this.threadId },
                 'background task failed',
             );
-            this.endTaskPresence(event.taskId, peer, '❌');
+            this.endTaskPresence(event.taskId, peer, 'error');
             this.channel.forwardTaskEvent?.(peer, {
                 event: 'error',
                 taskId: event.taskId,
@@ -1010,7 +1305,7 @@ export class ChannelWorker {
         );
 
         if (deliveryMode === 'silent') {
-            this.endTaskPresence(event.taskId, peer, '✅');
+            this.endTaskPresence(event.taskId, peer, 'ok');
             this.channel.forwardTaskEvent?.(peer, {
                 event: 'complete',
                 taskId: event.taskId,
@@ -1020,7 +1315,7 @@ export class ChannelWorker {
         }
 
         // React first so ✅ lands before the wake-up turn produces output.
-        this.endTaskPresence(event.taskId, peer, '✅');
+        this.endTaskPresence(event.taskId, peer, 'ok');
         this.channel.forwardTaskEvent?.(peer, {
             event: 'complete',
             taskId: event.taskId,
@@ -1035,9 +1330,8 @@ export class ChannelWorker {
             return;
         }
 
-        // Internal worker tasks (spawn_background_task) use <task-notification> XML
-        // so the coordinator can reliably match the taskId to its original spawn call.
-        // External webhook events use <untrusted-data> because the payload is third-party.
+        // Internal worker tasks use <task-notification> for reliable taskId matching;
+        // external webhook events use <untrusted-data> for third-party payloads.
         let systemMessage: string;
         if (event.workerName) {
             systemMessage = [
@@ -1071,8 +1365,7 @@ export class ChannelWorker {
         await this.runAgentTurn(systemMessage, 'system', this.backgroundTurnTimeoutMs);
     }
 
-    // Single structured LLM call. Full ReactAgent here loads history+tools
-    // and ignores "no tools" instructions.
+    // Single structured LLM call — full ReactAgent loads history+tools.
     private async runConditionalWebhookTurn(
         safeResult: string,
         peer: Peer,
@@ -1141,7 +1434,7 @@ export class ChannelWorker {
             const messageId = this.lastMessageId;
             this.taskMessageIds.set(taskId, messageId);
             this.channel
-                .react({ messageId, peer, emoji: '⏳' })
+                .react({ messageId, peer, emoji: DEFAULT_PRESENCE_EMOJIS.taskRunning })
                 .catch((err: unknown) => {
                     this.log.debug(
                         { err, taskId, channel: this.channel.name, op: 'react:task-start' },
@@ -1162,13 +1455,16 @@ export class ChannelWorker {
         }
     }
 
-    private endTaskPresence(taskId: string, peer: Peer, finalEmoji: '✅' | '❌'): void {
+    private endTaskPresence(taskId: string, peer: Peer, kind: 'ok' | 'error'): void {
         const messageId = this.taskMessageIds.get(taskId);
         if (messageId) {
             this.taskMessageIds.delete(taskId);
-            // Remove ⏳ first so finalEmoji wins on channels that stack reactions.
+            const finalEmoji = kind === 'ok'
+                ? DEFAULT_PRESENCE_EMOJIS.taskOk
+                : DEFAULT_PRESENCE_EMOJIS.taskError;
+            // Remove running indicator first so finalEmoji wins on stacking channels.
             this.channel
-                .react({ messageId, peer, emoji: '⏳', remove: true })
+                .react({ messageId, peer, emoji: DEFAULT_PRESENCE_EMOJIS.taskRunning, remove: true })
                 .catch((err: unknown) => {
                     this.log.debug(
                         { err, taskId, op: 'react:remove-pending' },
@@ -1246,8 +1542,7 @@ function isAbortRequest(text: string): boolean {
     return ABORT_PHRASES.has(text.trim().toLowerCase());
 }
 
-// Match order: more-specific prefixes first. Substring match so
-// server-prefixed names (e.g. `googleworkspace__gmail_search`) still hit.
+// Match order: more-specific prefixes first; substring match for server-prefixed names.
 const TOOL_EMOJI_BUCKETS: ReadonlyArray<readonly [RegExp, string]> = [
     [/gmail|email|inbox|imap|smtp|mailgun|postmark/i, '📧'],
     [/slack|discord|telegram|whatsapp|signal|imessage|line(?!\w)/i, '💬'],
@@ -1280,6 +1575,31 @@ function isMessageNotModifiedError(err: unknown): boolean {
     return /message is not modified/i.test(haystack);
 }
 
+/**
+ * Extract the channel's retry-after window (ms) from a 429 error.
+ * Returns undefined when err isn't a recognised rate-limit shape.
+ */
+function extract429RetryAfterMs(err: unknown): number | undefined {
+    if (!err || typeof err !== 'object') return undefined;
+    const e = err as Record<string, unknown>;
+    if (e['error_code'] !== 429 && e['status'] !== 429) {
+        const desc = typeof e['description'] === 'string' ? e['description'] : '';
+        const msg = typeof e['message'] === 'string' ? e['message'] : '';
+        if (!/429|too many requests|rate limit/i.test(`${desc} ${msg}`)) return undefined;
+    }
+    const params = e['parameters'] as Record<string, unknown> | undefined;
+    const fromParams = typeof params?.['retry_after'] === 'number' ? params['retry_after'] as number : undefined;
+    if (fromParams !== undefined) return Math.max(0, Math.ceil(fromParams * 1000));
+    const direct = typeof e['retry_after'] === 'number' ? e['retry_after'] as number : undefined;
+    if (direct !== undefined) return Math.max(0, Math.ceil(direct * 1000));
+    // Fallback: parse "retry after N" from message text.
+    const desc = typeof e['description'] === 'string' ? e['description'] : '';
+    const msg = typeof e['message'] === 'string' ? e['message'] : '';
+    const match = `${desc} ${msg}`.match(/retry after\s+(\d+(?:\.\d+)?)/i);
+    if (match?.[1]) return Math.max(0, Math.ceil(parseFloat(match[1]) * 1000));
+    return undefined;
+}
+
 function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -1291,7 +1611,7 @@ function rejectAfterTimeout(
     let timer: ReturnType<typeof setTimeout>;
     const promise = new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
-            // Abort the graph so it stops rather than getting orphaned.
+            // Abort the graph so it stops rather than orphaning.
             abort.abort(new Error('Agent invocation timed out'));
             reject(new Error('Agent invocation timed out'));
         }, ms);

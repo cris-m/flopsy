@@ -2,7 +2,7 @@
  * `flopsy status` — one-screen overview of the whole system.
  *
  * Separates *scan* (data gathering: reads flopsy.json5 + probes the running
- * gateway via mgmt HTTP) from *render* (output formatting). All three
+ * gateway via management HTTP) from *render* (output formatting). All three
  * renderers (compact / verbose / json) share one `StatusSnapshot` from
  * `@flopsy/shared` so the chat-side `/status` handler can reuse the same
  * shape without duplication.
@@ -18,6 +18,7 @@ import chalk from 'chalk';
 import {
     type StatusSnapshot,
     type CliTheme,
+    loadMgmtToken,
     renderCliCompact,
     renderCliVerbose,
 } from '@flopsy/shared';
@@ -75,7 +76,7 @@ function buildTheme(): CliTheme {
 
 /**
  * Gather the full StatusSnapshot by reading flopsy.json5 + probing the
- * running gateway's mgmt endpoint (best-effort — config view if gateway is
+ * running gateway's management endpoint (best-effort — config view if gateway is
  * down).
  */
 async function scanStatus(): Promise<StatusSnapshot> {
@@ -86,7 +87,7 @@ async function scanStatus(): Promise<StatusSnapshot> {
     const gw = await probeGatewayState(port);
     const live = gw.running ? await fetchLive(host, port) : undefined;
 
-    // Channels — merge config with live status from mgmt
+    // Channels — merge config with live status from management
     const liveChannels = new Map<string, { status?: string }>();
     if (live && Array.isArray((live as { channels?: unknown }).channels)) {
         for (const c of (live as { channels: Array<{ name: string; status?: string }> }).channels) {
@@ -151,7 +152,7 @@ async function scanStatus(): Promise<StatusSnapshot> {
     const mcpConfigured = Object.keys(mcpServers).length;
     const mcpActive = Object.values(mcpServers).filter((s) => s?.enabled !== false).length;
 
-    // Proactive — counts come from config; live stats from mgmt (optional)
+    // Proactive — counts come from config; live stats from management (optional)
     const proactiveCfg = config.proactive ?? {};
     const proactiveEnabled = proactiveCfg.enabled !== false;
     const heartbeats = heartbeatsOf(config);
@@ -166,7 +167,7 @@ async function scanStatus(): Promise<StatusSnapshot> {
     const webhookCfg = config.webhook ?? {};
     const webhookServerEnabled = webhookCfg.enabled === true;
 
-    // Prefer live runtime counts from /mgmt/status (which reads
+    // Prefer live runtime counts from /management/status (which reads
     // proactive.db) — config arrays are empty in the post-migration world
     // where schedules live in proactive.db, not flopsy.json5. Fall back to
     // config arrays when the gateway is down so the CLI still shows
@@ -267,8 +268,8 @@ async function scanStatus(): Promise<StatusSnapshot> {
  */
 async function fetchLive(host: string, port: number): Promise<Record<string, unknown> | undefined> {
     const mgmtPort = port + 1;
-    const url = `http://${host}:${mgmtPort}/mgmt/status`;
-    const token = process.env['FLOPSY_MGMT_TOKEN'];
+    const url = `http://${host}:${mgmtPort}/management/status`;
+    const token = loadMgmtToken();
     try {
         const res = await fetch(url, {
             headers: token ? { Authorization: `Bearer ${token}` } : {},

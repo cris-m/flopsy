@@ -4,6 +4,17 @@ export * from './channels';
 export * from './config';
 export { FlopsyGateway } from './gateway';
 export {
+    discoverAndLoadHooks,
+    HookRegistry,
+    emitHook,
+    getHookRegistry,
+    setHookRegistry,
+    type HookConfig,
+    type HookContext,
+    type HookHandler,
+    type RegisteredHook,
+} from './hooks';
+export {
     setPairingFacade,
     getPairingFacade,
     type PairingFacade,
@@ -34,3 +45,21 @@ export {
     type BranchSummary,
     type BranchOutcome,
 } from './commands/branch-facade';
+
+// Proactive decision schema — exposed so the team package can pass it
+// to `createReactAgent` as `outputSchema` when constructing proactive
+// agent instances (handler.ts when isProactive=true).
+export {
+    ProactiveDecisionSchema,
+    DeliverCategory,
+    SilenceReason,
+    CitationSchema,
+    ReportedIdsSchema,
+} from './proactive';
+export type {
+    ProactiveDecision,
+    DeliverCategoryT,
+    SilenceReasonT,
+    Citation,
+    ReportedIds,
+} from './proactive';

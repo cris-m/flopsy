@@ -32,12 +32,27 @@ class GlobalMessageQueue {
     enqueue(entry: Omit<GlobalQueueEntry, 'id' | 'enqueuedAt'>): string {
         const id = randomUUID();
         const item: GlobalQueueEntry = { ...entry, id, enqueuedAt: Date.now() };
-        this.entries.push(item);
-        this.entries.sort(
-            (a, b) =>
-                PRIORITY_ORDER[a.priority] - PRIORITY_ORDER[b.priority] ||
-                a.enqueuedAt - b.enqueuedAt,
-        );
+        // Insertion sort: linear scan to find the right position, splice
+        // it in. The previous `push + Array.sort` was O(N log N) on every
+        // enqueue — fine at small N, but message bursts (50 inbound in
+        // one tick across 100 workers) ran 50 full sorts back-to-back.
+        //
+        // Entries are already mostly sorted (FIFO within priority), so
+        // a linear scan from the END almost always finds the spot in
+        // O(1) — the new entry's (priority, enqueuedAt) is the largest
+        // tuple seen so far. Worst case (an interrupt-priority entry
+        // arriving when the queue is full of low-priority ones) is
+        // O(N), but that's still strictly better than O(N log N).
+        const newPri = PRIORITY_ORDER[item.priority];
+        let i = this.entries.length;
+        while (i > 0) {
+            const prev = this.entries[i - 1]!;
+            const prevPri = PRIORITY_ORDER[prev.priority];
+            if (prevPri < newPri) break;
+            if (prevPri === newPri && prev.enqueuedAt <= item.enqueuedAt) break;
+            i--;
+        }
+        this.entries.splice(i, 0, item);
         this.notify();
         return id;
     }

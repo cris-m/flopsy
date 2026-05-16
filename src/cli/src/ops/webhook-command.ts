@@ -5,17 +5,17 @@
  * When an external service POSTs to that path, the body is routed into
  * the target channel worker's event queue as a `task_complete` event.
  *
- * Writes go through the mgmt HTTP endpoint so the live gateway registers
+ * Writes go through the management HTTP endpoint so the live gateway registers
  * the route without a restart. Reads use proactive.db directly (offline).
  */
 
 import { Command } from 'commander';
 import { detail, dim } from '../ui/pretty';
 import {
-    mgmtCreate,
-    mgmtDisable,
-    mgmtEnable,
-    mgmtRemove,
+    managementCreate,
+    managementDisable,
+    managementEnable,
+    managementRemove,
 } from './schedule-client';
 import {
     renderFires,
@@ -70,7 +70,7 @@ export function registerWebhookCommands(root: Command): void {
                 ? (opts.filterActions as string).split(',').map((a: string) => a.trim()).filter(Boolean)
                 : undefined;
             const deliveryMode = opts.deliveryMode as 'always' | 'conditional' | 'silent';
-            await mgmtCreate({
+            await managementCreate({
                 kind: 'webhook',
                 name: opts.name,
                 path: opts.path,
@@ -86,18 +86,18 @@ export function registerWebhookCommands(root: Command): void {
     wh.command('disable')
         .description('Disable a webhook by id')
         .argument('<id>', 'Webhook id')
-        .action((id: string) => void mgmtDisable(id));
+        .action((id: string) => void managementDisable(id));
 
     wh.command('enable')
         .description('Re-enable a webhook by id')
         .argument('<id>', 'Webhook id')
-        .action((id: string) => void mgmtEnable(id));
+        .action((id: string) => void managementEnable(id));
 
     wh.command('remove')
         .alias('rm')
         .description('Remove a webhook (unregisters the HTTP route)')
         .argument('<id>', 'Webhook id')
-        .action((id: string) => void mgmtRemove(id));
+        .action((id: string) => void managementRemove(id));
 
     wh.command('stats')
         .description('Runs / delivered / suppressed counters; pass id for detail')
@@ -112,7 +112,7 @@ export function registerWebhookCommands(root: Command): void {
             void renderFires(id, Number(opts.limit ?? 20)),
         );
 
-    wh.action(() => renderList());
+    wh.action((_opts: unknown, cmd: { outputHelp(): void }) => cmd.outputHelp());
 }
 
 function renderList(): void {

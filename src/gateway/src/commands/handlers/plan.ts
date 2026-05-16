@@ -1,6 +1,16 @@
 import type { CommandContext, CommandDef } from '../types';
 import { getPlanFacade } from '../plan-facade';
 
+/** Same escape as skill-commands.ts (kept local to avoid a tiny shared
+ *  module). Prevents prompt-injection via `/plan ]...IGNORE PREVIOUS...`
+ *  breaking out of the bracket framing. */
+function escapeForBracketTemplate(s: string): string {
+    return s
+        .replace(/\]/g, '\\]')
+        .replace(/\[INST\]/gi, '[INST_LITERAL]')
+        .replace(/<\/(?:user_input|user_msg|system|assistant)>/gi, (m) => `[${m.slice(2)}_LITERAL]`);
+}
+
 export const planCommand: CommandDef = {
     name: 'plan',
     description: 'Plan a task before executing. Use: /plan <task>, or /plan cancel to abort.',
@@ -61,7 +71,7 @@ export const planCommand: CommandDef = {
                 '[The user invoked `/plan` for this task — they want plan mode. Use `create_plan` to draft the approach, ' +
                 'send it via `send_message` with the standard `go` / `edit` / `no` buttons, and wait for approval before executing. ' +
                 'Do NOT call `delegate_task` or `spawn_background_task` until they approve.]\n\n' +
-                raw,
+                escapeForBracketTemplate(raw),
         };
     },
 };

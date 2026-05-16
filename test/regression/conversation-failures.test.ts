@@ -241,7 +241,7 @@ describe('F6 — /branch list dispatcher routing is correct', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 describe('F7 — Personality bans corporate-bot openings', () => {
     it('SOUL.md bans "I\'d be happy to help!" / "Great question!" / "Absolutely!"', () => {
-        const src = read('.flopsy/SOUL.md');
+        const src = read('.flopsy/config/SOUL.md');
         expect(src).toMatch(/\*\*Banned openings:\*\*/);
         // Each banned opener appears somewhere in SOUL.md (the list spans lines).
         expect(src).toContain('"Great question!"');
@@ -250,7 +250,7 @@ describe('F7 — Personality bans corporate-bot openings', () => {
     });
 
     it('SOUL.md has a "Read the room" mood-matching contract', () => {
-        const src = read('.flopsy/SOUL.md');
+        const src = read('.flopsy/config/SOUL.md');
         expect(src).toMatch(/Read the room/);
         expect(src).toMatch(/Casual \/ curious|Stressed \/ vented|Focused \/ working/);
     });
@@ -274,7 +274,7 @@ describe('F8 — Web tool routing is documented and discoverable', () => {
     });
 
     it('AGENTS.md hard rule: always use a tool for live state, do not answer from training', () => {
-        const src = read('.flopsy/AGENTS.md');
+        const src = read('.flopsy/config/AGENTS.md');
         // The phrase is hard-wrapped across two lines in the source — use [\s\S]
         // for newline-tolerant match.
         expect(src).toMatch(/depends on external[\s\S]*?state/);
@@ -291,7 +291,7 @@ describe('F8 — Web tool routing is documented and discoverable', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 describe('F9 — Retry has a ceiling and a clean exit', () => {
     it('AGENTS.md documents the two-alternatives-before-surface rule', () => {
-        const src = read('.flopsy/AGENTS.md');
+        const src = read('.flopsy/config/AGENTS.md');
         // AGENTS.md uses the "try at least two alternatives" framing in a
         // dedicated section. Newline-tolerant.
         expect(src).toMatch(/try at least two alternatives before "I can't"/i);
@@ -299,7 +299,7 @@ describe('F9 — Retry has a ceiling and a clean exit', () => {
     });
 
     it('SOUL.md documents the "two more angles" recovery rule', () => {
-        const src = read('.flopsy/SOUL.md');
+        const src = read('.flopsy/config/SOUL.md');
         expect(src).toMatch(/try at least two more angles before saying "I can't\."/i);
     });
 
@@ -393,25 +393,28 @@ describe('Tool-call reaction wiring', () => {
 
     it('channel-worker.beginTaskPresence fires ⏳ on channels that advertise reactions', () => {
         const src = read('src/gateway/src/core/channel-worker.ts');
-        // The wire that matters: caps.includes('reactions') gates the react
-        // call. Don't let anyone "simplify" this back to an unconditional
-        // react that throws on stub channels.
+        // Gate: caps.includes('reactions') must drive the react() call.
         expect(src).toMatch(/supportsReactions = caps\.includes\('reactions'\)/);
-        expect(src).toMatch(/this\.channel\s*\.react\(\{\s*messageId,\s*peer,\s*emoji: '⏳'\s*\}\)/);
+        // The react() call uses the centralized taskRunning emoji (⏳ by default).
+        expect(src).toMatch(/\.react\(\{[\s\S]*?emoji:\s*DEFAULT_PRESENCE_EMOJIS\.taskRunning/);
     });
 
     it('channel-worker.endTaskPresence stamps ✅ or ❌ at task end', () => {
         const src = read('src/gateway/src/core/channel-worker.ts');
-        expect(src).toMatch(/finalEmoji: '✅' \| '❌'/);
-        expect(src).toMatch(/this\.endTaskPresence\(event\.taskId, peer, '✅'\)/);
-        expect(src).toMatch(/this\.endTaskPresence\(event\.taskId, peer, '❌'\)/);
+        // endTaskPresence carries a kind ('ok' | 'error') that picks the final emoji.
+        expect(src).toMatch(/endTaskPresence\([^)]*kind: 'ok' \| 'error'/);
+        expect(src).toMatch(/this\.endTaskPresence\(event\.taskId, peer, 'ok'\)/);
+        expect(src).toMatch(/this\.endTaskPresence\(event\.taskId, peer, 'error'\)/);
+        // Final emojis resolve via the centralized table (✅ / ❌ by default).
+        expect(src).toMatch(/DEFAULT_PRESENCE_EMOJIS\.taskOk/);
+        expect(src).toMatch(/DEFAULT_PRESENCE_EMOJIS\.taskError/);
     });
 
-    it('Telegram channel maps ⏳ to a Telegram-allowlist emoji', () => {
+    it('Telegram channel maps the taskRunning emoji to a Telegram-allowlist emoji', () => {
         // Telegram's reactions endpoint rejects emojis outside its whitelist.
-        // The mapping (currently ⏳ → 🤔) must stay so reactions don't 400.
+        // The taskRunning emoji must map to a safe fallback so reactions don't 400.
         const src = read('src/gateway/src/channels/telegram/channel.ts');
-        expect(src).toMatch(/'⏳':\s*'🤔'/);
+        expect(src).toMatch(/\[DEFAULT_PRESENCE_EMOJIS\.taskRunning\]:\s*'🤔'/);
         expect(src).toMatch(/function mapToTelegramAllowedEmoji/);
     });
 
@@ -444,16 +447,16 @@ describe('Tool-call reaction wiring', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 describe('soul + identity files are present and non-trivial', () => {
     it.each([
-        ['SOUL.md',           '.flopsy/SOUL.md',               1500],
-        ['AGENTS.md',         '.flopsy/AGENTS.md',             3000],
-        ['personalities.yaml','.flopsy/personalities.yaml',     2000],
+        ['SOUL.md',           '.flopsy/config/SOUL.md',               1500],
+        ['AGENTS.md',         '.flopsy/config/AGENTS.md',             3000],
+        ['personalities.yaml','.flopsy/config/personalities.yaml',     2000],
     ])('%s exists with at least %i chars', (_label, rel, minChars) => {
         const src = read(rel);
         expect(src.length).toBeGreaterThanOrEqual(minChars);
     });
 
     it('personalities.yaml defines at least 5 distinct overlays', () => {
-        const src = read('.flopsy/personalities.yaml');
+        const src = read('.flopsy/config/personalities.yaml');
         const topLevelKeys = src.match(/^[a-z][a-z0-9_]*:\s*$/gm);
         expect(topLevelKeys?.length ?? 0).toBeGreaterThanOrEqual(5);
     });

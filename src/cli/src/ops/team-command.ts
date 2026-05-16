@@ -8,10 +8,10 @@
 import { Command } from 'commander';
 import { renameSync, writeFileSync } from 'node:fs';
 import chalk from 'chalk';
-import { truncate } from '@flopsy/shared';
+import { loadMgmtToken, truncate } from '@flopsy/shared';
 import { bad, detail, dim, info, ok, row, section } from '../ui/pretty';
 import { readFlopsyConfig, type ModelRef, type RawAgent } from './config-reader';
-import { mgmtUrl } from './schedule-client';
+import { managementUrl } from './schedule-client';
 import { tint } from '../ui/theme';
 
 /** Format a ModelRef back into a "provider:name" string for display. */
@@ -65,19 +65,15 @@ export function registerTeamCommands(root: Command): void {
             writeAgentField(name, field, parsed);
         });
 
-    // Default: `flopsy team` with no subcommand → list (with live probe).
-    team.action(async () => {
-        const { config } = readFlopsyConfig();
-        const live = await fetchLiveAgents();
-        renderList(config.agents ?? [], buildPushMap(config.mcp?.servers ?? {}), live);
-    });
+    // Default: `flopsy team` with no subcommand → show help.
+    team.action((_opts: unknown, cmd: { outputHelp(): void }) => cmd.outputHelp());
 }
 
 type LiveAgentMap = Map<string, { state: 'idle' | 'busy'; currentTask?: string }>;
 
 async function fetchLiveAgents(): Promise<LiveAgentMap> {
-    const url = mgmtUrl('/mgmt/status');
-    const token = process.env['FLOPSY_MGMT_TOKEN'];
+    const url = managementUrl('/management/status');
+    const token = loadMgmtToken();
     const out: LiveAgentMap = new Map();
     try {
         const res = await fetch(url, {

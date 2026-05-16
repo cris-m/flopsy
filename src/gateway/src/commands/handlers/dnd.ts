@@ -6,6 +6,10 @@ export const dndCommand: CommandDef = {
     name: 'dnd',
     aliases: ['quiet'],
     description: 'Toggle Do Not Disturb. `/dnd`, `/dnd 2h`, `/dnd off`.',
+    // Admin: DND is a global toggle that silences proactive delivery for
+    // everyone, not just the caller. A paired Telegram user toggling
+    // `/dnd 30d` would mute the bot for the operator across all channels.
+    scope: 'admin',
     handler: async (ctx: CommandContext) => {
         const facade = getDndFacade();
         if (!facade) {

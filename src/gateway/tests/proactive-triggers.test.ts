@@ -18,6 +18,19 @@ import { HeartbeatTrigger } from '../src/proactive/triggers/heartbeat';
 import { CronTrigger } from '../src/proactive/triggers/cron';
 import { PromptLoader } from '../src/proactive/prompt-loader';
 import type { JobExecutor } from '../src/proactive/pipeline/executor';
+
+/**
+ * triggerNow() is fire-and-forget — it dispatches the fire via
+ * `void this.fire(...)` and returns immediately. Inside fire(), several
+ * awaits happen before the executor is called (prompt resolve, presence
+ * check, delivery resolution, etc.). Tests that assert on executor
+ * activity after triggerNow need to wait until that chain settles.
+ *
+ * 50ms is enough for the synchronous-only stubs used in these tests.
+ */
+function flushDetachedFire(): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, 50));
+}
 import type { PresenceManager } from '../src/proactive/state/presence';
 import type { StateStore } from '../src/proactive/state/store';
 import type {
@@ -64,7 +77,7 @@ describe('HeartbeatTrigger — prompt-file ENOENT skip', () => {
 
     beforeEach(() => {
         homeDir = mkdtempSync(join(tmpdir(), 'flopsy-hb-trig-'));
-        mkdirSync(join(homeDir, 'proactive', 'heartbeats'), { recursive: true });
+        mkdirSync(join(homeDir, 'content', 'prompts', 'heartbeats'), { recursive: true });
         prevHome = process.env.FLOPSY_HOME;
         process.env.FLOPSY_HOME = homeDir;
     });
@@ -100,7 +113,7 @@ describe('HeartbeatTrigger — prompt-file ENOENT skip', () => {
 
     it('forwards loaded prompt to the executor when the file exists', async () => {
         writeFileSync(
-            join(homeDir, 'proactive', 'heartbeats', 'pulse.md'),
+            join(homeDir, 'content', 'prompts', 'heartbeats', 'pulse.md'),
             'real prompt body',
             'utf8',
         );
@@ -121,6 +134,7 @@ describe('HeartbeatTrigger — prompt-file ENOENT skip', () => {
         trigger.addHeartbeat(hb, target);
 
         await trigger.triggerNow('pulse');
+        await flushDetachedFire();
         expect(calls).toHaveLength(1);
         expect(calls[0]!.prompt).toBe('real prompt body');
         expect(calls[0]!.trigger).toBe('heartbeat');
@@ -172,6 +186,7 @@ describe('HeartbeatTrigger — prompt-file ENOENT skip', () => {
         trigger.addHeartbeat(hb, target);
 
         await trigger.triggerNow('pulse');
+        await flushDetachedFire();
         expect(calls).toHaveLength(1);
         expect(calls[0]!.threadId).toBeUndefined();
         trigger.stop();
@@ -202,7 +217,7 @@ describe('CronTrigger — prompt-file ENOENT skip', () => {
 
     beforeEach(() => {
         homeDir = mkdtempSync(join(tmpdir(), 'flopsy-cron-trig-'));
-        mkdirSync(join(homeDir, 'proactive', 'cron'), { recursive: true });
+        mkdirSync(join(homeDir, 'content', 'prompts', 'cron'), { recursive: true });
         prevHome = process.env.FLOPSY_HOME;
         process.env.FLOPSY_HOME = homeDir;
     });
@@ -238,7 +253,7 @@ describe('CronTrigger — prompt-file ENOENT skip', () => {
 
     it('forwards loaded cron prompt to the executor', async () => {
         writeFileSync(
-            join(homeDir, 'proactive', 'cron', 'morning.md'),
+            join(homeDir, 'content', 'prompts', 'cron', 'morning.md'),
             'morning brief body',
             'utf8',
         );
@@ -260,6 +275,7 @@ describe('CronTrigger — prompt-file ENOENT skip', () => {
         };
         await trigger.addJob(job);
         await trigger.triggerNow('morning');
+        await flushDetachedFire();
 
         expect(calls).toHaveLength(1);
         expect(calls[0]!.prompt).toBe('morning brief body');
@@ -269,7 +285,7 @@ describe('CronTrigger — prompt-file ENOENT skip', () => {
 
     it('uses static job.payload.threadId when supplied (operator override)', async () => {
         writeFileSync(
-            join(homeDir, 'proactive', 'cron', 'p.md'),
+            join(homeDir, 'content', 'prompts', 'cron', 'p.md'),
             'p',
             'utf8',
         );
@@ -295,6 +311,7 @@ describe('CronTrigger — prompt-file ENOENT skip', () => {
         };
         await trigger.addJob(job);
         await trigger.triggerNow('pinned');
+        await flushDetachedFire();
 
         expect(calls[0]!.threadId).toBe('group-thread-xyz');
         await trigger.stop();

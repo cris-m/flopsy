@@ -129,6 +129,8 @@ export interface TeammateTaskState extends TaskStateBase {
     readonly workerName: string; // matches AgentDefinition.name in flopsy.json5
     readonly leaderTaskId?: string; // which teammate spawned this (undefined for direct-from-main)
     readonly depth: number; // 0 = spawned by main, 1 = spawned by a teammate (capped)
+    /** Chain of worker names that led to this task. Used for loop detection. */
+    readonly spawnChain: string[];
     /**
      * Messages queued mid-turn via user injection or inter-teammate mailbox.
      * Drained at tool-round boundaries by the mid-turn-injector interceptor.
@@ -191,8 +193,10 @@ export function createTeammateTask(
         toolUseId?: string;
         /** Caller-provided id (from `registry.nextId('teammate')`); falls back to random. */
         id?: string;
+        spawnChain?: string[];
     },
 ): TeammateTaskState {
+    const chain = args.spawnChain ?? [];
     return {
         id: args.id ?? generateTaskId('teammate'),
         type: 'teammate',
@@ -201,6 +205,7 @@ export function createTeammateTask(
         leaderTaskId: args.leaderTaskId,
         toolUseId: args.toolUseId,
         depth: args.depth,
+        spawnChain: chain,
         createdAt: Date.now(),
         status: 'pending',
         notified: false,

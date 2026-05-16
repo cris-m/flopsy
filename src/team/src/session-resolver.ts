@@ -53,7 +53,7 @@ export interface ResolveResult {
  *   4. Closes the stale session and opens a fresh one if needed.
  *   5. Returns the effective threadId (`<peer_id>#<session_id>`).
  *
- * Critical invariants (OpenClaw / Hermes pattern):
+ * Critical invariants:
  *   - Only `source: 'user'` extends `last_user_message_at`. Heartbeats and
  *     cron fires re-use the active session if fresh, but never refresh
  *     freshness — a dead session can't be kept alive by background ticks.

@@ -47,9 +47,16 @@ export class GoogleChatChannel extends BaseChannel implements WebhookChannel {
         try {
             const parsed = JSON.parse(body) as { token?: string };
             const provided = parsed.token ?? '';
-            if (provided.length !== expected.length) return false;
+            // Compare via timingSafeEqual on equal-length buffers (zero-pad the
+            // shorter input) so length differences don't short-circuit and leak
+            // the expected length through timing.
+            const maxLen = Math.max(provided.length, expected.length);
+            const a = Buffer.alloc(maxLen);
+            const b = Buffer.alloc(maxLen);
+            Buffer.from(provided).copy(a);
+            Buffer.from(expected).copy(b);
             const { timingSafeEqual } = require('node:crypto') as typeof import('node:crypto');
-            return timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
+            return provided.length === expected.length && timingSafeEqual(a, b);
         } catch {
             return false;
         }

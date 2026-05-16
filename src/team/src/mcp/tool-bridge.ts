@@ -1,18 +1,6 @@
 /**
- * Convert MCP tools (JSON-Schema-described, called via the SDK) into
- * flopsygraph BaseTool instances that the ReactAgent + interceptor stack
- * already know how to invoke.
- *
- * Naming: tools land in the agent's catalog as `<server>__<toolName>`
- * to prevent collisions across servers (gmail__send vs slack__send).
- * This is opinionated — claude-code also uses double-underscore — and
- * makes telemetry/log lines self-explanatory.
- *
- * Schema shimming: MCP exposes JSON Schema; flopsygraph's defineTool
- * wants a Zod schema. We use `z.object({}).passthrough()` and let the
- * MCP server do its own validation — re-encoding JSON Schema → Zod
- * here would be ~500 lines for marginal benefit (errors land in the
- * tool result either way, framed identically).
+ * Convert MCP tools into flopsygraph BaseTool instances.
+ * Names are namespaced as `<server>__<toolName>` to prevent cross-server collisions.
  */
 
 import { z } from 'zod';
@@ -34,14 +22,8 @@ export interface BridgedTool extends BaseTool {
 }
 
 function namespacedName(server: string, original: string): string {
-    // Skip the server prefix when the upstream tool name already starts
-    // with it — many MCP servers (gmail, slack, github) name tools like
-    // `gmail_search`, `slack_post`, etc. Adding `gmail__gmail_search`
-    // creates a redundant doubled prefix that confuses LLMs (they guess
-    // the natural `gmail_search` and miss the actual tool). The collision
-    // detection in bridgeAllTools still catches genuine cross-server
-    // conflicts. Match is case-insensitive and tolerant of single
-    // underscore vs double — "gmail_search" or "gmail__search" both pass.
+    // Skip the prefix when the upstream name already starts with it
+    // (gmail__gmail_search would confuse LLMs that guess `gmail_search`).
     const normalized = original.toLowerCase();
     const prefix = server.toLowerCase();
     if (normalized.startsWith(prefix + '_') || normalized.startsWith(prefix + NAME_DELIMITER)) {
@@ -50,12 +32,7 @@ function namespacedName(server: string, original: string): string {
     return `${server}${NAME_DELIMITER}${original}`;
 }
 
-/**
- * Stringify an MCP tool result for the agent's text-only context window.
- * MCP results are arrays of content items (text, image, resource); we
- * flatten text segments and discard binary content with a marker so the
- * model knows something was returned but not surfaced inline.
- */
+/** Flatten content items to text; binary content gets a placeholder marker. */
 function flattenResult(result: NormalisedCallToolResult): string {
     if (!result.content || result.content.length === 0) {
         return result.isError ? '(error: no content returned)' : '(no content)';
@@ -80,11 +57,7 @@ function flattenResult(result: NormalisedCallToolResult): string {
     return result.isError ? `MCP tool error: ${joined}` : joined;
 }
 
-/**
- * Wrap one MCP tool as a flopsygraph BaseTool. `manager` stays bound
- * via closure so the tool can call back into the right client when the
- * agent invokes it.
- */
+/** Wrap one MCP tool as a flopsygraph BaseTool with the manager bound via closure. */
 export function bridgeMcpTool(
     server: string,
     tool: McpTool,
@@ -95,14 +68,8 @@ export function bridgeMcpTool(
         tool.description?.trim() ||
         `MCP tool ${tool.name} from ${server} (no description provided)`;
 
-    // Convert the MCP JSON Schema to Zod so the LLM sees real parameter types
-    // (required fields, enums, descriptions). Passthrough left a `{}` schema
-    // and — in practice — caused models to prefer other tools with detailed
-    // schemas (http_request) over MCP tools, because the MCP tool looked
-    // "unstructured" compared to competitors.
-    //
-    // If the inputSchema is missing or malformed, fall back to passthrough so
-    // the tool is still callable (MCP server does its own validation).
+    // Convert MCP JSON Schema → Zod so the LLM sees real parameter types.
+    // Falls back to passthrough on missing/malformed schema (MCP server validates server-side).
     const rawSchema = tool.inputSchema as Record<string, unknown> | undefined;
     let toolSchema: z.ZodType<Record<string, unknown>>;
     try {
@@ -123,10 +90,7 @@ export function bridgeMcpTool(
         schema: toolSchema,
         execute: async (args) => {
             try {
-                // No timeout override here — the client manager reads
-                // per-server `callTimeoutMs` from config and falls back to
-                // the 30s default. Set `mcp.servers.<name>.callTimeoutMs`
-                // in flopsy.json5 for file-heavy servers (obsidian, drive).
+                // Client manager reads per-server `callTimeoutMs` from config (30s default).
                 const result = await manager.callTool(
                     server, tool.name, args as Record<string, unknown>,
                 );
@@ -145,12 +109,7 @@ export function bridgeMcpTool(
     });
 }
 
-/**
- * Bridge ALL tools advertised by every connected server. Returns a
- * flat array, with collisions detected and logged (NOT silently
- * deduped — surfacing them in logs nudges the operator to rename in
- * config OR drop one of the conflicting servers).
- */
+/** Bridge ALL connected servers' tools; collisions are logged + skipped. */
 export async function bridgeAllTools(manager: McpClientManager): Promise<BridgedTool[]> {
     const out: BridgedTool[] = [];
     const seen = new Set<string>();
@@ -160,8 +119,6 @@ export async function bridgeAllTools(manager: McpClientManager): Promise<Bridged
         for (const tool of tools) {
             const bridged = bridgeMcpTool(server, tool, manager);
             if (seen.has(bridged.name)) {
-                // Theoretically impossible since we namespace by server,
-                // but log + skip if it ever happens (e.g. server-side dup).
                 log.warn(
                     { name: bridged.name, server },
                     'duplicate bridged tool name — skipping second',
@@ -177,18 +134,8 @@ export async function bridgeAllTools(manager: McpClientManager): Promise<Bridged
 }
 
 /**
- * Filter bridged tools by a server allow-list (the team-member's
- * `mcpServers` field OR the wildcard "*" in `assignTo`).
- *
- * Resolution order, first match wins:
- *   1. agent-side `mcpServers: ["gmail", "calendar"]` → only those
- *   2. server-side `assignTo: ["gandalf"]` includes agent name → include
- *   3. server-side `assignTo: ["*"]` → include for everyone
- *   4. otherwise → skip
- *
- * Implemented by passing both signals to this function. Either may be
- * empty: empty `agentRequested` means "no preference, use assignTo";
- * empty `assignTo` means "server is opt-in, no broadcast".
+ * Filter by allow-list (agent's `mcpServers` first; else server-side `assignTo`).
+ * Empty `agentRequested` → use assignTo; empty `assignTo` → opt-in only.
  */
 export function filterToolsForAgent(
     tools: readonly BridgedTool[],
@@ -196,8 +143,7 @@ export function filterToolsForAgent(
     agentRequested: readonly string[] | undefined,
     serverAssignToMap: Readonly<Record<string, readonly string[]>>,
 ): BridgedTool[] {
-    // Case-insensitive match: `assignTo: ["Sam"]` with agent `"sam"` used to
-    // silently drop every tool. Compare normalised values on both sides.
+    // Case-insensitive match — `assignTo: ["Sam"]` vs agent `"sam"` would otherwise drop.
     const needle = agentName.trim().toLowerCase();
     if (agentRequested && agentRequested.length > 0) {
         const set = new Set(agentRequested.map((n) => n.trim().toLowerCase()));

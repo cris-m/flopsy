@@ -1,7 +1,7 @@
 /**
  * `flopsy dnd` — toggle Do Not Disturb on the running gateway.
  *
- * Mirrors the `/dnd` slash command. Talks to the mgmt HTTP endpoint so
+ * Mirrors the `/dnd` slash command. Talks to the management HTTP endpoint so
  * the change takes effect on the live engine without a restart.
  *
  *   flopsy dnd                → show current state
@@ -13,7 +13,7 @@
 
 import { Command } from 'commander';
 import { bad, detail, ok, section } from '../ui/pretty';
-import { mgmtFetchJson } from './schedule-client';
+import { managementFetchJson } from './schedule-client';
 
 export function registerDndCommand(root: Command): void {
     const dnd = root
@@ -24,7 +24,7 @@ export function registerDndCommand(root: Command): void {
     dnd.command('status', { isDefault: true })
         .description('Show current DND state')
         .action(async () => {
-            const status = await mgmtFetchJson<DndSnapshot>('GET', '/mgmt/dnd');
+            const status = await managementFetchJson<DndSnapshot>('GET', '/management/dnd');
             if (!status) process.exit(1);
             if (!status.active) {
                 console.log(ok('DND off — proactive messages arrive normally.'));
@@ -45,7 +45,7 @@ export function registerDndCommand(root: Command): void {
                 console.log(bad(`Couldn't parse --for "${opts.for}". Use "30m", "2h", etc.`));
                 process.exit(1);
             }
-            const snap = await mgmtFetchJson<DndSnapshot>('POST', '/mgmt/dnd/on', {
+            const snap = await managementFetchJson<DndSnapshot>('POST', '/management/dnd/on', {
                 durationMs: ms,
                 reason: opts.reason,
             });
@@ -61,9 +61,9 @@ export function registerDndCommand(root: Command): void {
     dnd.command('off')
         .description('Clear DND immediately')
         .action(async () => {
-            const r = await mgmtFetchJson<{ ok?: boolean; message?: string }>(
+            const r = await managementFetchJson<{ ok?: boolean; message?: string }>(
                 'POST',
-                '/mgmt/dnd/off',
+                '/management/dnd/off',
                 {},
             );
             if (!r) process.exit(1);
@@ -79,7 +79,7 @@ export function registerDndCommand(root: Command): void {
                 console.log(bad(`Couldn't parse --until "${opts.until}". Use 24-hour format like "22:00".`));
                 process.exit(1);
             }
-            const snap = await mgmtFetchJson<DndSnapshot>('POST', '/mgmt/dnd/quiet', { untilMs });
+            const snap = await managementFetchJson<DndSnapshot>('POST', '/management/dnd/quiet', { untilMs });
             if (!snap) process.exit(1);
             console.log(ok(`Quiet hours until ${new Date(snap.untilMs!).toLocaleString()}`));
         });

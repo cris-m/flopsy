@@ -109,6 +109,30 @@ async function main(): Promise<void> {
     process.on('SIGTERM', () => {
         void shutdown('SIGTERM');
     });
+
+    // Belt-and-suspenders: contain EPIPE / ECONNRESET escaping from a
+    // crashed MCP child or any other stdio dependency. The MCP client
+    // manager already wires per-transport `onerror`/`onclose`, but a
+    // race between child death and a parent-side write can still surface
+    // as an unhandled error event before the transport handler fires.
+    // Treating these as recoverable — log + continue — keeps the gateway
+    // alive while the affected MCP client is marked failed.
+    process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
+        if (err && (err.code === 'EPIPE' || err.code === 'ECONNRESET')) {
+            log.warn({ err: err.message, code: err.code }, 'contained child-pipe error');
+            return;
+        }
+        log.fatal({ err }, 'uncaughtException — exiting');
+        void shutdown('uncaughtException');
+    });
+    process.on('unhandledRejection', (reason: unknown) => {
+        const err = reason as NodeJS.ErrnoException;
+        if (err && (err.code === 'EPIPE' || err.code === 'ECONNRESET')) {
+            log.warn({ err: err.message ?? String(reason), code: err.code }, 'contained child-pipe rejection');
+            return;
+        }
+        log.error({ reason }, 'unhandledRejection (non-fatal)');
+    });
 }
 
 main().catch((err) => {

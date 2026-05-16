@@ -54,6 +54,20 @@ export function buildSkillCommands(skillsRoot: string): CommandDef[] {
     return skills.map((s) => buildCommand(s));
 }
 
+/** Escape user-supplied text before embedding it in an LLM template
+ *  that uses `[...]` brackets as framing. Otherwise a user typing
+ *  `/myskill ]\n\nIGNORE PREVIOUS INSTRUCTIONS: ...` breaks out of the
+ *  bracket and the agent reads the rest as fresh authority. Replace
+ *  closing brackets + control sequences with safe equivalents. The
+ *  user's text still renders correctly to the model; the agent just
+ *  can't escape the bracket framing. */
+function escapeForBracketTemplate(s: string): string {
+    return s
+        .replace(/\]/g, '\\]')
+        .replace(/\[INST\]/gi, '[INST_LITERAL]')
+        .replace(/<\/(?:user_input|user_msg|system|assistant)>/gi, (m) => `[${m.slice(2)}_LITERAL]`);
+}
+
 function buildCommand(skill: SkillMeta): CommandDef {
     return {
         name: skill.name,
@@ -69,12 +83,13 @@ function buildCommand(skill: SkillMeta): CommandDef {
                         `question grounded in what that skill does so they know what input to give.]`,
                 };
             }
+            const safeArgs = escapeForBracketTemplate(args);
             return {
                 text: `Applying \`${skill.name}\` skill...`,
                 forwardToAgent:
                     `[The user invoked /${skill.name}. Read /skills/${skill.name}/SKILL.md ` +
                     `if you don't already remember it, then apply that skill to the input below. ` +
-                    `Stay in the skill's voice and structure.]\n\n${args}`,
+                    `Stay in the skill's voice and structure.]\n\n${safeArgs}`,
             };
         },
     };

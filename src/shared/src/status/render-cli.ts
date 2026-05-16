@@ -1,7 +1,6 @@
 /**
- * Terminal renderers — compact (default) and verbose. Pure string builders;
- * the caller passes in colour functions so the shared package stays
- * terminal-agnostic (tests can pass identity functions, CLI passes its theme).
+ * Terminal renderers — compact + verbose. Pure string builders; the caller
+ * supplies colour functions so the shared package stays terminal-agnostic.
  */
 
 import type { StatusSnapshot } from './types';
@@ -27,15 +26,11 @@ export const plainTheme: CliTheme = {
     heading: (s) => s,
 };
 
-/**
- * Compact render — one-line-per-section Hermes-style. Target: fits on a
- * single terminal screen (~12 lines), high info density.
- */
+/** Compact render: one line per section; fits a ~12-line terminal screen. */
 export function renderCliCompact(s: StatusSnapshot, t: CliTheme = plainTheme): string {
     const lines: string[] = [];
     const label = (name: string) => t.heading(`${GLYPH.diamond} ${name.padEnd(14)}`);
 
-    // Issues first (surface pain before stats)
     if (s.issues && s.issues.length > 0) {
         for (const i of s.issues) {
             const marker = i.severity === 'error' ? t.bad('✕') : t.warn('⚠');
@@ -43,7 +38,6 @@ export function renderCliCompact(s: StatusSnapshot, t: CliTheme = plainTheme): s
         }
     }
 
-    // Gateway
     {
         const parts: string[] = [];
         if (s.gateway.running) {
@@ -62,7 +56,6 @@ export function renderCliCompact(s: StatusSnapshot, t: CliTheme = plainTheme): s
         lines.push(`${label('Gateway')}${parts.join(t.dim(' · '))}`);
     }
 
-    // Channels
     {
         const enabled = s.channels.filter((c) => c.enabled);
         const disabled = s.channels.filter((c) => !c.enabled);
@@ -75,7 +68,6 @@ export function renderCliCompact(s: StatusSnapshot, t: CliTheme = plainTheme): s
         lines.push(`${label('Channels')}${countStr}   ${dots.join('  ')}`);
     }
 
-    // Team
     {
         if (s.team.length === 0) {
             lines.push(`${label('Team')}${t.dim('none configured')}`);
@@ -99,7 +91,6 @@ export function renderCliCompact(s: StatusSnapshot, t: CliTheme = plainTheme): s
         }
     }
 
-    // Proactive
     {
         const p = s.proactive;
         const bits: string[] = [];
@@ -129,7 +120,6 @@ export function renderCliCompact(s: StatusSnapshot, t: CliTheme = plainTheme): s
         lines.push(`${label('Proactive')}${bits.join('  ')}`);
     }
 
-    // Integrations
     {
         const i = s.integrations;
         const bits: string[] = [];
@@ -152,7 +142,6 @@ export function renderCliCompact(s: StatusSnapshot, t: CliTheme = plainTheme): s
         lines.push(`${label('Integrations')}${bits.join('   ')}`);
     }
 
-    // Work — only when there's active or very recent background work to surface
     if (s.work && (s.work.active.length > 0 || (s.work.recent?.length ?? 0) > 0)) {
         const bits: string[] = [];
         if (s.work.active.length > 0) {
@@ -168,21 +157,16 @@ export function renderCliCompact(s: StatusSnapshot, t: CliTheme = plainTheme): s
         lines.push(`${label('Work')}${bits.join('  ')}`);
     }
 
-    // Paths (footer)
     lines.push(`${label('Paths')}${t.dim(tildePath(s.paths.config))}`);
 
     return lines.join('\n');
 }
 
-/**
- * Verbose render — expanded per-section detail. Hermes-style `◆ Heading` with
- * indented rows. Heavier but readable; invoked via `flopsy status --verbose`.
- */
+/** Verbose render: `◆ Heading` with indented rows. Used by `flopsy status --verbose`. */
 export function renderCliVerbose(s: StatusSnapshot, t: CliTheme = plainTheme): string {
     const lines: string[] = [];
     const heading = (name: string) => t.heading(`${GLYPH.diamond} ${name}`);
 
-    // Issues first (prominent, full text)
     if (s.issues && s.issues.length > 0) {
         lines.push(heading('Attention'));
         for (const i of s.issues) {
@@ -193,7 +177,6 @@ export function renderCliVerbose(s: StatusSnapshot, t: CliTheme = plainTheme): s
         lines.push('');
     }
 
-    // Gateway
     lines.push(heading('Gateway'));
     if (s.gateway.running) {
         lines.push(`  state        ${t.ok('running')}`);
@@ -211,7 +194,6 @@ export function renderCliVerbose(s: StatusSnapshot, t: CliTheme = plainTheme): s
     }
     lines.push('');
 
-    // Channels
     {
         const total = s.channels.length;
         const enabledCount = s.channels.filter((c) => c.enabled).length;
@@ -228,7 +210,6 @@ export function renderCliVerbose(s: StatusSnapshot, t: CliTheme = plainTheme): s
         lines.push('');
     }
 
-    // Team
     {
         const total = s.team.length;
         const enabledCount = s.team.filter((m) => m.enabled).length;
@@ -252,7 +233,6 @@ export function renderCliVerbose(s: StatusSnapshot, t: CliTheme = plainTheme): s
         lines.push('');
     }
 
-    // Proactive
     {
         const p = s.proactive;
         lines.push(heading('Proactive'));
@@ -299,11 +279,9 @@ export function renderCliVerbose(s: StatusSnapshot, t: CliTheme = plainTheme): s
         lines.push('');
     }
 
-    // Integrations
     {
         const i = s.integrations;
         lines.push(heading('Integrations'));
-        // Auth
         if (i.auth.length === 0) {
             lines.push(`  auth         ${t.dim('none · run `flopsy auth <provider>`')}`);
         } else {
@@ -318,13 +296,11 @@ export function renderCliVerbose(s: StatusSnapshot, t: CliTheme = plainTheme): s
                 lines.push(`  auth         ${name.padEnd(24)} ${tag}`);
             }
         }
-        // MCP
         lines.push(
             `  mcp          ${
                 i.mcp.enabled ? t.ok(`${i.mcp.active}/${i.mcp.configured} servers enabled`) : t.bad('disabled')
             }`,
         );
-        // Memory
         lines.push(
             `  memory       ${
                 i.memory.enabled
@@ -335,7 +311,6 @@ export function renderCliVerbose(s: StatusSnapshot, t: CliTheme = plainTheme): s
         lines.push('');
     }
 
-    // Paths
     lines.push(heading('Paths'));
     lines.push(`  config       ${tildePath(s.paths.config)}`);
     lines.push(`  state        ${tildePath(s.paths.state)}`);

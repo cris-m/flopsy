@@ -2,6 +2,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import type { Peer, OutboundMessage, ReactionOptions, Message, Media } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
+import { resolveMediaSource } from '@gateway/core/media-resolver';
 import type { IMessageChannelConfig } from './types';
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
@@ -18,6 +19,8 @@ export class IMessageChannel extends BaseChannel {
     private readonly cliPath: string;
     private pollTimer: ReturnType<typeof setInterval> | null = null;
     private lastTimestamp: string = new Date().toISOString();
+    /** Re-entrancy guard — POLL_INTERVAL (3s) < EXEC_TIMEOUT (15s) would overlap pollers. */
+    private polling = false;
 
     constructor(config: IMessageChannelConfig) {
         super(config);
@@ -59,18 +62,45 @@ export class IMessageChannel extends BaseChannel {
 
         if (message.media?.length) {
             for (const media of message.media) {
-                if (!media.url) continue;
+                const resolved = await resolveMediaSource(media);
+                if (!resolved.ok) {
+                    this.log.warn(
+                        { recipient, mediaType: media.type, mediaUrl: media.url, reason: resolved.reason, detail: resolved.detail, op: 'send:media:rejected' },
+                        'imessage send: media resolution failed — skipping attachment',
+                    );
+                    continue;
+                }
+                // imsg CLI's --file requires a local path; URLs/buffers can't be passed.
+                if (resolved.source.kind !== 'local-path') {
+                    this.log.warn(
+                        { recipient, mediaType: media.type, sourceKind: resolved.source.kind, reason: 'imessage-requires-local-path', op: 'send:media:rejected' },
+                        'imessage send: imsg CLI only accepts local file paths — skipping attachment',
+                    );
+                    continue;
+                }
                 await execFileAsync(
                     this.cliPath,
-                    ['send', '--to', recipient, '--file', media.url],
+                    ['send', '--to', recipient, '--file', resolved.source.absPath],
                     { timeout: EXEC_TIMEOUT_MS },
                 );
             }
         }
 
         if (message.body?.trim()) {
-            await execFileAsync(this.cliPath, ['send', '--to', recipient, '--text', message.body], {
-                timeout: EXEC_TIMEOUT_MS,
+            // Pipe body via stdin — macOS argv cap (~256KB) would E2BIG on long replies.
+            await new Promise<void>((resolve, reject) => {
+                const child = execFile(
+                    this.cliPath,
+                    ['send', '--to', recipient, '--stdin'],
+                    { timeout: EXEC_TIMEOUT_MS },
+                    (err) => (err ? reject(err) : resolve()),
+                );
+                if (!child.stdin) {
+                    reject(new Error('imsg child has no stdin'));
+                    return;
+                }
+                child.stdin.write(message.body!);
+                child.stdin.end();
             });
         }
 
@@ -79,23 +109,22 @@ export class IMessageChannel extends BaseChannel {
 
     async sendTyping(_peer: Peer): Promise<void> {}
 
-    /**
-     * iMessage tapbacks are not exposed by the `imsg` CLI this adapter uses,
-     * and the alternative — UI automation via osascript — is fragile across
-     * macOS versions (Apple has removed/restricted the AutomatedTapbackEvent
-     * APIs multiple times since macOS 13). Rather than ship a sometimes-works
-     * implementation that silently drops on minor macOS updates, this stub
-     * stays a no-op. The channel doesn't advertise 'reactions' in
-     * capabilities, so beginTaskPresence falls through to typing-only (which
-     * is also unsupported here, so iMessage gets no async-progress signal —
-     * the final reply is the only user feedback). If you need progress
-     * signals on iMessage, the cleanest path is an ephemeral status message
-     * pattern (send "⏳ working…" then edit/delete on completion) — but
-     * iMessage edit/delete via CLI is also platform-limited as of this writing.
-     */
+    /** iMessage tapbacks are not exposed by the imsg CLI; AppleScript automation is
+     *  fragile across macOS versions. No-op; not advertised in capabilities. */
     async react(_options: ReactionOptions): Promise<void> {}
 
     private async poll(): Promise<void> {
+        // Skip if a prior poll is still in flight (CLI can run up to 15s under load).
+        if (this.polling) return;
+        this.polling = true;
+        try {
+            await this.pollImpl();
+        } finally {
+            this.polling = false;
+        }
+    }
+
+    private async pollImpl(): Promise<void> {
         let stdout: string;
         try {
             const result = await execFileAsync(
@@ -125,6 +154,8 @@ export class IMessageChannel extends BaseChannel {
             return;
         }
 
+        // Advance only after successful emit so a throw doesn't drop the failed message.
+        let maxProcessedTimestamp: string | null = null;
         for (const msg of messages) {
             if (!msg.text && !msg.attachments?.length) continue;
             if (msg.is_from_me && !this.channelConfig.selfChatMode) continue;
@@ -172,8 +203,12 @@ export class IMessageChannel extends BaseChannel {
                 media: media.length > 0 ? media : undefined,
             };
 
-            this.lastTimestamp = normalized.timestamp;
+            // Emit first; advance timestamp only on success.
             await this.emit('onMessage', normalized);
+            maxProcessedTimestamp = normalized.timestamp;
+        }
+        if (maxProcessedTimestamp) {
+            this.lastTimestamp = maxProcessedTimestamp;
         }
     }
 }

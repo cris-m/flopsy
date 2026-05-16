@@ -1,7 +1,15 @@
+import { createLogger } from '@flopsy/shared';
 import type { Media } from '@gateway/types';
+
+const log = createLogger('message-queue');
 
 const DEFAULT_COALESCE_DELAY_MS = 300;
 const MAX_QUEUED_MESSAGES = 500;
+
+/** Throttle the overflow warning. Without this, a flood of inbound
+ *  messages spams the log thousands of times — we only need the
+ *  first warning per minute to know the worker is under-capacity. */
+const OVERFLOW_LOG_INTERVAL_MS = 60_000;
 
 export interface QueuedMessage {
     readonly text: string;
@@ -15,6 +23,8 @@ export class MessageQueue {
     private waiter: ((batch: QueuedMessage[]) => void) | null = null;
     private coalesceTimer: ReturnType<typeof setTimeout> | null = null;
     private readonly coalesceDelayMs: number;
+    private lastOverflowWarnAt = 0;
+    private overflowDropsSinceWarn = 0;
 
     constructor(coalesceDelayMs: number = DEFAULT_COALESCE_DELAY_MS) {
         this.coalesceDelayMs = coalesceDelayMs;
@@ -24,9 +34,28 @@ export class MessageQueue {
         return this.buffer.length;
     }
 
-    enqueue(text: string, media?: ReadonlyArray<Media>, synthetic?: boolean): void {
+    /**
+     * Returns true if the message was accepted, false if dropped due to
+     * overflow. Callers that mirror per-message state (e.g. global queue
+     * id tracking in channel-worker) MUST check the return value and
+     * skip the mirror push on `false` — otherwise the mirror grows
+     * unbounded while the underlying queue stays at cap.
+     */
+    enqueue(text: string, media?: ReadonlyArray<Media>, synthetic?: boolean): boolean {
         if (this.buffer.length >= MAX_QUEUED_MESSAGES) {
-            this.buffer.shift();
+            // Drop newest (see P4-I8 comment). Throttle the warning so
+            // a sustained flood doesn't fill disk.
+            this.overflowDropsSinceWarn += 1;
+            const now = Date.now();
+            if (now - this.lastOverflowWarnAt > OVERFLOW_LOG_INTERVAL_MS) {
+                log.warn(
+                    { drops: this.overflowDropsSinceWarn, cap: MAX_QUEUED_MESSAGES },
+                    'message queue at capacity — dropping newest messages',
+                );
+                this.lastOverflowWarnAt = now;
+                this.overflowDropsSinceWarn = 0;
+            }
+            return false;
         }
 
         this.buffer.push({ text, enqueuedAt: Date.now(), media, synthetic });
@@ -42,6 +71,7 @@ export class MessageQueue {
             }, this.coalesceDelayMs);
             this.coalesceTimer.unref();
         }
+        return true;
     }
 
     dequeue(): Promise<QueuedMessage[]> {

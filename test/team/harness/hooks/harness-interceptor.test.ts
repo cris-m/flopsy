@@ -107,12 +107,6 @@ describe('beforeModelCall — <presence> block', () => {
             peerNativeId: '123456789',
         });
         const session = store.openSession({ peerId: PEER, source: 'user' });
-        store.recordMessage({
-            userId: PEER,
-            threadId: `${PEER}#${session.sessionId}`,
-            role: 'user',
-            content: 'hi',
-        });
         store.touchSession(session.sessionId, 'user');
         const text = await injectedText();
         expect(text ?? '').not.toContain('<presence');
@@ -127,12 +121,6 @@ describe('beforeModelCall — <presence> block', () => {
                 peerNativeId: '123456789',
             });
             const session = store.openSession({ peerId: PEER, source: 'user' });
-            store.recordMessage({
-                userId: PEER,
-                threadId: `${PEER}#${session.sessionId}`,
-                role: 'user',
-                content: 'old message',
-            });
             store.touchSession(session.sessionId, 'user');
             store.closeSession(session.sessionId, 'user');
             store.setSessionSummary(session.sessionId, 'old chat');

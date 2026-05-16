@@ -16,7 +16,8 @@ export type RouteHandler = (
     res: ServerResponse,
 ) => Promise<void>;
 
-const DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024;
+// 2 MB covers every webhook platform we integrate; channels override via maxBodyBytes.
+const DEFAULT_MAX_BODY_BYTES = 2 * 1024 * 1024;
 const DEDUP_TTL_MS = 3_600_000;
 const MAX_DEDUP_ENTRIES = 50_000;
 
@@ -28,9 +29,7 @@ export class WebhookServer {
     private readonly processed = new Map<string, number>();
     private cleanupInterval: ReturnType<typeof setInterval> | null = null;
     private readonly routes = new Map<string, RouteHandler>();
-    // Paths registered with `ownsSignature: true` verify their own signature
-    // inline; the global-secret check is skipped for these so per-route
-    // secrets don't collide with `webhook.secret` from flopsy.json5.
+    // Routes with own signature verification skip the global secret check.
     private readonly routesOwnSignature = new Set<string>();
     private readonly rateLimiter = new RateLimiter();
 
@@ -130,26 +129,7 @@ export class WebhookServer {
             return this.respond(res, 200, { status: 'ok' });
         }
 
-        // GET/HEAD on registered paths return 200 for reachability probes
-        // (LINE, Slack tools). Unregistered paths 404 to avoid leaking the
-        // route table to scanners.
-        if (req.method === 'GET' || req.method === 'HEAD') {
-            const url = req.url ?? '/';
-            const matched = [...this.routes.keys()].some((prefix) => url.startsWith(prefix));
-            if (matched) {
-                return this.respond(res, 200, {
-                    status: 'ok',
-                    method: 'POST',
-                    info: 'webhook endpoint — send POST with JSON body to deliver an event',
-                });
-            }
-            return this.respond(res, 404, { error: 'Unknown webhook endpoint' });
-        }
-
-        if (req.method !== 'POST') {
-            return this.respond(res, 405, { error: 'Method not allowed' });
-        }
-
+        // IP allowlist + rate-limit gate all methods (including GET) before route lookup.
         const clientIp = this.getClientIp(req);
         if (this.config?.allowedIps?.length) {
             if (!this.config.allowedIps.includes(clientIp)) {
@@ -167,9 +147,30 @@ export class WebhookServer {
             return this.respond(res, 429, { error: 'Too many requests' });
         }
 
+        // GET/HEAD on registered paths return 200 (LINE/Slack reachability probes).
+        if (req.method === 'GET' || req.method === 'HEAD') {
+            const url = req.url ?? '/';
+            const matched = [...this.routes.keys()].some((prefix) => url.startsWith(prefix));
+            if (matched) {
+                return this.respond(res, 200, {
+                    status: 'ok',
+                    method: 'POST',
+                    info: 'webhook endpoint — send POST with JSON body to deliver an event',
+                });
+            }
+            return this.respond(res, 404, { error: 'Unknown webhook endpoint' });
+        }
+
+        if (req.method !== 'POST') {
+            return this.respond(res, 405, { error: 'Method not allowed' });
+        }
+
         let body: string;
+        let raw: Buffer;
         try {
-            body = await this.readBody(req);
+            const result = await this.readBody(req);
+            body = result.body;
+            raw = result.raw;
         } catch (err) {
             if (err instanceof Error && err.message === 'body too large') {
                 return this.respond(res, 413, { error: 'Request body too large' });
@@ -181,8 +182,7 @@ export class WebhookServer {
             return this.respond(res, 400, { error: 'Empty body' });
         }
 
-        // Global signature check skipped when the matched route owns its own
-        // signature (route's own secret would 401 against the global secret).
+        // Skip global signature check for routes that own their own verification.
         if (this.config?.secret) {
             const reqUrl = req.url ?? '/';
             const matchedRouteOwnsSig = [...this.routesOwnSignature].some((prefix) =>
@@ -194,7 +194,8 @@ export class WebhookServer {
                     this.log.warn('missing webhook signature');
                     return this.respond(res, 401, { error: 'Missing signature' });
                 }
-                if (!verifyWebhookSignature(this.config.secret, body, sigHeader)) {
+                // Verify against raw bytes — providers sign original request bytes.
+                if (!verifyWebhookSignature(this.config.secret, raw, sigHeader)) {
                     this.log.warn('invalid webhook signature');
                     return this.respond(res, 401, { error: 'Invalid signature' });
                 }
@@ -331,7 +332,7 @@ export class WebhookServer {
         return null;
     }
 
-    private async readBody(req: IncomingMessage): Promise<string> {
+    private async readBody(req: IncomingMessage): Promise<{ body: string; raw: Buffer }> {
         const maxBytes = this.config?.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
         return new Promise((resolve, reject) => {
             const chunks: Buffer[] = [];
@@ -350,7 +351,9 @@ export class WebhookServer {
             req.on('end', () => {
                 if (!settled) {
                     settled = true;
-                    resolve(Buffer.concat(chunks).toString());
+                    // Keep both forms: string for handlers, Buffer for raw-bytes HMAC.
+                    const raw = Buffer.concat(chunks);
+                    resolve({ body: raw.toString(), raw });
                 }
             });
             req.on('error', (err) => {
@@ -363,7 +366,19 @@ export class WebhookServer {
     }
 
     private getClientIp(req: IncomingMessage): string {
-        return req.socket.remoteAddress ?? '';
+        // Trust X-Forwarded-For only from loopback (assumed trusted proxy on same host).
+        const directIp = req.socket.remoteAddress ?? '';
+        if (isLoopbackIp(directIp)) {
+            const fwd = req.headers['x-forwarded-for'];
+            const fwdStr = Array.isArray(fwd) ? fwd[0] : fwd;
+            if (typeof fwdStr === 'string' && fwdStr.length > 0) {
+                // Left-most XFF entry is the original client; strip `[ipv6]:port` form.
+                const firstHop = fwdStr.split(',')[0]!.trim();
+                const stripped = firstHop.replace(/^\[|\](:\d+)?$/g, '').replace(/:\d+$/, '');
+                if (stripped.length > 0) return stripped;
+            }
+        }
+        return directIp;
     }
 
     private isDuplicate(eventId: string): boolean {

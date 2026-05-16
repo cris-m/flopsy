@@ -194,6 +194,8 @@ export interface Channel {
 
     clearSession?(): Promise<void>;
     editMessage?(messageId: string, peer: Peer, body: string): Promise<void>;
+    /** Delete previously-sent message; used to clear orphan stream previews. */
+    deleteMessage?(messageId: string, peer: Peer): Promise<void>;
     updateAccessControl?(update: AccessControlUpdate): void;
     pairingRequestHandler?: PairingRequestHandler | null;
 
@@ -266,12 +268,16 @@ export interface ChannelWorkerConfig {
     readonly getGatewayStatus?: () => GatewayStatusSnapshot | undefined;
     /** BaseChatModel for conditional webhook delivery (typed `unknown` to avoid cycle). */
     readonly structuredOutputModel?: unknown;
+    /** Lifecycle-reaction policy; defaults to `{ direct: true, group: 'mentions' }`. */
+    readonly reactionPolicy?: {
+        readonly direct: boolean;
+        readonly group: 'always' | 'mentions' | 'never';
+    };
+    /** Pre-placed ackReaction.emoji reused as running indicator (avoids stacking). */
+    readonly ackEmoji?: string;
 }
 
-/**
- * User-safe snapshot for chat commands. No tokens / peer ids / URLs / paths —
- * adding fields here is a conscious privacy choice.
- */
+/** User-safe snapshot for chat commands; no tokens, peer ids, URLs, or paths. */
 export interface GatewayStatusSnapshot {
     readonly uptimeMs: number;
     readonly channels: ReadonlyArray<{

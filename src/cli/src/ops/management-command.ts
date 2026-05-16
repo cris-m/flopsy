@@ -1,29 +1,31 @@
 /**
- * `flopsy mgmt ...` — live queries against the running gateway's
+ * `flopsy management ...` — live queries against the running gateway's
  * management HTTP endpoint.
  *
  * Companion to `flopsy status` (config-only). When the gateway is
- * running, `mgmt status` hits the live process so you see truth:
+ * running, `management status` hits the live process so you see truth:
  * which channels actually connected, how many threads are instantiated,
  * today's token totals, etc.
  *
- * Auth: `FLOPSY_MGMT_TOKEN` env var (optional). Gateway binds localhost
+ * Auth: `FLOPSY_MGMT_TOKEN` env var or <FLOPSY_HOME>/mgmt-token file.
+ * Both gateway and CLI read the same locations. Gateway binds localhost
  * only so the socket isn't reachable off-box.
  */
 
 import { Command } from 'commander';
+import { loadMgmtToken } from '@flopsy/shared';
 import { bad, dim, info, ok, row, section } from '../ui/pretty';
-import { mgmtUrl } from './schedule-client';
+import { managementUrl } from './schedule-client';
 
-export function registerMgmtCommands(root: Command): void {
-    const mgmt = root
-        .command('mgmt')
+export function registerManagementCommands(root: Command): void {
+    const management = root
+        .command('management')
         .description('Live queries against the running gateway (ping / status)');
 
-    mgmt.command('ping')
-        .description('Verify the gateway mgmt endpoint is responding')
+    management.command('ping')
+        .description('Verify the gateway management endpoint is responding')
         .action(async () => {
-            const url = mgmtUrl('/mgmt/ping');
+            const url = managementUrl('/management/ping');
             try {
                 const res = await fetchWithAuth(url);
                 const body = await res.json();
@@ -42,11 +44,11 @@ export function registerMgmtCommands(root: Command): void {
             }
         });
 
-    mgmt.command('status')
+    management.command('status')
         .description('Live status snapshot from the running gateway')
         .option('--json', 'Emit raw JSON')
         .action(async (opts: { json?: boolean }) => {
-            const url = mgmtUrl('/mgmt/status');
+            const url = managementUrl('/management/status');
             try {
                 const res = await fetchWithAuth(url);
                 if (!res.ok) {
@@ -71,7 +73,7 @@ export function registerMgmtCommands(root: Command): void {
 }
 
 async function fetchWithAuth(url: string): Promise<Response> {
-    const token = process.env['FLOPSY_MGMT_TOKEN'];
+    const token = loadMgmtToken();
     return fetch(url, {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
         signal: AbortSignal.timeout(3000),

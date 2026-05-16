@@ -1,6 +1,6 @@
 /**
  * `flopsy tasks` — inspect in-flight and recent background tasks across
- * every thread. Data comes from the running gateway's `/mgmt/tasks`
+ * every thread. Data comes from the running gateway's `/management/tasks`
  * endpoint — this command cannot operate offline.
  *
  * Surfaces:
@@ -14,9 +14,9 @@
 
 import { Command } from 'commander';
 import chalk from 'chalk';
-import { agoLabel, truncate } from '@flopsy/shared';
+import { agoLabel, loadMgmtToken, truncate } from '@flopsy/shared';
 import { bad, dim, info, ok, section } from '../ui/pretty';
-import { mgmtUrl } from './schedule-client';
+import { managementUrl } from './schedule-client';
 
 interface TaskRow {
     readonly id: string;
@@ -93,8 +93,8 @@ function buildFilters(opts: {
 
 async function fetchTasks(params: Record<string, string>): Promise<TaskRow[]> {
     const qs = new URLSearchParams(params).toString();
-    const url = mgmtUrl(`/mgmt/tasks${qs ? '?' + qs : ''}`);
-    const token = process.env['FLOPSY_MGMT_TOKEN'];
+    const url = managementUrl(`/management/tasks${qs ? '?' + qs : ''}`);
+    const token = loadMgmtToken();
     try {
         const res = await fetch(url, {
             headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -113,7 +113,7 @@ async function fetchTasks(params: Record<string, string>): Promise<TaskRow[]> {
         return body.tasks ?? [];
     } catch (err) {
         const hint = err instanceof Error ? err.message : String(err);
-        console.log(bad(`mgmt endpoint unreachable at ${url}`));
+        console.log(bad(`management endpoint unreachable at ${url}`));
         console.log(info(`gateway not running? start it with \`flopsy gateway start\`. hint: ${hint}`));
         process.exit(1);
     }

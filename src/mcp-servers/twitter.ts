@@ -315,7 +315,11 @@ server.registerTool(
 server.registerTool(
     'twitter_news',
     {
-        description: 'Get trending news and topics from X/Twitter',
+        description: [
+            'Get trending news and topics from X/Twitter.',
+            'Each item carries a public `url` (e.g. https://x.com/i/trending/<id>) — INCLUDE that URL when listing topics so the user can click through to the trend page on X.',
+            'No summary is fetched per topic; if the user wants one, do a follow-up `twitter_search` with the headline.',
+        ].join('\n'),
         inputSchema: {
             count: z.number().optional().default(10).describe('Number of items'),
             category: z
@@ -334,7 +338,23 @@ server.registerTool(
         if (!result.success) {
             return { content: [{ type: 'text', text: `Error: ${result.error}` }] };
         }
-        return { content: [{ type: 'text', text: JSON.stringify(result.data, null, 2) }] };
+
+        // bird returns `twitter://trending/<id>` for both `id` and `url`.
+        // That scheme isn't clickable from a chat client. Map it to the
+        // public X.com trend page so the agent can surface a real link.
+        const TRENDING_URI = /^twitter:\/\/trending\/(\d+)$/;
+        const items = Array.isArray(result.data) ? result.data : [];
+        const enriched = items.map((raw) => {
+            const item = raw as Record<string, unknown>;
+            const url = typeof item['url'] === 'string' ? item['url'] : '';
+            const m = url.match(TRENDING_URI);
+            if (m && m[1]) {
+                return { ...item, url: `https://x.com/i/trending/${m[1]}` };
+            }
+            return item;
+        });
+
+        return { content: [{ type: 'text', text: JSON.stringify(enriched, null, 2) }] };
     },
 );
 

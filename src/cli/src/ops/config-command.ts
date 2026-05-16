@@ -96,8 +96,10 @@ export function registerConfigCommand(root: Command): void {
             });
         });
 
-    // Default: `flopsy config` with no subcommand → dump whole config
-    cfg.action(() => {
+    // Default: `flopsy config` with no subcommand → show help (use `dump` for full config).
+    cfg.action((_opts: unknown, cmd: { outputHelp(): void }) => cmd.outputHelp());
+
+    cfg.command('dump').description('Print the full flopsy.json5 contents').action(() => {
         const { path, config } = readFlopsyConfig();
         console.log(section('Config'));
         console.log(dim(`file: ${path}`));

@@ -1,7 +1,5 @@
 import { z } from 'zod';
 
-// Model configuration: simple provider:name references with per-model config.
-
 const modelConfigSchema = z
     .object({
         temperature: z.number().min(0).max(2).optional(),
@@ -14,6 +12,10 @@ const modelConfigSchema = z
         reasoning: z.boolean().optional(),
         baseUrl: z.string().url().optional(),
         stopSequences: z.array(z.string()).optional(),
+        // Ollama knobs forwarded via `extra_body` on the OpenAI-compat path.
+        numCtx: z.number().int().positive().optional(),
+        keepAlive: z.string().optional(),
+        recursionLimit: z.number().int().positive().optional(),
     })
     .strict()
     .optional();
@@ -95,6 +97,14 @@ const telegramSchema = baseChannelSchema.extend({
     group: groupSchema.default({}),
     token: z.string().default(''),
     botUsername: z.string().default(''),
+    streaming: z
+        .object({
+            /** Live streaming preview — edit placeholder as chunks arrive. */
+            enabled: z.boolean().default(true),
+            /** 1000ms is the empirical sweet spot — lower triggers 429s; higher loses live feel. */
+            minEditIntervalMs: z.number().int().positive().default(1000),
+        })
+        .default({}),
 });
 
 const discordPresenceSchema = z
@@ -223,13 +233,8 @@ const gatewaySchema = z.object({
             maxEntries: z.number().default(10_000),
         })
         .default({}),
-    /**
-     * Management HTTP endpoint for CLI live-queries (e.g. `flopsy mgmt status`).
-     * Listens on 127.0.0.1 only. Auth via env `FLOPSY_MGMT_TOKEN` (optional —
-     * when unset, any localhost caller is trusted since the socket isn't
-     * reachable off-box anyway). Defaults to port = gateway.port + 1.
-     */
-    mgmt: z
+    /** Management HTTP endpoint for CLI live-queries. 127.0.0.1 only; auth via `FLOPSY_MGMT_TOKEN`. */
+    management: z
         .object({
             enabled: z.boolean().default(true),
             host: z.string().default('127.0.0.1'),
@@ -294,6 +299,12 @@ const heartbeatDefinitionSchema = z.object({
         .optional(),
     oneshot: z.boolean().default(false),
     delivery: deliveryTargetSchema.optional(),
+    // No-agent / pre-check: tiny scripts gate the fire to cut LLM cost.
+    noAgent: z.boolean().default(false),
+    script: z.string().optional(),          // path under FLOPSY_HOME/scripts/
+    preCheckScript: z.string().optional(),  // path under FLOPSY_HOME/scripts/
+    // Skills pre-loaded as authority context; resolved to .flopsy/content/skills/<name>/SKILL.md.
+    skills: z.array(z.string().min(1)).optional(),
 });
 
 const cronScheduleSchema = z.discriminatedUnion('kind', [
@@ -313,6 +324,10 @@ const cronPayloadSchema = z.object({
     threadId: z.string().optional(),
     deliveryMode: z.enum(['always', 'conditional', 'silent']).default('always'),
     oneshot: z.boolean().default(false),
+    noAgent: z.boolean().default(false),
+    script: z.string().optional(),
+    preCheckScript: z.string().optional(),
+    skills: z.array(z.string().min(1)).optional(),
 });
 
 const jobDefinitionSchema = z.object({
@@ -343,28 +358,11 @@ const proactiveSchema = z
         retryQueuePath: z.string().default('state/retry-queue.json'),
         /** Fallback delivery target when a schedule has no explicit `delivery`. */
         delivery: deliveryTargetSchema.optional(),
-        /**
-         * When true, proactive messages without an explicit `delivery` go to
-         * the channel+peer of the user's MOST RECENT inbound message (auto-
-         * routes to wherever they're chatting). Falls back to
-         * `proactive.delivery` when no inbound activity has been recorded yet.
-         */
+        /** Auto-route to the channel+peer of the user's most recent inbound message. */
         followActiveChannel: z.boolean().default(false),
-        /**
-         * Cosine-similarity threshold for delivery dedup. When an embedding
-         * matches a prior delivery above this value within `similarityWindowMs`,
-         * the message is suppressed.  nomic-embed-text hits ~0.88–0.95 on
-         * paraphrases of the same topic; raise toward 0.98 to allow more
-         * repetition, lower toward 0.80 to allow less.  Default: 0.88.
-         * Note: similarity dedup is bypassed entirely for deliveryMode 'always'.
-         */
+        /** Cosine threshold for delivery dedup (bypassed for deliveryMode 'always'). */
         similarityThreshold: z.number().min(0).max(1).default(0.88),
-        /**
-         * How far back (in ms) to scan for similar deliveries. Deliveries
-         * older than this window do not count against the similarity check.
-         * Default: 48 h.  Set lower (e.g. 14400000 = 4 h) for high-frequency
-         * heartbeats where the same topic naturally recurs every day.
-         */
+        /** Scan window for similarity dedup. Default 48h. */
         similarityWindowMs: z
             .number()
             .int()
@@ -373,10 +371,7 @@ const proactiveSchema = z
         heartbeats: z
             .object({
                 enabled: z.boolean().default(false),
-                /** @deprecated Since v2 — schedules live in proactive.db. This
-                 * array is kept only for one-time migration on first boot
-                 * (see `configSeededAt` in proactive.json). Edit schedules via
-                 * `flopsy schedule` CLI or the manage_schedule agent tool. */
+                /** @deprecated Schedules live in proactive.db; array kept only for one-time migration. */
                 heartbeats: z.array(heartbeatDefinitionSchema).default([]),
             })
             .default({}),
@@ -399,38 +394,22 @@ const workspaceSchema = z
     })
     .default({});
 
-// Human-in-the-loop approval — thin wrapper over flopsygraph's humanApproval()
-// interceptor. When a gated tool is called, the graph pauses via GraphInterrupt
-// and the gateway renders a review prompt on the active channel.
+// Human-in-the-loop approval — thin wrapper over flopsygraph's humanApproval() interceptor.
 const approvalsSchema = z.object({
-    // Which tools require approval. Accepts a string[] of tool names or 'all'.
     tools: z.union([z.array(z.string()), z.literal('all')]),
-    // Which review actions the user can choose from. Default: all four.
     actions: z
         .array(z.enum(['approve', 'skip', 'revise', 'feedback']))
         .optional(),
 });
 
 /**
- * Per-agent sandbox configuration. When `enabled: true` the agent gets
- * an `execute_code` tool. When `programmaticToolCalling: true` the agent
- * can pass `use_tools: true` on each call so the sandboxed code can
- * call ANY of the agent's tools as regular functions; only the printed
- * output enters the LLM context.
- *
- * Only `enabled` is required. All other fields carry sensible defaults
- * suitable for local development. For production set `backend: 'docker'`
- * and harden `memoryLimit` / `timeout`.
+ * Per-agent sandbox configuration. `enabled: true` adds an `execute_code` tool;
+ * `programmaticToolCalling: true` lets sandboxed code call any of the agent's
+ * tools as regular functions (only printed output enters LLM context).
  */
 const sandboxConfigSchema = z.object({
     enabled: z.boolean().default(false),
-    /**
-     * Sandbox backend name. Built-ins: `local`, `docker`, `kubernetes`.
-     * Custom backends become valid here once registered via
-     * `registerSandboxBackend(name, ...)` at boot. Validated at runtime
-     * by `createSession` — a typo or unregistered name throws with the
-     * list of registered backends.
-     */
+    /** Built-ins: `local`, `docker`, `kubernetes`. Validated at runtime by `createSession`. */
     backend: z.string().default('local'),
     language: z.enum(['python', 'javascript', 'typescript', 'bash']).default('python'),
     /** Hard wall-clock cap on a single execution, in ms. */
@@ -439,135 +418,63 @@ const sandboxConfigSchema = z.object({
     memoryLimit: z.number().int().positive().optional(),
     /** CPU shares (Docker/K8s only). */
     cpuLimit: z.number().positive().optional(),
-    /**
-     * Allow the sandbox to reach the network. Auto-enabled when
-     * `programmaticToolCalling: true` so the sandbox can call back to
-     * the tool bridge on `host.docker.internal`.
-     */
+    /** Auto-enabled when `programmaticToolCalling: true` (sandbox needs DNS for the tool bridge). */
     networkEnabled: z.boolean().default(false),
     /** Reuse the session between invocations instead of tearing down. */
     keepAlive: z.boolean().default(true),
-    /**
-     * Enable the `use_tools: true` flag on `execute_code`. The model
-     * writes code that orchestrates multiple of this agent's tools in
-     * one pass, keeping intermediate data out of the LLM context.
-     */
+    /** Exposes other agent tools as functions to sandboxed code via `use_tools: true`. */
     programmaticToolCalling: z.boolean().default(false),
-    /**
-     * Treat the code being executed as untrusted (LLM-generated against
-     * an adversarial user, multi-tenant, or unaudited). When true, the
-     * `local` backend is REFUSED — only docker/kubernetes are accepted,
-     * because local has no kernel isolation and runs on the host UID
-     * with full network access.
-     *
-     * Default false to preserve back-compat. Set true for any
-     * production-facing deployment exposing the agent to non-trusted
-     * users. When unset and backend=local, the runtime emits a loud
-     * console.warn so an operator notices the security posture.
-     */
+    /** When true, `local` backend is REFUSED — only docker/kubernetes accepted. */
     untrusted: z.boolean().default(false),
-    /**
-     * Tier-2 hardening for Docker/Kubernetes backends. When `true`, applies
-     * a hardened seccomp profile blocking namespace manipulation, eBPF,
-     * kernel keyring, ptrace, mount/pivot_root/chroot, kernel module
-     * loading, and reboot. Adds defense-in-depth on top of the default
-     * Tier-1 hardening (CapDrop ALL, no-new-privileges, read-only rootfs).
-     *
-     * Default `false` to preserve dev workflows. Recommended `true` for
-     * any production deployment running LLM-generated code against
-     * multiple users.
-     */
+    /** Tier-2 hardening for Docker/K8s: hardened seccomp profile (defense-in-depth over CapDrop). */
     hardened: z.boolean().default(false),
 });
 
 const agentDefinitionSchema = z.object({
     name: z.string().min(1),
     enabled: z.boolean().default(true),
-    // Only 'main' is load-bearing (team bootstrap looks for it); all
-    // other values are informational labels for specialist workers
-    // (e.g. 'security', 'media'). Keep 'main' strict, accept any string
-    // otherwise so new worker archetypes don't force schema edits.
+    // Only 'main' is load-bearing; other values are informational labels.
     type: z.string().default('main'),
     domain: z.string().optional(),
     config: z.record(z.unknown()).optional(),
 
-    // Model: "provider:name" format (e.g., "anthropic:claude-3-5-sonnet")
+    /** "provider:name" format (e.g., "anthropic:claude-3-5-sonnet"). */
     model: z.string().optional(),
-    // Per-model config overrides (temperature, maxTokens, etc.)
     model_config: modelConfigSchema,
-    // Fallback models in priority order
     fallback_models: z.array(modelRefSchema).default([]),
-    // Cost tier for model selection: low=faster/cheaper, high=more capable
     cost_tier: z.enum(['low', 'medium', 'high']).default('medium'),
-    // Tier-routed model aliases (fast / balanced / powerful) — the LLM can
-    // request a specific tier for a sub-task; absent tier → fall through to
-    // `model` as the default.
+    /** Tier aliases (fast/balanced/powerful); absent tier falls through to `model`. */
     routing: modelRoutingSchema,
 
-    // Named toolset bundles the agent subscribes to. Resolved at runtime via
-    // the TOOLSETS registry (src/team/src/toolsets/index.ts). Unknown names
-    // fail loud at startup.
+    /** Resolved at runtime via the TOOLSETS registry; unknown names fail loud at startup. */
     toolsets: z.array(z.string()).default([]),
 
-    // Optional path (relative to FLOPSY_HOME) to a markdown prompt file that
-    // overrides the default built-in prompt for this agent's `type`.
+    /** Path (relative to FLOPSY_HOME) overriding the built-in prompt for this agent's `type`. */
     promptPath: z.string().optional(),
 
-    // Human-in-the-loop tool approval. Absent → tools run unattended.
     approvals: approvalsSchema.optional(),
 
-    // Role in the fellowship.
-    //   'main'   — the gateway entry point (exactly one per config). Gets
-    //              send_message + spawn_background_task + delegate_task
-    //              auto-injected on top of `toolsets`.
-    //   'worker' — a named teammate the main agent can delegate to. Runs
-    //              ephemeral per sub-task; does not talk to the user directly
-    //              and does not get delegation tools (max depth = 1).
-    // Defaults from `type`: type='main' → role='main', otherwise 'worker'.
+    /** Defaults from `type`: 'main' → 'main'; otherwise 'worker'. */
     role: z.enum(['main', 'worker']).optional(),
 
-    // Which teammate names the main agent is allowed to delegate to. Ignored
-    // when role !== 'main'. Each entry must match another agent's `name`.
-    // Defaults to every enabled non-main agent at bootstrap.
+    /** Allow-list of worker names. Defaults to every enabled non-main agent. */
     workers: z.array(z.string()).optional(),
 
-    // Per-agent MCP server allow-list. When set, ONLY these MCP servers'
-    // tools are attached to this agent — overrides the server-side
-    // `assignTo` field. When unset (default), the agent receives every
-    // MCP server whose `assignTo` includes this agent's name OR "*".
+    /** Per-agent MCP allow-list; overrides server-side `assignTo`. */
     mcpServers: z.array(z.string()).optional(),
 
-    // Which flopsygraph graph type to build for this agent.
-    //   'react'          — default; standard ReactAgent with tools + system prompt.
-    //                      Use for main agents and most workers.
-    //   'deep-research'  — multi-round search/summarise/reflect pipeline
-    //                      (createDeepResearcher). Good for deep-research workers.
-    //                      Does NOT support arbitrary tools or our harness/role
-    //                      interceptors — its workflow is hardcoded.
+    /** 'react' (default) or 'deep-research' (hardcoded multi-round pipeline). */
     graph: z.enum(['react', 'deep-research']).default('react'),
 
-    // Sandbox opt-in. Absent / disabled → agent has no code execution tools.
-    // When enabled the agent gets `execute_code`; when programmaticToolCalling
-    // is also on, `execute_code({use_tools:true})` exposes every other tool
-    // this agent has as a function the model can call from sandbox code.
     sandbox: sandboxConfigSchema.optional(),
 
-    // Default voice overlay applied when no per-turn override and no
-    // session-set value exists. Must match a key in personalities.yaml.
-    // Use this when the agent should always speak in a particular tone
-    // (e.g. a productivity-coach agent always defaults to "concise") so
-    // the user doesn't have to /personality after every /new. Per-session
-    // /personality choices and per-turn proactive overrides still win.
+    /** Default voice overlay; must match a key in personalities.yaml. */
     defaultPersonality: z.string().optional(),
 });
 
 /**
- * Semantic memory store configuration. Backs the `manage_memory` +
- * `search_memory` tools flopsygraph auto-wires into every ReactAgent.
- *
- * When `embedder` is set, an Ollama-backed embedder is wired so
- * `search_memory` does cosine similarity; without it the store falls back
- * to keyed listing. `enabled: false` disables the memory tools entirely.
+ * Semantic memory store for `manage_memory` + `search_memory` tools.
+ * With `embedder`, `search_memory` does cosine similarity; without, keyed listing only.
  */
 const memorySchema = z.object({
     enabled: z.boolean().default(true),
@@ -578,66 +485,59 @@ const memorySchema = z.object({
             baseUrl: z.string().url().optional(),
         })
         .optional(),
+    /** Disables only the user-profile surface (`profile` namespace + USER.md). */
+    userProfileEnabled: z.boolean().default(true),
+    /** Per-namespace char budget; ~2200 ≈ 800 tokens. 0 disables enforcement. */
+    memoryCharLimit: z.number().int().min(0).default(2200),
+    /** User-profile char budget (USER.md + `profile` combined); ~1375 ≈ 500 tokens. */
+    userCharLimit: z.number().int().min(0).default(1375),
 });
 
 /**
- * MCP (Model Context Protocol) server registry. Each entry describes a
- * child-process tool server (stdio) or remote HTTP endpoint that
- * flopsygraph-wired agents can call at runtime.
+ * MCP (Model Context Protocol) server registry. Each entry is a stdio child-process
+ * or HTTP/SSE endpoint flopsygraph agents can call.
  *
- * Design choices:
- *   - `requires` gates servers on env-var presence so credentials missing
- *     → server silently disabled with a log, not a crash
- *   - `requiresAuth` points at Layer-1 auth providers (e.g. "google") —
- *     the loader pulls a fresh access_token via getValidAccessToken() and
- *     injects it as FLOPSY_<PROVIDER>_ACCESS_TOKEN before spawning
- *   - `platform` gates OS-specific servers (apple-notes, spotify-darwin)
- *   - `assignTo` routes each server's tool bundle to specific team
- *     members (["gandalf"], ["saruman"], or ["*"] for everyone)
- *   - `env` values support `${VAR}` and `${VAR:-default}` expansion at
- *     spawn time, not parse time, so FLOPSY_HOME / runtime vars land
+ * - `requires`: env vars gating spawn (missing → disabled with a log).
+ * - `requiresAuth`: Layer-1 auth providers; loader injects FLOPSY_<PROVIDER>_ACCESS_TOKEN.
+ * - `assignTo`: routes the tool bundle to team members (["*"] for everyone).
+ * - `env`: supports `${VAR}` / `${VAR:-default}` expansion at spawn time.
  */
 const mcpServerSchema = z.object({
     enabled: z.boolean().default(true),
     transport: z.enum(['stdio', 'http', 'sse']).default('stdio'),
-    // stdio transport
     command: z.string().optional(),
     args: z.array(z.string()).default([]),
-    // http / sse transport
     url: z.string().url().optional(),
     headers: z.record(z.string()).optional(),
-    // shared
     env: z.record(z.string()).default({}),
     requires: z.array(z.string()).default([]),
     requiresAuth: z.array(z.string()).default([]),
     platform: z.enum(['darwin', 'linux', 'win32']).optional(),
     assignTo: z.array(z.string()).default([]),
     description: z.string().optional(),
-    // Per-server call timeout (ms). Omit → default (30s in McpClientManager).
-    // Set higher (e.g. 600000 = 10 min) for slow servers with big data like
-    // obsidian vaults or Google Drive indexes. Set to 0 to disable the
-    // timeout entirely — only do this if you trust the server not to hang,
-    // since a stuck call will pin the agent's turn forever.
+    /** Per-server call timeout. Omit → 30s default. 0 disables (caller hangs forever risk). */
     callTimeoutMs: z.number().int().min(0).optional(),
-    // When true, this server's tools land in the agent's STATIC toolset
-    // (always bound) instead of the dynamic catalog (gated behind
-    // __load_tool__). Use for high-value, narrow
-    // toolsets that are central to a worker's job — e.g. gmail/calendar/
-    // drive on a "personal-assistant" worker. Trade-off: ~50-100 tokens
-    // of system prompt per pre-loaded tool. Default false.
+    /** When true, tools land in the static toolset; otherwise gated behind `__load_tool__`. */
     preload: z.boolean().default(false),
-    // Full OAuth redirect URI for provider auth flows that need a
-    // dashboard-registered URI (e.g. Spotify). Must match exactly what
-    // you register in the provider's developer dashboard. The CLI's
-    // auth provider parses host+port+path from this one field to bind
-    // the local callback listener. Only consulted by `flopsy auth
-    // <provider>` — the MCP server itself never reads it.
+    /** OAuth redirect URI for provider flows (e.g. Spotify); only consulted by `flopsy auth`. */
     redirectBase: z.string().url().optional(),
 });
 
 const mcpSchema = z.object({
     enabled: z.boolean().default(true),
     servers: z.record(mcpServerSchema).default({}),
+});
+
+/**
+ * Inferred-commitments. Off by default. Opt-in to fire a hidden post-turn LLM pass
+ * that extracts future check-ins; smart-pulse surfaces them later.
+ */
+const commitmentsSchema = z.object({
+    enabled: z.boolean().default(false),
+    /** Rolling 24h cap per peer; prevents stale check-in overflow. */
+    maxPerDay: z.number().int().min(0).max(50).default(3),
+    /** Confidence floor; higher = fewer, higher-quality commitments. */
+    minConfidence: z.number().min(0).max(1).default(0.7),
 });
 
 export const flopsyConfigSchema = z
@@ -651,6 +551,7 @@ export const flopsyConfigSchema = z
         models: modelsConfigSchema.default({}),
         agents: z.array(agentDefinitionSchema).default([]),
         memory: memorySchema.default({}),
+        commitments: commitmentsSchema.default({}),
         mcp: mcpSchema.default({}),
         timezone: z.string().default('UTC'),
     })
@@ -683,5 +584,6 @@ export type ModelRouting = z.infer<typeof modelRoutingSchema>;
 export type ModelSource = z.infer<typeof modelSourceSchema>;
 export type ModelsConfig = z.infer<typeof modelsConfigSchema>;
 export type MemoryConfig = z.infer<typeof memorySchema>;
+export type CommitmentsConfig = z.infer<typeof commitmentsSchema>;
 export type McpConfig = z.infer<typeof mcpSchema>;
 export type McpServerConfig = z.infer<typeof mcpServerSchema>;

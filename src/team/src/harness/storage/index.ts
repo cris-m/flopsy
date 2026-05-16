@@ -14,10 +14,10 @@ export type {
     SessionSource,
     SessionCloseReason,
     PeerRow,
-    MessageRow,
-    MessageSearchHit,
     TokenDailyTotal,
     TokenDailyByModel,
     ToolFailureRow,
+    ProactiveDecisionRow,
+    ProactiveCommitmentRow,
 } from './learning-store';
 export type { PairingPending, PairingApproved, RequestCodeResult } from './pairing-store';

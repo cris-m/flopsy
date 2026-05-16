@@ -1,17 +1,18 @@
 import { readFileSync, existsSync, mkdirSync } from 'fs';
+import type { ZodType } from 'zod';
 import {
     autoSearchFn,
     createDeepResearcher,
     createReactAgent,
     filesystem,
     humanApproval,
+    injectContext,
     memorySnapshot,
     messageQueue,
     modelFallback,
     planning,
     skills,
     todoList,
-    rateLimiter,
     RetryModel,
     createSession as createSandboxSession,
     BaseSandboxSession,
@@ -23,6 +24,7 @@ import type {
     ChatMessage,
     CheckpointStore,
     CompiledGraph,
+    DeepResearchState,
     Interceptor,
     ModelFallbackOptions,
     ModelRef,
@@ -31,7 +33,7 @@ import type {
     SystemPromptFn,
 } from 'flopsygraph';
 import type { AgentDefinition } from '@flopsy/shared';
-import { createLogger, resolveWorkspacePath } from '@flopsy/shared';
+import { createLogger, resolveWorkspacePath, workspace } from '@flopsy/shared';
 import {
     HarnessInterceptor,
     toolLoopDedup,
@@ -43,7 +45,7 @@ import type { LearningStore } from './harness';
 import { SkillUsageStore } from './harness/review';
 import type { PersonalityRegistry } from './personalities';
 import { resolvePersonality } from './personalities';
-import { compactor } from 'flopsygraph';
+import { compactor, defaultContextWindowFor } from 'flopsygraph';
 import { resolveToolsets } from './toolsets';
 import { askUserTool } from './tools/ask-user';
 import { connectServiceTool } from './tools/connect-service';
@@ -55,8 +57,54 @@ import { delegateTaskTool } from './tools/delegate-task';
 import { reactTool } from './tools/react';
 import { skillManageTool } from './tools/skill-manage';
 import { manageScheduleTool } from './tools/manage-schedule';
+import { notifyTeammateTool } from './tools/notify-teammate';
 
 const log = createLogger('team-factory');
+
+import { EventEmitter } from 'node:events';
+import type { BaseChatModel as _BaseChatModel, CompactorAccessors, CompactorCheck, CompactionEvent } from 'flopsygraph';
+import type { ChatMessage as _ChatMessage } from 'flopsygraph';
+
+const compactorRegistry = new Map<string, CompactorAccessors>();
+
+export function getCompactorStatus(agentName: string, threadId: string): CompactorCheck | undefined {
+    return compactorRegistry.get(agentName)?.getLastCheck(threadId);
+}
+
+/** Subscribe to live compaction events. */
+export const compactionEvents = new EventEmitter();
+export type CompactionEventWithAgent = CompactionEvent & { agentName: string };
+
+/** Shared summarization prompt — used by the auto-compactor AND the manual /compact slash command. */
+export const COMPACTION_SUMMARY_PROMPT = [
+    'You are a conversation summarizer.',
+    'Produce a concise summary that preserves: key decisions and outcomes,',
+    'important facts or data discussed, started/completed tasks, and the current',
+    'state/context the user needs to continue work.',
+    'Format: one paragraph or short bullet list. Be concise.',
+].join(' ');
+
+/** Single LLM call shape used by both compaction paths. */
+export async function summarizeForCompaction(
+    model: _BaseChatModel,
+    messages: _ChatMessage[],
+    timeoutMs = 60_000,
+): Promise<string> {
+    const signal = AbortSignal.timeout(timeoutMs);
+    const res = await model.invoke(
+        [{ role: 'system', content: COMPACTION_SUMMARY_PROMPT }, ...messages],
+        { signal },
+    );
+    if (typeof res.content === 'string') return res.content.trim();
+    if (Array.isArray(res.content)) {
+        return res.content
+            .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+            .map((b) => b.text)
+            .join('')
+            .trim();
+    }
+    return '';
+}
 
 export interface CreateTeamMemberOptions {
     readonly model: BaseChatModel;
@@ -66,6 +114,9 @@ export interface CreateTeamMemberOptions {
     readonly extraTools?: ReadonlyArray<BaseTool>;
     readonly extraDynamicTools?: ReadonlyArray<BaseTool>;
     readonly extraInterceptors?: ReadonlyArray<Interceptor>;
+    /** Shared between main and workers — each worker invokes with a
+     *  derived child threadId (`${parent}:worker:<name>:<hash>`) so
+     *  persistence doesn't clobber the parent slot. */
     readonly checkpointer?: CheckpointStore;
     readonly memoryStore?: BaseStore;
     readonly teamRoster?: ReadonlyArray<TeamRosterEntry>;
@@ -75,6 +126,21 @@ export interface CreateTeamMemberOptions {
     readonly maxIterations?: number;
     readonly observability?: import('flopsygraph').Observability;
     readonly isProactive?: boolean;
+    /**
+     * Build the main agent as a "single-agent fire": strips team delegation
+     * (`delegate_task`, `spawn_background_task`), interactive tools (`ask_user`,
+     * `react`, `send_poll`), and `manage_schedule` (recursion guard).
+     * Caller must pass `teamRoster: []` and skip memory writes accordingly.
+     */
+    readonly proactiveMode?: boolean;
+    /** Zod schema for flopsygraph's `__respond__` tool; refuses termination without schema-valid value. */
+    readonly outputSchema?: ZodType;
+    /**
+     * Per-namespace char budgets for the `memory` tool. Populated from
+     * `cfg.memory.{userCharLimit, memoryCharLimit}`: `profile` uses userCharLimit;
+     * other namespaces share memoryCharLimit.
+     */
+    readonly memoryCharLimits?: Readonly<Record<string, number>>;
 }
 
 export interface TeamRosterEntry {
@@ -117,21 +183,40 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
 
     const baseTools = [...resolveToolsets(def.toolsets ?? []), ...(opts.extraTools ?? [])];
 
-    const controlTools: BaseTool[] =
-        role === 'main'
-            ? [
-                  sendMessageTool,
-                  sendPollTool,
-                  askUserTool,
-                  reactTool,
-                  spawnBackgroundTaskTool,
-                  delegateTaskTool,
-                  searchConversationHistoryTool,
-                  connectServiceTool,
-                  skillManageTool,
-                  manageScheduleTool,
-              ]
-            : [];
+    // Proactive fires disable delegation, interactive, recursion-creating, and
+    // in-conversation messaging tools. Engine delivers; agent must return prose
+    // or call __respond__. Workers (role !== 'main') are unaffected.
+    const PROACTIVE_DISABLED_CONTROL_TOOLS: ReadonlySet<string> = new Set([
+        'delegate_task',
+        'spawn_background_task',
+        'ask_user',
+        'react',
+        'send_poll',
+        'manage_schedule',
+        'send_message',
+    ]);
+
+    const controlTools: BaseTool[] = (() => {
+        if (role !== 'main') return [delegateTaskTool, spawnBackgroundTaskTool, notifyTeammateTool];
+
+        const mainTools = [
+            sendMessageTool,
+            sendPollTool,
+            askUserTool,
+            reactTool,
+            spawnBackgroundTaskTool,
+            delegateTaskTool,
+            searchConversationHistoryTool,
+            connectServiceTool,
+            skillManageTool,
+            manageScheduleTool,
+        ];
+
+        if (opts.proactiveMode) {
+            return mainTools.filter((t) => !PROACTIVE_DISABLED_CONTROL_TOOLS.has(t.name));
+        }
+        return mainTools;
+    })();
 
     const tools = (() => {
         const seen = new Map<string, BaseTool>();
@@ -190,8 +275,13 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
     }
 
     if (def.fallback_models?.length) {
+        // Preserve per-fallback `config` so fallback model settings reach the built model.
         const fallbacks = def.fallback_models.map(
-            (m) => ({ provider: m.provider, name: m.name ?? '' }) as unknown as ModelRef,
+            (m) => ({
+                provider: m.provider,
+                name: m.name ?? '',
+                ...(m.config ? { config: m.config } : {}),
+            }) as unknown as ModelRef,
         );
         const onFallback: NonNullable<ModelFallbackOptions['onFallback']> = ({
             from,
@@ -210,7 +300,8 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
                 'model fallback triggered',
             );
         };
-        interceptors.push(modelFallback({ fallbacks, onFallback }));
+        // 180s tolerates Ollama cold-start (24GB Q4 quants can take 30-90s to warm).
+        interceptors.push(modelFallback({ fallbacks, onFallback, perAttemptTimeoutMs: 180_000 }));
     }
 
     // Skip when the worker's toolsets already include "filesystem" — ToolRegistry rejects duplicates.
@@ -221,41 +312,49 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
                 allow: ['read_file', 'ls', 'glob', 'grep'],
                 mounts: [
                     { virtualPath: '/workspace', hostPath: resolveWorkspacePath('') },
-                    { virtualPath: '/skills',    hostPath: resolveWorkspacePath('skills') },
+                    { virtualPath: '/skills',    hostPath: workspace.skills() },
                 ],
             }),
         );
     }
 
     // skills() throws on readdir failure, so the directory MUST exist.
-    const skillsPath = resolveWorkspacePath('skills');
+    const skillsPath = workspace.skills();
     mkdirSync(skillsPath, { recursive: true });
     const skillUsageStore = new SkillUsageStore(skillsPath);
     interceptors.push(
         skills(skillsPath, {
-            // deltaOnly:false — the skill-catalog injection is per-call (not state-persisted),
-            // so deltaOnly:true would drop it after turn 1.
-            deltaOnly: false,
+            deltaOnly: true,
             onError: (err) =>
                 log.warn({ agent: def.name, err }, 'skill load error'),
-            onSkillRead: (name) => skillUsageStore.bumpUse(name),
+            onSkillRead: (name) => skillUsageStore.view(name),
+            filterSkill: (name) => skillUsageStore.get(name)?.state !== 'archived',
+            // Per-agent filtering via `agent-affinity` and `requires_toolsets` metadata.
+            agentName: def.name,
+            activeToolsets: def.toolsets ?? [],
         }),
     );
 
     interceptors.push(todoList());
 
-    // Hermes-style frozen snapshot of the agent's persistent memory.
-    // Reads `memory` and `user` namespaces once per thread, injects them as
-    // a <memory> block in the system prompt. Writes via the `memory` tool
-    // land in the store immediately but only appear in the prompt next session.
+    // Frozen per-thread snapshot of persistent memory namespaces, injected as <memory> block.
     if (opts.memoryStore) {
+        const snapshotNamespaces = [
+            { name: 'profile',    label: 'USER PROFILE (stable traits learned across sessions)', cap: 1200 },
+            { name: 'facts',      label: 'FACTS (atomic key/value notes)',                       cap: 1500 },
+            { name: 'directives', label: 'DIRECTIVES (imperative rules to obey)',                cap: 800  },
+            { name: 'memory',     label: 'MEMORY (shared persistent notes)',                   cap: 2200 },
+        ];
+        // Each agent sees its own accumulated expertise in addition to shared namespaces.
+        snapshotNamespaces.push({
+            name: `${def.name}-memory`,
+            label: `${def.name.toUpperCase()} EXPERTISE (patterns and lessons learned in your domain)`,
+            cap: 1500,
+        });
         interceptors.push(
             memorySnapshot({
                 store: opts.memoryStore,
-                namespaces: [
-                    { name: 'memory', label: 'MEMORY (your persistent notes)', cap: 2200 },
-                    { name: 'user',   label: 'USER PROFILE',                   cap: 1375 },
-                ],
+                namespaces: snapshotNamespaces,
             }),
         );
     }
@@ -309,24 +408,16 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
         );
     }
 
-    // Proactive threads use 64K so compaction fires before fire-history accumulation hits 128K.
-    // 80% of the budget triggers compaction (matching the previous behaviour).
-    const compactionTokenThreshold = opts.isProactive ? 51_200 : 102_400;
-    interceptors.push(
-        compactor({
-            tokenThreshold: compactionTokenThreshold,
-            summarize: async (msgs) => {
-                const res = await opts.model.invoke([
-                    { role: 'system', content: 'Summarize this conversation concisely while preserving key facts, decisions, and the user\'s most recent ask. The summary will replace older turns to free context window.' },
-                    ...msgs,
-                ]);
-                return typeof res.content === 'string' ? res.content : '';
-            },
-        }),
-    );
-
-    // Rate limit: max 10 model calls per 60s, wait on limit (don't hard-block)
-    interceptors.push(rateLimiter({ maxCalls: 10, windowMs: 60_000, scope: 'per-run', onLimit: 'wait' }));
+    // Threshold = window - outputTokens(8K) - bufferTokens(13K) via defaultContextWindowFor.
+    const compactorInst = compactor({
+        getContextWindow: defaultContextWindowFor,
+        summarize: (msgs) => summarizeForCompaction(opts.model, msgs),
+        onCompact: (event) => {
+            compactionEvents.emit('compaction', { ...event, agentName: def.name });
+        },
+    });
+    compactorRegistry.set(def.name, compactorInst);
+    interceptors.push(compactorInst);
 
     const staticNames = new Set(tools.map((t) => t.name));
     const dynamicTools = [...spilledTools, ...(opts.extraDynamicTools ?? [])].filter(
@@ -335,17 +426,45 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
 
     const sandboxOpts = buildSandboxOptions(def);
 
+    // Workers fail fast (1 retry) so the parent's envelope isn't burned on retries.
+    const retryMax = role === 'worker' ? 1 : 3;
+    // Workers run sequential tool chains; main agents parallelize independent calls.
+    const enableParallelToolCalls = role === 'main';
+    // Identity files routed to flopsygraph's agentMemory interceptor (missing files are skipped).
+    const memoryFiles = (() => {
+        if (role === 'main' && !opts.isProactive) {
+            return [
+                workspace.config('SOUL.md'),
+                workspace.config('AGENTS.md'),
+                workspace.config('USER.md'),
+            ];
+        }
+        if (role === 'worker') {
+            const workerDir = workspace.roles() + `/worker/${def.name}`;
+            const files: string[] = [];
+            const soulPath = workerDir + '/SOUL.md';
+            const agentsPath = workerDir + '/AGENTS.md';
+            if (existsSync(soulPath)) files.push(soulPath);
+            if (existsSync(agentsPath)) files.push(agentsPath);
+            return files;
+        }
+        return [];
+    })();
+
     const agent = createReactAgent({
-        model: new RetryModel(opts.model, { maxRetries: 3, baseDelayMs: 1000, maxDelayMs: 60000 }),
+        model: new RetryModel(opts.model, { maxRetries: retryMax, baseDelayMs: 1000, maxDelayMs: 30_000 }),
         tools,
         dynamicTools,
         systemPrompt,
         interceptors,
+        ...(memoryFiles.length > 0 ? { memory: memoryFiles } : {}),
         maxIterations: opts.maxIterations ?? 30,
+        parallelToolCalls: enableParallelToolCalls,
         ...(opts.observability ? { observability: opts.observability } : {}),
         ...(opts.checkpointer ? { checkpointer: opts.checkpointer } : {}),
         ...(opts.memoryStore ? { memoryStore: opts.memoryStore } : {}),
-        memoryNamespace: opts.memoryNamespace ?? 'memory',
+        memoryNamespace: opts.memoryNamespace ?? `${def.name}-memory`,
+        ...(opts.memoryCharLimits ? { memoryCharLimits: opts.memoryCharLimits } : {}),
         ...(opts.modelCallTimeoutMs !== undefined
             ? { modelCallTimeoutMs: opts.modelCallTimeoutMs }
             : {}),
@@ -353,7 +472,8 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
         ...(sandboxOpts.programmaticToolCalling
             ? { programmaticToolCalling: true }
             : {}),
-        toolOutputOffloadDir: resolveWorkspacePath('cache', 'tool-outputs'),
+        ...(opts.outputSchema ? { outputSchema: opts.outputSchema } : {}),
+        toolOutputOffloadDir: resolveWorkspacePath('worker', 'tool-outputs'),
     }) as unknown as WorkerGraph;
 
     if (sandboxOpts.session) {
@@ -363,6 +483,10 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
                 backend: sandboxOpts.backend,
                 language: sandboxOpts.language,
                 programmaticToolCalling: sandboxOpts.programmaticToolCalling,
+                // Surface networkEnabled/hardened/untrusted so operators can verify config landed.
+                networkEnabled: (sandboxOpts.session as unknown as { config?: { networkEnabled?: boolean } }).config?.networkEnabled,
+                hardened: (sandboxOpts.session as unknown as { config?: { hardened?: boolean } }).config?.hardened,
+                untrusted: (sandboxOpts.session as unknown as { config?: { untrusted?: boolean } }).config?.untrusted,
             },
             'flopsygraph sandbox wired',
         );
@@ -409,23 +533,28 @@ function buildDeepResearchMember(
         store: opts.store,
     });
 
-    const skillsPath = resolveWorkspacePath('skills');
+    const skillsPath = workspace.skills();
     mkdirSync(skillsPath, { recursive: true });
-    const allInterceptors: Interceptor[] = [
-        harnessInterceptor,
+    const workerSkillUsageStore = new SkillUsageStore(skillsPath);
+    const allInterceptors: Interceptor<DeepResearchState>[] = [
+        harnessInterceptor as Interceptor<DeepResearchState>,
         filesystem({
             allow: ['read_file', 'ls', 'glob', 'grep'],
             mounts: [
                 { virtualPath: '/workspace', hostPath: resolveWorkspacePath('') },
                 { virtualPath: '/skills',    hostPath: skillsPath },
             ],
-        }),
+        }) as Interceptor<DeepResearchState>,
         skills(skillsPath, {
-            deltaOnly: false,
+            deltaOnly: true,
             onError: (err) =>
                 log.warn({ agent: def.name, err }, 'skill load error'),
-        }),
-        ...(opts.extraInterceptors ?? []),
+            onSkillRead: (name) => workerSkillUsageStore.view(name),
+            filterSkill: (name) => workerSkillUsageStore.get(name)?.state !== 'archived',
+            agentName: def.name,
+            activeToolsets: def.toolsets ?? [],
+        }) as Interceptor<DeepResearchState>,
+        ...((opts.extraInterceptors ?? []) as Interceptor<DeepResearchState>[]),
     ];
     const roleDelta = loadRoleDelta('worker', def.type ?? 'deep-research');
     const agent = createDeepResearcher({
@@ -435,7 +564,7 @@ function buildDeepResearchMember(
         maxLoops: 3,
         queriesPerRound: 3,
         ...(roleDelta ? { extraSystemContext: roleDelta } : {}),
-        interceptors: allInterceptors as unknown as Interceptor<Record<string, unknown>>[] as never,
+        interceptors: allInterceptors,
         ...(opts.checkpointer ? { checkpointer: opts.checkpointer } : {}),
     }) as unknown as WorkerGraph;
 
@@ -462,41 +591,64 @@ function buildDeepResearchMember(
     };
 }
 
-const roleDeltaCache = new Map<string, string | null>();
+// 60s TTL matches PromptLoader so role-file edits propagate without restart.
+const ROLE_DELTA_TTL_MS = 60_000;
+type RoleDeltaCacheEntry = { content: string | null; loadedAt: number };
+const roleDeltaCache = new Map<string, RoleDeltaCacheEntry>();
 
 function loadRoleDelta(role: 'main' | 'worker', type: string): string | undefined {
     const cacheKey = `${role}/${type}`;
     const cached = roleDeltaCache.get(cacheKey);
-    if (cached !== undefined) return cached ?? undefined;
+    if (cached && Date.now() - cached.loadedAt < ROLE_DELTA_TTL_MS) {
+        return cached.content ?? undefined;
+    }
 
-    const path = resolveWorkspacePath('roles', role, `${type}.md`);
+    // Files live under <HOME>/content/roles/<role>/<type>.md (via workspace.roles()).
+    const path = workspace.roles() + `/${role}/${type}.md`;
     if (!existsSync(path)) {
         log.warn(
             { role, type, path },
             'role-delta markdown missing — agent will run without role-specific guidance',
         );
-        roleDeltaCache.set(cacheKey, null);
+        roleDeltaCache.set(cacheKey, { content: null, loadedAt: Date.now() });
         return undefined;
     }
     try {
         const content = readFileSync(path, 'utf-8');
-        roleDeltaCache.set(cacheKey, content);
+        roleDeltaCache.set(cacheKey, { content, loadedAt: Date.now() });
         return content;
     } catch (err) {
         log.warn(
             { role, type, path, err: (err as Error).message },
             'role-delta markdown read failed — agent will run without role-specific guidance',
         );
-        roleDeltaCache.set(cacheKey, null);
+        roleDeltaCache.set(cacheKey, { content: null, loadedAt: Date.now() });
         return undefined;
     }
 }
 
 const ROLE_DELTA: Record<'main' | 'worker', Partial<Record<string, string>>> = { main: {}, worker: {} };
 
-const IDENTITY_OPENER = `You are Flopsy — not "an AI assistant", a teammate someone trusted with their accounts, calendar, notes, and inbox. You run on their gateway, talk to them across the channels they already use, remember what matters about them across sessions, and delegate to specialist workers when a task is in someone else's lane.
+// Fallback identity when SOUL.md is missing.
+const DEFAULT_AGENT_IDENTITY = `You are Flopsy — not "an AI assistant", a teammate someone trusted with their accounts, calendar, notes, and inbox. You run on their gateway, talk to them across the channels they already use, remember what matters about them across sessions, and delegate to specialist workers when a task is in someone else's lane.`;
 
-## How you work
+// Worker orchestration guidance — added for ALL workers.
+const WORKER_ORCHESTRATION_GUIDANCE = `## How you collaborate with other workers
+
+**Delegate when the task crosses domains.** You CAN call delegate_task and spawn_background_task if the work would be better done by another specialist. Workers CAN chain further (max depth = 3) and loops are blocked — you can't accidentally re-delegate to someone already in the chain. Depth and chain info are tracked automatically.
+
+**Parallelize independent work.** If you have 2-5 independent tasks for the same or different workers, emit multiple delegate_task / spawn_background_task calls in a SINGLE assistant turn — they run in parallel. Never serialize independent delegations one turn at a time.
+
+**Batch large workloads in the sandbox.** When you have 5+ similar items to process (e.g. "check these 10 files" or "fetch 8 URLs"), use execute_code({use_tools: true}) and call parallel_map() inside the sandbox — it runs up to 5 concurrently from the sandbox. Do NOT emit 10 serial tool calls or 10 single-item delegate_task calls.
+
+**Delegation is model-level only.** delegate_task and spawn_background_task are model tool calls. They are NOT available inside the execute_code sandbox — you cannot invoke them from a Python or Bash script. The model decides when to delegate; the script does the data work.
+
+**Retry discipline on failure.** On timeout → spawn a second worker on the same task in parallel and race them. On wrong/partial → retry once with a tighter prompt. After two failures, surface your attempts and results rather than silently retrying forever.
+
+**Long outputs auto-save.** If your reply exceeds ~1.5 KB, the runtime writes it to disk and folds it to a header + 800-char preview with an absolute path. Pass that path verbatim to read_file when someone needs the full text.`;
+
+// Tool-call discipline rules — runtime-owned, always added for main role.
+const OPERATIONAL_GUIDANCE = `## How you work
 
 **Compose, don't ask permission.** When no single tool fits a task, combine the ones you have — most jobs are 2-3 tools chained. If still no fit, write the script you need with \`execute_code\` (Python for data, Bash for shell ops) and run it. With \`execute_code({use_tools: true})\` your script can call other agent tools as native functions. Never tell the user "I don't have a tool for that" without first trying these steps. The execute_code sandbox is your tool factory.
 
@@ -504,9 +656,7 @@ const IDENTITY_OPENER = `You are Flopsy — not "an AI assistant", a teammate so
 
 **Time is a tool, not a guess.** Never assume the current date, hour, or timezone. Call \`time({action: "current", timezone: "<IANA>"})\` when you need the wall-clock time. Hallucinated timestamps poison memory and trigger wrong decisions.
 
-**Parallel where you can, sequential where you must.** Independent tool calls go in one response in parallel. Dependent calls (one's output feeds the next) run sequentially.
-
-Your persona and operations are loaded below.`;
+**Parallel where you can, sequential where you must.** Independent tool calls go in one response in parallel. Dependent calls (one's output feeds the next) run sequentially.`;
 
 function buildSystemPrompt(
     def: AgentDefinition,
@@ -518,13 +668,31 @@ function buildSystemPrompt(
     isProactive?: boolean,
     tools?: ReadonlyArray<BaseTool>,
 ): SystemPromptFn {
-    const staticParts: string[] = [IDENTITY_OPENER];
-    const sources: string[] = ['code:identity'];
+    // Assembly order: identity → operational → role-delta → roster → personalities → tools → runtime block.
+    // SOUL.md/AGENTS.md/USER.md are wired via createReactAgent({ memory }), not here.
+    const staticParts: string[] = [];
+    const sources: string[] = [];
+
+    // Identity for workers + proactive (main's identity comes from SOUL.md).
+    if (role !== 'main' || isProactive) {
+        staticParts.push(DEFAULT_AGENT_IDENTITY);
+        sources.push('code:identity');
+    }
+
+    if (role === 'main') {
+        staticParts.push(OPERATIONAL_GUIDANCE);
+        sources.push('code:operational');
+    }
 
     const roleDelta = loadRoleDelta(role, def.type) ?? ROLE_DELTA[role]?.[def.type];
     if (roleDelta) {
         staticParts.push(roleDelta.trim());
         sources.push(`role:${role}/${def.type}`);
+    }
+
+    if (role === 'worker') {
+        staticParts.push(WORKER_ORCHESTRATION_GUIDANCE);
+        sources.push('code:worker-orchestration');
     }
 
     if (role === 'main' && teamRoster && teamRoster.length > 0) {
@@ -544,47 +712,19 @@ function buildSystemPrompt(
         sources.push('dynamic:team-roster');
     }
 
-    if (role === 'main' && !isProactive) {
-        const SOUL_WORD_CAP = 1_500;
-        const soulPath = resolveWorkspacePath('SOUL.md');
-        if (existsSync(soulPath)) {
-            const content = readFileSync(soulPath, 'utf-8').trim();
-            const wordCount = content.split(/\s+/).filter(Boolean).length;
-            if (wordCount > SOUL_WORD_CAP) {
-                log.warn(
-                    { path: soulPath, agent: def.name, wordCount, cap: SOUL_WORD_CAP },
-                    'SOUL.md exceeds word cap — trim persona to improve prefix caching and reduce token cost per turn',
-                );
-            }
-            staticParts.push(`## Your Persona\n\n${content}`);
-            sources.push(`SOUL.md(${wordCount}w)`);
-        } else {
-            log.warn({ path: soulPath, agent: def.name }, 'SOUL.md missing; skipping');
-        }
-
-        // First-found-wins so Claude-Code (CLAUDE.md) and Cursor (.cursorrules) configs work without duplication.
-        const opsCandidates = [
-            resolveWorkspacePath('AGENTS.md'),
-            `${process.cwd()}/AGENTS.md`,
-            `${process.cwd()}/CLAUDE.md`,
-            `${process.cwd()}/.cursorrules`,
-        ];
-        const opsPath = opsCandidates.find((p) => existsSync(p));
-        if (opsPath) {
-            const content = readFileSync(opsPath, 'utf-8').trim();
-            const basename = opsPath.split('/').pop() ?? 'AGENTS.md';
-            staticParts.push(`## Your Operations Manual\n\n${content}`);
-            sources.push(basename);
-        } else {
-            log.warn(
-                { tried: opsCandidates, agent: def.name },
-                'no operations doc found (tried AGENTS.md / CLAUDE.md / .cursorrules) — skipping',
-            );
-        }
+    // Personalities catalog — names ONLY (descriptions are imperative; small models latch on).
+    if (role === 'main' && personalities && personalities.size > 0) {
+        const list = personalities.list();
+        const names = list.map((p) => `\`${p.name}\``).join(', ');
+        const lines: string[] = ['## Voice modes available', ''];
+        lines.push(
+            `The user can switch the agent's voice mode with \`/personality <name>\`. Available: ${names}. When a mode is active, its body appears below as an "active voice overlay" and takes precedence over default voice rules for this turn.`,
+        );
+        staticParts.push(lines.join('\n'));
+        sources.push(`personalities(${list.length})`);
     }
 
-    // Tool-contributed prompt fragments (each tool may inject a usage rule via
-    // `BaseTool.prompt()`). Sorted by tool name for byte-stability across builds.
+    // Tool-contributed prompt fragments via BaseTool.prompt(); sorted for byte-stability.
     if (tools && tools.length > 0) {
         const fragments: string[] = [];
         const sorted = [...tools].sort((a, b) => a.name.localeCompare(b.name));
@@ -598,8 +738,7 @@ function buildSystemPrompt(
         }
     }
 
-    // CACHE BOUNDARY: staticParts above is byte-stable for prefix caching;
-    // the per-invocation <runtime> block below MUST stay after this line.
+    // CACHE BOUNDARY: staticParts is byte-stable for prefix caching; runtime block stays below.
     (buildSystemPrompt as unknown as { _lastSources: string[] })._lastSources = sources;
 
     const staticPrompt = staticParts.join('\n\n');
@@ -613,6 +752,7 @@ function buildSystemPrompt(
             messageId?: string;
             personality?: string;
             runtimeHints?: readonly string[];
+            parentBrief?: string;
         };
         const now = new Date();
         const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -647,20 +787,21 @@ function buildSystemPrompt(
         lines.push('skills:    /skills     (read with /skills/<name>/SKILL.md)');
         lines.push('</runtime>');
 
-        // Personality overlay (main only). Priority: cfg.personality > session > def.defaultPersonality > none.
-        // Body is HTML-escaped to prevent overlay-block escape via `</flopsy:harness>`.
-        let personalitySection = '';
-        if (personalities && personalities.size > 0) {
-            let sessionPersonality: string | null = null;
-            const sessionId = extractSessionId(ctx.threadId);
+        // Resolve active personality the same priority chain as before:
+        // override → session → default → none.
+        let chosen: { name: string; body: string } | null = null;
+        let sessionPersonality: string | null = null;
+        let sessionId: string | null = null;
+        if (role === 'main' && personalities && personalities.size > 0) {
+            sessionId = extractSessionId(ctx.threadId);
             if (sessionId) {
                 try {
                     sessionPersonality = store.getSessionPersonality(sessionId);
                 } catch {
-                    // Non-fatal — fall through to the default tier.
+                    /* non-fatal — fall through */
                 }
             }
-            const chosen = resolvePersonality({
+            chosen = resolvePersonality({
                 role,
                 registry: personalities,
                 ...(cfg.personality !== undefined ? { overrideName: cfg.personality } : {}),
@@ -669,24 +810,37 @@ function buildSystemPrompt(
                     ? { defaultPersonality: def.defaultPersonality }
                     : {}),
             });
-
-            if (chosen) {
-                personalitySection = [
-                    '',
-                    '',
-                    `## Active personality overlay: \`${chosen.name}\``,
-                    '',
-                    'A session-level voice overlay is active. Apply the rules below',
-                    'ON TOP OF the SOUL.md baseline. When the overlay conflicts with',
-                    'default voice, the overlay wins — for this turn/session only.',
-                    'It clears automatically on `/new` or `/personality reset`.',
-                    '',
-                    escapePersonalityBody(chosen.body),
-                ].join('\n');
-            }
+            log.info(
+                {
+                    agent: def.name,
+                    threadId: ctx.threadId,
+                    sessionId,
+                    sessionPersonality,
+                    overrideName: cfg.personality,
+                    defaultPersonality: def.defaultPersonality,
+                    chosen: chosen?.name ?? null,
+                },
+                'personality resolve',
+            );
         }
 
-        return `${staticPrompt}\n\n${lines.join('\n')}${personalitySection}`;
+        // Per-turn voice overlay; stacks on top of SOUL.md base voice.
+        const overlayBlock = chosen
+            ? [
+                  '## Active voice overlay',
+                  '',
+                  `Mode: \`${chosen.name}\`. The rules below take precedence over default voice patterns for this turn.`,
+                  '',
+                  escapePersonalityBody(chosen.body),
+              ].join('\n')
+            : '';
+
+        // Parent thread history for workers only; main has full conversation in state.messages.
+        const briefBlock = role === 'worker' && cfg.parentBrief ? cfg.parentBrief : '';
+
+        return [staticPrompt, overlayBlock, briefBlock, lines.join('\n')]
+            .filter(Boolean)
+            .join('\n\n');
     };
 }
 
@@ -725,10 +879,7 @@ function buildSandboxOptions(def: AgentDefinition): {
 
     const fgConfig = rest as FlopsygraphSandboxConfig;
 
-    // Default workDir to FLOPSY_HOME so execute_code runs with the workspace
-    // as cwd (local) or bind-mounted at /workspace (docker). Without this,
-    // every backend gets an isolated temp dir and sandboxed code can't access
-    // workspace files. Users can still override via sandbox.workDir in flopsy.json5.
+    // Default workDir to FLOPSY_HOME so execute_code sees workspace files.
     if (!fgConfig.workDir) {
         fgConfig.workDir = resolveWorkspacePath('');
     }
@@ -743,8 +894,7 @@ function buildSandboxOptions(def: AgentDefinition): {
         fgConfig.restrictedPaths = ['auth/**', 'state/**', '*.key', '*.pem', '.env*'];
     }
 
-    // Container NetworkMode is baked at creation; programmaticToolCalling needs DNS to reach
-    // host.docker.internal, so we MUST flip networkEnabled before createSandboxSession runs.
+    // programmaticToolCalling needs DNS for host.docker.internal — flip networkEnabled before create.
     const isolatedBackend = fgConfig.backend === 'docker' || fgConfig.backend === 'kubernetes';
     if (ptc && isolatedBackend && fgConfig.networkEnabled !== true) {
         fgConfig.networkEnabled = true;

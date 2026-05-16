@@ -1,13 +1,13 @@
 /**
- * Shared mgmt-HTTP client for every CLI command that talks to the running
- * gateway (`flopsy heartbeat`, `cron`, `webhook`, `dnd`, `mgmt`, `tasks`).
+ * Shared management-HTTP client for every CLI command that talks to the running
+ * gateway (`flopsy heartbeat`, `cron`, `webhook`, `dnd`, `management`, `tasks`).
  * Centralises URL resolution, bearer-token handling, response shaping,
  * and the offline SQLite fallback used by schedule list/show.
  */
 
 import Database from 'better-sqlite3';
 import { existsSync } from 'node:fs';
-import { resolveWorkspacePath } from '@flopsy/shared';
+import { loadMgmtToken, resolveWorkspacePath } from '@flopsy/shared';
 import { bad, info, ok, row } from '../ui/pretty';
 import { readFlopsyConfig } from './config-reader';
 
@@ -76,19 +76,19 @@ export function parseConfig(row: RuntimeScheduleRow): Record<string, unknown> {
     }
 }
 
-/** Resolve a mgmt endpoint URL from flopsy.json5, with a sane fallback. */
-export function mgmtUrl(path: string): string {
+/** Resolve a management endpoint URL from flopsy.json5, with a sane fallback. */
+export function managementUrl(path: string): string {
     try {
         const { config } = readFlopsyConfig();
         const gw = config.gateway ?? {};
-        // Explicit gateway.mgmt.port wins. Without it, fall back to
+        // Explicit gateway.management.port wins. Without it, fall back to
         // gateway.port + 2 instead of +1 — the +1 default collides with
         // webhook.port (also default 18790), routing every CLI command
         // to the webhook server and producing "Missing signature" errors.
         // +2 (= 18791) leaves room for the webhook server at +1.
         const port =
-            (gw as { mgmt?: { port?: number } }).mgmt?.port ?? ((gw.port ?? 18789) + 2);
-        const host = (gw as { mgmt?: { host?: string } }).mgmt?.host ?? '127.0.0.1';
+            (gw as { management?: { port?: number } }).management?.port ?? ((gw.port ?? 18789) + 2);
+        const host = (gw as { management?: { host?: string } }).management?.host ?? '127.0.0.1';
         return `http://${host}:${port}${path}`;
     } catch {
         return `http://127.0.0.1:18791${path}`;
@@ -96,17 +96,21 @@ export function mgmtUrl(path: string): string {
 }
 
 function authHeaders(): Record<string, string> {
-    const token = process.env['FLOPSY_MGMT_TOKEN'];
+    // Read from env first, then from the gateway-generated <HOME>/mgmt-token
+    // file. The CLI is a separate process from the gateway so env-var
+    // inheritance can't be assumed; the file is the steady-state path on
+    // fresh installs where the operator never sets FLOPSY_MGMT_TOKEN.
+    const token = loadMgmtToken();
     return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
-/** Write-style mgmt call: expects 2xx JSON, prints ok/error, exits on failure. */
-export async function mgmtFetch(
+/** Write-style management call: expects 2xx JSON, prints ok/error, exits on failure. */
+export async function managementFetch(
     method: string,
     path: string,
     body?: unknown,
 ): Promise<void> {
-    const url = mgmtUrl(path);
+    const url = managementUrl(path);
     try {
         const res = await fetch(url, {
             method,
@@ -131,22 +135,30 @@ export async function mgmtFetch(
     }
 }
 
-export const mgmtCreate = (body: Record<string, unknown>): Promise<void> =>
-    mgmtFetch('POST', '/mgmt/schedule', body);
-export const mgmtRemove = (id: string): Promise<void> =>
-    mgmtFetch('DELETE', `/mgmt/schedule/${encodeURIComponent(id)}`);
-export const mgmtEnable = (id: string): Promise<void> =>
-    mgmtFetch('POST', `/mgmt/schedule/${encodeURIComponent(id)}/enable`);
-export const mgmtDisable = (id: string): Promise<void> =>
-    mgmtFetch('POST', `/mgmt/schedule/${encodeURIComponent(id)}/disable`);
+export const managementCreate = (body: Record<string, unknown>): Promise<void> =>
+    managementFetch('POST', '/management/schedule', body);
+export const managementRemove = (id: string): Promise<void> =>
+    managementFetch('DELETE', `/management/schedule/${encodeURIComponent(id)}`);
+export const managementEnable = (id: string): Promise<void> =>
+    managementFetch('POST', `/management/schedule/${encodeURIComponent(id)}/enable`);
+export const managementDisable = (id: string): Promise<void> =>
+    managementFetch('POST', `/management/schedule/${encodeURIComponent(id)}/disable`);
+export const managementTrigger = (id: string): Promise<void> =>
+    managementFetch('POST', `/management/schedule/${encodeURIComponent(id)}/trigger`);
+export const managementSetSkills = (id: string, skills: string[]): Promise<void> =>
+    managementFetch('POST', `/management/schedule/${encodeURIComponent(id)}/skills`, {
+        skills,
+    });
+export const managementTick = (kind: 'cron' | 'heartbeat'): Promise<void> =>
+    managementFetch('POST', `/management/schedule/tick?kind=${kind}`);
 
-/** Read-style mgmt call: returns parsed JSON or null on error (prints once). */
-export async function mgmtFetchJson<T>(
+/** Read-style management call: returns parsed JSON or null on error (prints once). */
+export async function managementFetchJson<T>(
     method: string,
     path: string,
     body?: unknown,
 ): Promise<T | null> {
-    const url = mgmtUrl(path);
+    const url = managementUrl(path);
     try {
         const res = await fetch(url, {
             method,
@@ -179,7 +191,7 @@ function unreachable(url: string, err: unknown): never {
 
 function unreachableSoft(url: string, err: unknown): void {
     const hint = err instanceof Error ? err.message : String(err);
-    console.log(bad(`mgmt endpoint unreachable at ${url}`));
+    console.log(bad(`management endpoint unreachable at ${url}`));
     console.log(
         info(`gateway not running? start with \`flopsy gateway start\`. hint: ${hint}`),
     );
@@ -211,19 +223,19 @@ export interface FireRow {
     content: string;
 }
 
-/** GET /mgmt/proactive/stats — whole-engine aggregate + per-schedule. */
+/** GET /management/proactive/stats — whole-engine aggregate + per-schedule. */
 export async function fetchProactiveStats(windowMs = 86_400_000): Promise<ProactiveStats | null> {
-    return mgmtFetchJson<ProactiveStats>(
+    return managementFetchJson<ProactiveStats>(
         'GET',
-        `/mgmt/proactive/stats?windowMs=${windowMs}`,
+        `/management/proactive/stats?windowMs=${windowMs}`,
     );
 }
 
-/** GET /mgmt/proactive/fires/:id — delivery history for one schedule. */
+/** GET /management/proactive/fires/:id — delivery history for one schedule. */
 export async function fetchFires(id: string, limit = 20): Promise<FireRow[]> {
-    const body = await mgmtFetchJson<{ fires: FireRow[] }>(
+    const body = await managementFetchJson<{ fires: FireRow[] }>(
         'GET',
-        `/mgmt/proactive/fires/${encodeURIComponent(id)}?limit=${limit}`,
+        `/management/proactive/fires/${encodeURIComponent(id)}?limit=${limit}`,
     );
     return body?.fires ?? [];
 }

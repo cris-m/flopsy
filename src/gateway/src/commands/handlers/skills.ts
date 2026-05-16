@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from 'fs';
 import { join } from 'path';
-import { resolveWorkspacePath, panel, row, STATE } from '@flopsy/shared';
+import { workspace, panel, row, STATE } from '@flopsy/shared';
 import type { CommandDef, CommandContext } from '../types';
 
 interface SkillRef {
@@ -14,11 +14,16 @@ const SAFE_NAME_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 export const skillsCommand: CommandDef = {
     name: 'skills',
     description: 'Review skill proposals. `/skills`, `/skills approve <name>`, `/skills reject <name>`.',
+    // Admin: approve/reject mutate the workspace (rename/rm under
+    // <FLOPSY_HOME>/content/skills/). Even read verbs (list/show)
+    // disclose what's been proposed — useful recon for a paired
+    // adversary. Single-operator default: admin-only across the board.
+    scope: 'admin',
     handler: async (ctx: CommandContext) => {
         const sub = (ctx.args[0] ?? '').toLowerCase();
         const target = ctx.args[1] ?? '';
 
-        const skillsRoot = resolveWorkspacePath('skills');
+        const skillsRoot = workspace.skills();
         const proposedRoot = join(skillsRoot, 'proposed');
 
         switch (sub) {

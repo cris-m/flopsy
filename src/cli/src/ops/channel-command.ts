@@ -260,21 +260,8 @@ export function registerChannelCommands(root: Command): void {
             console.log(dim('restart gateway for the change to take effect'));
         });
 
-    // Default: `flopsy channel` with no subcommand → list.
-    ch.action(() => {
-        const { config } = readFlopsyConfig();
-        const channels = (config.channels ?? {}) as Record<string, RawChannel>;
-        console.log(section('Channels'));
-        const names = Object.keys(channels).sort();
-        if (names.length === 0) {
-            console.log(row('channels', dim('none configured')));
-            return;
-        }
-        for (const name of names) {
-            const c = channels[name];
-            console.log(row(name, c.enabled === true ? ok('enabled') : dim('disabled')));
-        }
-    });
+    // Default: `flopsy channel` with no subcommand → show help (use `list` for the channel listing).
+    ch.action((_opts: unknown, cmd: { outputHelp(): void }) => cmd.outputHelp());
 }
 
 function flipEnabled(name: string, value: boolean): void {

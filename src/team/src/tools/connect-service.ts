@@ -28,21 +28,34 @@ interface ConnectServiceConfigurable {
 export const connectServiceTool = defineTool({
     name: 'connect_service',
     description: [
-        'ONE-TIME OAUTH SETUP ONLY. Starts a Google device-code authorization',
-        'flow. The user gets a URL + short code, signs in on their phone, and',
-        'a success notification arrives in a later turn.',
+        'ONE-TIME OAUTH SETUP. Starts a Google device-code flow: the user',
+        'gets a URL + short code, signs in on whatever device they have',
+        '(phone is fine), and a success notification arrives in a later turn.',
+        'The URL + code are sent to the user automatically — you do not need',
+        'to format anything; just invoke the tool.',
         '',
-        'DO NOT USE for reading / sending / listing email, calendar events,',
-        'drive files, notes, etc. — those are already authorized via the',
-        'existing credentials file and must be reached by DELEGATING to the',
-        'worker that owns the corresponding MCP server (see the hard routing',
-        'table in your role instructions). Calling connect_service when the',
-        'user just wants to read their inbox will TRIGGER A DUPLICATE OAUTH',
-        'CONSENT — which is noisy, confusing, and never what the user wants.',
+        'WHEN TO CALL:',
+        '- User asks to authenticate / sign in / connect / link / authorize',
+        '  a Google account, OR to switch accounts.',
+        '- A worker reports `invalid_grant`, `revoked`, or "credential',
+        '  missing" for a Google MCP tool.',
         '',
-        'ONLY call this tool when the user explicitly asks to authorize,',
-        'connect, or link a new account, OR when a worker reports that the',
-        'stored credential is revoked / expired / missing.',
+        'DO NOT CALL when the user just wants to read/send email, list',
+        'calendar events, search drive, etc. — those tools are already',
+        'authorized; delegate to the worker that owns the relevant MCP',
+        'server instead. Calling connect_service for a read-an-email request',
+        'will trigger a duplicate OAuth consent — never what the user wants.',
+        '',
+        'SCOPE COVERAGE (Google policy, not Flopsy config):',
+        '- Calendar, Drive (file-scope), YouTube → authorized by this tool.',
+        '- Gmail → NOT authorized by this tool. Google policy blocks Gmail',
+        '  scopes from the device flow regardless of consent-screen setup.',
+        '  If the user specifically asked for Gmail / "link my gmail" /',
+        '  "email access", tell them: run `flopsy auth google` in a terminal',
+        '  on the machine running the gateway — that uses a browser flow',
+        '  Google does allow for Gmail. After that, gmail_* tools work here.',
+        '  Do NOT call connect_service for Gmail-only asks; it will succeed',
+        '  for the other scopes but Gmail will still be missing.',
     ].join('\n'),
     schema: z.object({
         provider: z
@@ -54,12 +67,10 @@ export const connectServiceTool = defineTool({
             .optional()
             .describe(
                 'Optional. OMIT THIS FIELD — the default scope set is correct. ' +
-                'Defaults to device-flow-safe set: gmail.readonly, gmail.send, ' +
-                'calendar, drive.file, openid, email, profile. ' +
-                'Only override if you have a specific narrower or wider need. ' +
-                'Any extra scope MUST be (a) on Google\'s device-flow allowlist ' +
-                'and (b) registered on the OAuth consent screen, or Google ' +
-                'rejects with `invalid_scope`. Passing `null` is treated as omit.',
+                'Defaults to device-flow-safe set: openid, email, profile, ' +
+                'calendar, drive.file, youtube, youtube.readonly. ' +
+                'Note: Gmail scopes are NOT in the default set — Google blocks ' +
+                'them from device flow. Gmail auth uses a separate web-flow path.',
             ),
     }),
     execute: async ({ provider, scopes: rawScopes }, ctx) => {

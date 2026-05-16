@@ -164,7 +164,7 @@ describe('FlopsyBot main agent wiring — MemoryProvider end-to-end', () => {
         const writeTool = allTools2.find((t) => t.name === 'memory');
         expect(writeTool).toBeDefined();
 
-        // The Hermes-style three actions: add / replace / remove.
+        // Three actions: add / replace / remove.
         const addResult = await writeTool!.execute(
             {
                 action: 'add',

@@ -1,12 +1,4 @@
-/**
- * Channel renderers — `/status` output for chat adapters. Two flavours:
- *   - Markdown: Telegram, Discord, Slack, Mattermost (supports *bold*, _italic_,
- *     inline code, line breaks)
- *   - Plain: Signal, SMS, email fallback (no formatting)
- *
- * Neither renderer references ANSI colour, terminal width, or filesystem paths.
- * Output is intended to fit in a single chat message — aim for <1500 chars.
- */
+/** Channel renderers for `/status`: Markdown (Telegram/Discord/Slack) and plain (Signal/SMS). */
 
 import type { StatusSnapshot } from './types';
 import { EMOJI, agoLabel, truncate } from './format';
@@ -15,7 +7,6 @@ import { EMOJI, agoLabel, truncate } from './format';
 export function renderChannelMarkdown(s: StatusSnapshot): string {
     const lines: string[] = [];
 
-    // Issues surface first when present — operator sees the problem before stats.
     if (s.issues && s.issues.length > 0) {
         lines.push(s.issues.map((i) => `${i.severity === 'error' ? '❌' : '⚠️'} ${i.message}`).join('\n'));
         lines.push('');
@@ -74,14 +65,12 @@ export function renderChannelMarkdown(s: StatusSnapshot): string {
             const triggersLine = triggerBits.length > 0 ? triggerBits.join(' · ') : 'no schedules';
             lines.push(`*Proactive* ${running} ${triggersLine}`);
 
-            // Last fire per kind (only when we have a timestamp)
             const fires: string[] = [];
             if (p.heartbeats.lastFireAgoMs !== undefined) fires.push(`hb ${agoLabel(p.heartbeats.lastFireAgoMs)}`);
             if (p.cron.lastFireAgoMs !== undefined) fires.push(`cron ${agoLabel(p.cron.lastFireAgoMs)}`);
             if (p.webhooks.lastReceiveAgoMs !== undefined) fires.push(`wh ${agoLabel(p.webhooks.lastReceiveAgoMs)}`);
             if (fires.length > 0) lines.push(`last fire — ${fires.join(' · ')}`);
 
-            // 24h funnel
             if (p.stats24h) {
                 const st = p.stats24h;
                 const parts = [
@@ -102,9 +91,7 @@ export function renderChannelMarkdown(s: StatusSnapshot): string {
         }
     }
 
-    // Integrations: skip when nothing interesting is set — slash /status in
-    // chat cares less about this than the CLI does. Shown only when auth OR
-    // MCP servers are configured.
+    // Slash /status hides this section unless auth or MCP is configured.
     {
         const i = s.integrations;
         const hasContent = i.auth.length > 0 || i.mcp.configured > 0;
@@ -127,7 +114,6 @@ export function renderChannelMarkdown(s: StatusSnapshot): string {
         }
     }
 
-    // Current thread — slash-only context.
     if (s.thread) {
         const t = s.thread;
         lines.push('');
@@ -158,7 +144,6 @@ export function renderChannelMarkdown(s: StatusSnapshot): string {
 
 /** No-markdown fallback for Signal/SMS. Strips bold, cuts aggressively. */
 export function renderChannelPlain(s: StatusSnapshot): string {
-    // Strip markdown markers by rendering markdown then removing them.
     return renderChannelMarkdown(s)
         .replace(/[*_`]/g, '')
         .split('\n')

@@ -1,21 +1,19 @@
 import { describe, it, expect } from 'vitest';
-import type { MessageRow } from '../../storage';
 import { hasToolCallSignal, TRIVIAL_SESSION_CHAR_THRESHOLD } from '../session-extractor';
 
-function row(role: 'user' | 'assistant', content: string, id = 1): MessageRow {
-    return {
-        id,
-        userId: 'u1',
-        threadId: 'tg:dm:peer1',
-        role,
-        content,
-        createdAt: id * 1000,
-    };
+// Local shape mirrors the extractor's internal `ExtractorMessage` —
+// it only reads `role` + `content`. Was previously typed as `MessageRow`
+// from storage, but the messages table was dropped when the team layer
+// stopped mirroring messages into learning.db (kept only in checkpoints).
+type Msg = { role: 'user' | 'assistant'; content: string };
+
+function row(role: 'user' | 'assistant', content: string, _id = 1): Msg {
+    return { role, content };
 }
 
 describe('hasToolCallSignal', () => {
     it('returns false for plain conversational replies', () => {
-        const msgs: MessageRow[] = [
+        const msgs: Msg[] = [
             row('user', 'what time is it?'),
             row('assistant', 'It is 4pm.', 2),
             row('user', 'thanks'),
@@ -25,35 +23,35 @@ describe('hasToolCallSignal', () => {
     });
 
     it('detects [delegated to <worker>] markers', () => {
-        const msgs: MessageRow[] = [
+        const msgs: Msg[] = [
             row('assistant', '[delegated to legolas] research the topic'),
         ];
         expect(hasToolCallSignal(msgs)).toBe(true);
     });
 
     it('detects [spawned background task] markers', () => {
-        const msgs: MessageRow[] = [
+        const msgs: Msg[] = [
             row('assistant', '[spawned background task #7 → saruman]'),
         ];
         expect(hasToolCallSignal(msgs)).toBe(true);
     });
 
     it('detects worker-reply-offload markers', () => {
-        const msgs: MessageRow[] = [
+        const msgs: Msg[] = [
             row('assistant', 'see [worker reply offloaded to /workspace/...]'),
         ];
         expect(hasToolCallSignal(msgs)).toBe(true);
     });
 
     it('detects iteration-cap stop suffixes', () => {
-        const msgs: MessageRow[] = [
+        const msgs: Msg[] = [
             row('assistant', 'partial answer (stopped after 30 tool calls)'),
         ];
         expect(hasToolCallSignal(msgs)).toBe(true);
     });
 
     it('detects __load_tool__ DCL traces', () => {
-        const msgs: MessageRow[] = [
+        const msgs: Msg[] = [
             row('assistant', 'used __load_tool__({"name":"gmail_search"}) earlier'),
         ];
         expect(hasToolCallSignal(msgs)).toBe(true);
@@ -62,7 +60,7 @@ describe('hasToolCallSignal', () => {
     it('ignores tool-call markers that appear in user messages only', () => {
         // Defensive: users don't tool-call, but if they paste a marker we
         // shouldn't be tricked into treating it as a signal.
-        const msgs: MessageRow[] = [
+        const msgs: Msg[] = [
             row('user', 'why did it print [delegated to legolas]?'),
             row('assistant', 'no idea'),
         ];
@@ -79,7 +77,7 @@ describe('trivial-session threshold', () => {
     });
 
     it('a typical "what time? / 4pm / thanks / yw" session falls below the threshold', () => {
-        const msgs: MessageRow[] = [
+        const msgs: Msg[] = [
             row('user', 'what time is it?'),
             row('assistant', 'It is 4pm.', 2),
             row('user', 'thanks'),
@@ -94,7 +92,7 @@ describe('trivial-session threshold', () => {
         // 400 chars per assistant message × 2 puts assistant content alone
         // at 800. Add a normal user side and the session clears.
         const long = 'x'.repeat(400);
-        const msgs: MessageRow[] = [
+        const msgs: Msg[] = [
             row('user', 'explain the difference between A and B'),
             row('assistant', long, 2),
             row('user', 'and what about C?'),

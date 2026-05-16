@@ -26,7 +26,7 @@
         "enabled": true,
         "servers": {
             "obsidian": {
-                "enabled": true,
+                "enabled": false,
                 "transport": "stdio",
                 "command": "npx",
                 "args": [
@@ -111,18 +111,19 @@
                 "transport": "stdio",
                 "command": "npx",
                 "args": [
-                    "-y",
-                    "@playwright/mcp@latest",
-                    "--browser",
-                    "chromium",
-                    "--headless"
+                    "tsx",
+                    "${MCP_ROOT}/browser.ts"
                 ],
                 "assignTo": [
                     "gandalf",
                     "legolas",
                     "saruman"
                 ],
-                "description": "Playwright-based browser automation. Set `enabled: true` after running `npx playwright install chromium`."
+                // Custom Playwright MCP with PDF, HAR, video capture, CDP connect,
+                // stealth mode, and multi-session support. Requires playwright
+                // installed in src/mcp-servers. Run `npx playwright install chromium`
+                // once before enabling.
+                "description": "Custom Playwright MCP: browser automation, screenshots, PDF, HAR recording, video capture, CDP connect (real browser sessions)."
             },
             "apple-notes": {
                 "enabled": true,

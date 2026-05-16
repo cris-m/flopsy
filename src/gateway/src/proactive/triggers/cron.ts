@@ -87,10 +87,24 @@ export class CronTrigger {
         }
     }
 
-    async triggerNow(id: string): Promise<boolean> {
+    /**
+     * Manually fire a cron job. Returns immediately after dispatching;
+     * the actual fire (including the LLM call, which can take 30-60s)
+     * runs detached. CLI callers see "triggered cron X" within ms
+     * instead of timing out on a 5s default fetch timeout. Failures
+     * are logged but don't propagate — the caller's "ok: true" only
+     * means the engine accepted the trigger, not that delivery
+     * succeeded; delivery shows up via channel send + log entries.
+     */
+    triggerNow(id: string): boolean {
         const job = this.jobs.get(id);
         if (!job) return false;
-        await this.fire(job);
+        void this.fire(job).catch((err) => {
+            log.error(
+                { jobId: id, err: err instanceof Error ? err.message : String(err) },
+                'manually-triggered cron fire failed',
+            );
+        });
         return true;
     }
 
@@ -184,6 +198,10 @@ export class CronTrigger {
             delivery,
             deliveryMode: job.payload.deliveryMode ?? 'always',
             ...(resolvedThreadId ? { threadId: resolvedThreadId } : {}),
+            ...(job.payload.noAgent ? { noAgent: true } : {}),
+            ...(job.payload.script ? { script: job.payload.script } : {}),
+            ...(job.payload.preCheckScript ? { preCheckScript: job.payload.preCheckScript } : {}),
+            ...(job.payload.skills && job.payload.skills.length > 0 ? { skills: job.payload.skills } : {}),
         };
 
         await this.executor.execute(executionJob).catch((err) => {

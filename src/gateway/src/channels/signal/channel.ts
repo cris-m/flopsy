@@ -2,7 +2,21 @@ import { spawn, type ChildProcess } from 'child_process';
 import { createInterface, type Interface } from 'readline';
 import type { Peer, OutboundMessage, ReactionOptions, Message } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
+import { resolveMediaSource } from '@gateway/core/media-resolver';
 import type { SignalChannelConfig } from './types';
+
+/** Per-RPC ack timeout — signal-cli typically responds in <500ms but
+ *  we cap at 10s so a hung child doesn't pin send() promises forever.
+ *  Send still "returns success" on timeout (the RPC may have landed
+ *  with no response surfaced); the alternative is rejecting and the
+ *  caller retrying a probably-duplicate message. */
+const RPC_ACK_TIMEOUT_MS = 10_000;
+
+interface PendingRpc {
+    resolve: (result: unknown) => void;
+    reject: (err: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+}
 
 export class SignalChannel extends BaseChannel {
     readonly name = 'signal';
@@ -11,6 +25,11 @@ export class SignalChannel extends BaseChannel {
     private process: ChildProcess | null = null;
     private reader: Interface | null = null;
     private readonly channelConfig: SignalChannelConfig;
+    /** id → pending RPC ack handlers. Previously send() resolved
+     *  immediately after the stdin.write returned — the caller thought
+     *  the message was delivered when signal-cli hadn't even tried yet.
+     *  Now we correlate the JSON-RPC response by id and wait for it. */
+    private readonly pendingRpcs = new Map<string, PendingRpc>();
 
     constructor(config: SignalChannelConfig) {
         super(config);
@@ -83,15 +102,75 @@ export class SignalChannel extends BaseChannel {
         const isGroup = message.peer.type === 'group';
         const id = `rpc-${Date.now()}`;
 
-        this.writeRpc(id, 'send', {
+        // Resolve media via the shared resolver. signal-cli's
+        // `attachments` array accepts local file paths; remote http(s)
+        // URLs aren't supported (we'd need to download first). Inline
+        // base64 also unsupported by signal-cli — drop it with a
+        // structured warning instead of silently mismatching.
+        const attachments: string[] = [];
+        if (message.media?.length) {
+            for (const media of message.media) {
+                const resolved = await resolveMediaSource(media);
+                if (!resolved.ok) {
+                    this.log.warn(
+                        { peer: message.peer.id, mediaType: media.type, mediaUrl: media.url, reason: resolved.reason, detail: resolved.detail, op: 'send:media:rejected' },
+                        'signal send: media resolution failed — skipping attachment',
+                    );
+                    continue;
+                }
+                if (resolved.source.kind !== 'local-path') {
+                    this.log.warn(
+                        { peer: message.peer.id, mediaType: media.type, sourceKind: resolved.source.kind, reason: 'signal-requires-local-path', op: 'send:media:rejected' },
+                        'signal send: signal-cli only accepts local file paths for attachments — skipping',
+                    );
+                    continue;
+                }
+                attachments.push(resolved.source.absPath);
+            }
+        }
+
+        await this.writeRpcAwait(id, 'send', {
             ...(isGroup ? { groupId: message.peer.id } : { recipient: [message.peer.id] }),
             message: message.body ?? '',
-            ...(message.media?.length && {
-                attachments: message.media.filter((m) => m.url).map((m) => m.url!),
-            }),
+            ...(attachments.length && { attachments }),
         });
 
         return id;
+    }
+
+    /** Write an RPC and wait for the matching response (by id) before
+     *  resolving. Timeout-bounded; logs on timeout but doesn't throw so
+     *  the caller's send() promise still settles (the message may have
+     *  landed even if the ack got lost). EPIPE on stdin.write is caught
+     *  + rejected so the caller learns the channel is dead. */
+    private async writeRpcAwait(id: string, method: string, params: Record<string, unknown>): Promise<unknown> {
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                if (this.pendingRpcs.delete(id)) {
+                    this.log.warn({ id, method }, 'signal RPC ack timeout — resolving anyway');
+                    resolve(undefined);
+                }
+            }, RPC_ACK_TIMEOUT_MS);
+            timer.unref?.();
+            this.pendingRpcs.set(id, { resolve, reject, timer });
+            try {
+                if (!this.process?.stdin) {
+                    throw new Error('Signal stdin not available');
+                }
+                this.process.stdin.write(
+                    JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n',
+                    (err) => {
+                        if (err) {
+                            clearTimeout(timer);
+                            if (this.pendingRpcs.delete(id)) reject(err);
+                        }
+                    },
+                );
+            } catch (err) {
+                clearTimeout(timer);
+                if (this.pendingRpcs.delete(id)) reject(err instanceof Error ? err : new Error(String(err)));
+            }
+        });
     }
 
     async sendTyping(peer: Peer): Promise<void> {
@@ -117,15 +196,50 @@ export class SignalChannel extends BaseChannel {
     }
 
     private writeRpc(id: string, method: string, params: Record<string, unknown>): void {
-        this.process!.stdin!.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+        // Non-awaiting fire-and-forget path — used by typing + react
+        // where the caller doesn't need an ack. Still catches EPIPE
+        // synchronously to avoid uncaught exceptions on dead stdin.
+        try {
+            this.process!.stdin!.write(
+                JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n',
+            );
+        } catch (err) {
+            this.log.debug({ id, method, err: err instanceof Error ? err.message : String(err) }, 'signal writeRpc failed (non-fatal)');
+        }
     }
 
     private async handleJsonRpcLine(line: string): Promise<void> {
-        let parsed: { method?: string; params?: Record<string, unknown> };
+        let parsed: { id?: string | number; method?: string; params?: Record<string, unknown>; result?: unknown; error?: unknown };
         try {
             parsed = JSON.parse(line);
         } catch {
             return;
+        }
+
+        // RPC response correlation — match by id, resolve/reject the
+        // pending promise from writeRpcAwait. Done BEFORE the receive
+        // dispatch so a response line doesn't accidentally fall through
+        // to message parsing.
+        if (parsed.id !== undefined && (parsed.result !== undefined || parsed.error !== undefined)) {
+            const rawId = String(parsed.id);
+            // RPC ids we generate match `rpc-<digits>` (see writeRpcAwait
+            // above). Reject any other shape so a malformed subprocess line
+            // can't resolve an unrelated pending promise.
+            if (!/^rpc-\d+$/.test(rawId)) return;
+            const pending = this.pendingRpcs.get(rawId);
+            if (pending) {
+                clearTimeout(pending.timer);
+                this.pendingRpcs.delete(rawId);
+                if (parsed.error) {
+                    const errMsg = typeof parsed.error === 'object' && parsed.error !== null && 'message' in parsed.error
+                        ? String((parsed.error as { message: unknown }).message)
+                        : JSON.stringify(parsed.error);
+                    pending.reject(new Error(`signal RPC error: ${errMsg}`));
+                } else {
+                    pending.resolve(parsed.result);
+                }
+                return;
+            }
         }
 
         if (parsed.method !== 'receive') return;

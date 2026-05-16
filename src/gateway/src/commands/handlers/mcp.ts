@@ -6,6 +6,11 @@ import { getMcpFacade, type McpServerStatus } from '../mcp-facade';
 export const mcpCommand: CommandDef = {
     name: 'mcp',
     description: 'Show MCP server status. `/mcp reload` to reconnect after auth changes.',
+    // Admin: `reload --evict` re-establishes every MCP subprocess and
+    // drops cached thread toolsets — DoSable from external channels.
+    // Read-only `mcp` (status) is also admin-only because it leaks
+    // which integrations are wired (recon).
+    scope: 'admin',
     handler: async (ctx: CommandContext) => {
         const facade = getMcpFacade();
         if (!facade) {

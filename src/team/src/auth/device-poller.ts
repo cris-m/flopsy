@@ -1,20 +1,6 @@
 /**
- * Device-flow poller — runs ONE poll loop per pending authorization.
- *
- * Flow:
- *   1. connect_service tool calls googleDeviceFlow.start() → gets device_code,
- *      user_code, verificationUrl, interval, expires_in.
- *   2. Tool tells the user via send_message ("go to .../device, enter code XYZ").
- *   3. Tool calls `startPolling()` here — registers a setInterval that polls
- *      every `interval` seconds until success / expiry / denial.
- *   4. On success: invokes the supplied `onSuccess` callback which is
- *      responsible for notifying the user via the channel.
- *   5. On terminal failure: `onFailure` callback fires.
- *
- * The poller is INTENTIONALLY simple — no persistence. If the gateway
- * restarts mid-poll, the user has to re-run `connect_service`. Adding
- * persistence is straightforward (write {deviceCode, threadId, ...} to
- * state.db, resume on startup) but premature for v1.
+ * Device-flow poller — one poll loop per pending authorization.
+ * No persistence: a gateway restart mid-poll means the user re-runs `connect_service`.
  */
 
 import { createLogger } from '@flopsy/shared';
@@ -43,9 +29,7 @@ export interface DevicePollOptions {
 export function startDevicePolling(opts: DevicePollOptions): DevicePollerHandle {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
-    // Protect against concurrent polls (one in-flight at a time).
     let inFlight = false;
-    // Honour Google's interval; bumped to 10s on slow_down.
     let intervalSec = Math.max(1, opts.intervalSeconds);
 
     const tick = async (): Promise<void> => {
@@ -55,8 +39,7 @@ export function startDevicePolling(opts: DevicePollOptions): DevicePollerHandle 
             return;
         }
         if (inFlight) {
-            // Previous poll still running — schedule another tick after the
-            // current interval. Avoid pile-up on a slow network.
+            // Reschedule rather than pile up on slow network.
             timer = setTimeout(() => void tick(), intervalSec * 1000);
             return;
         }
@@ -78,13 +61,7 @@ export function startDevicePolling(opts: DevicePollOptions): DevicePollerHandle 
                 return;
             }
             if (result.status === 'pending') {
-                // RFC 8628 §3.5: on `slow_down`, ADD 5s to the running
-                // interval — don't overwrite. Without this, repeated
-                // slow_downs never accumulate and we keep polling at a
-                // rate the server is explicitly asking us to slow.
-                // `result.slowDown` is the signal from google.ts; for
-                // plain `authorization_pending` we honour the server's
-                // suggested interval (Google may bump it on its own).
+                // RFC 8628 §3.5: on `slow_down` ADD 5s to the running interval (don't overwrite).
                 if ((result as { slowDown?: boolean }).slowDown) {
                     intervalSec = intervalSec + 5;
                 } else {
@@ -93,9 +70,6 @@ export function startDevicePolling(opts: DevicePollOptions): DevicePollerHandle 
                 timer = setTimeout(() => void tick(), intervalSec * 1000);
                 return;
             }
-            // expired | denied | error — log the actionable detail for 'error'
-            // so operators aren't staring at a useless "denied" in logs when
-            // the real cause is invalid_grant/invalid_client/etc.
             if (result.status === 'error') {
                 log.warn(
                     { provider: opts.provider, detail: result.errorDetail },
@@ -117,8 +91,7 @@ export function startDevicePolling(opts: DevicePollOptions): DevicePollerHandle 
         }
     };
 
-    // Kick off the first poll AFTER the initial interval — Google
-    // explicitly says don't poll before the first interval elapses.
+    // RFC 8628: don't poll before the first interval elapses.
     timer = setTimeout(() => void tick(), intervalSec * 1000);
 
     return {

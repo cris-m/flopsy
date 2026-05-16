@@ -1,4 +1,4 @@
-import { createLogger, resolveWorkspacePath, scrubPii } from '@flopsy/shared';
+import { createLogger, resolveWorkspacePath, scrubPii, workspace } from '@flopsy/shared';
 import type {
     AgentCallbacks,
     AgentChunk,
@@ -11,8 +11,9 @@ import type {
     TaskStatusSummary,
     ThreadStatusSnapshot,
 } from '@flopsy/gateway';
+import { ProactiveDecisionSchema } from '@flopsy/gateway';
 import type { AgentDefinition, McpConfig } from '@flopsy/shared';
-import type { BaseChatModel, BaseStore, CheckpointStore, BaseTool, Provider, ContentBlock, ModelRouter, TextBlock } from 'flopsygraph';
+import type { BaseChatModel, BaseStore, CheckpointStore, BaseTool, ChatMessage, Provider, ContentBlock, ModelRouter, TextBlock } from 'flopsygraph';
 import {
     CheckpointManager,
     ModelLoader,
@@ -23,11 +24,13 @@ import {
 } from 'flopsygraph';
 
 import { parseModelString } from './bootstrap';
-import { createTeamMember, resolveRole } from './factory';
+import { createTeamMember, getCompactorStatus, resolveRole, summarizeForCompaction } from './factory';
 import type { TeamMember, TeamRosterEntry } from './factory';
 import { getSharedLearningStore, getSharedPairingStore } from './harness';
 import { setPairingFacade, setPersonalityFacade, setInsightsFacade, setBranchFacade } from '@flopsy/gateway';
-import type { SessionExtractor, ExtractionResult, SkillProposal } from './harness/review';
+import type { ExtractionResult, SkillProposal } from './harness/review';
+import { SessionExtractor } from './harness/review';
+import { CommitmentsExtractor } from './harness/review/commitments-extractor';
 import {
     scanExistingSkills,
     writeSkillFile,
@@ -54,6 +57,55 @@ import type {
 
 const log = createLogger('team-handler');
 
+/**
+ * Hints rendered verbatim in the proactive agent's `<runtime>` block.
+ * Output guidance is mode-aware: only `conditional` fires register `__respond__`;
+ * `always`/`silent` emit plain prose. The disabled-tool list mirrors the filter
+ * in `factory.ts` when `proactiveMode: true`.
+ */
+export function buildProactiveRuntimeHints(
+    deliveryMode?: 'always' | 'conditional' | 'silent',
+): readonly string[] {
+    const common = [
+        'context: proactive fire (heartbeat / cron / webhook) — no live user is on the other end of this turn.',
+        'unavailable: delegate_task (no workers in proactive mode), spawn_background_task, ask_user, react, send_poll, manage_schedule, send_message.',
+        'available: memory tools, MCP tools, web_search, __load_tool__ for the long tail.',
+    ];
+
+    const outputHint = (() => {
+        if (deliveryMode === 'conditional') {
+            return 'output: call `__respond__` with the structured ProactiveDecision (deliver+message OR deliver+silenceReason). `__respond__` is a MODEL TOOL CALL, not a Python function — do NOT write `__respond__(...)` inside execute_code; that NameErrors.';
+        }
+        if (deliveryMode === 'always') {
+            return 'output: this is `delivery: always`. There is NO `__respond__` tool registered — emit your final response as plain prose in your last assistant turn. The engine delivers your text directly to the configured channel. Calling `__respond__` will tool-not-found error and waste retries.';
+        }
+        return 'output: emit your final response as plain prose. There is no `__respond__` tool for this fire. The engine handles delivery (or silent-mode side-effects) from your final text.';
+    })();
+
+    return [
+        ...common,
+        outputHint,
+        'output: keep replies tight — proactive turns are pushed to the user, not pulled. One coherent message, no clarifying questions, no meta-status lines like "Message delivered."',
+    ];
+}
+
+/**
+ * Resolve the abort signal for a proactive fire.
+ * Default: unlimited (per-call `modelCallTimeoutMs` and `maxIterations` already bound work).
+ * Operators can set `FLOPSY_PROACTIVE_TIMEOUT_MS` for a hard wall-clock cap; `0` = unlimited.
+ */
+export function resolveProactiveTimeoutSignal(): AbortSignal {
+    const raw = (process.env.FLOPSY_PROACTIVE_TIMEOUT_MS ?? '').trim();
+    if (!raw) {
+        return new AbortController().signal;
+    }
+    const ms = Number(raw);
+    if (!Number.isFinite(ms) || ms <= 0) {
+        return new AbortController().signal;
+    }
+    return AbortSignal.timeout(ms);
+}
+
 export interface ThreadIdentity {
     readonly userId: string;
     readonly userName?: string;
@@ -71,6 +123,11 @@ export interface TeamHandlerConfig {
     readonly store?: LearningStore;
     readonly memory?: {
         readonly enabled?: boolean;
+        readonly userProfileEnabled?: boolean;
+        /** Per-namespace char budget for namespaces other than `profile`. */
+        readonly memoryCharLimit?: number;
+        /** Char budget specifically for the `profile` namespace. */
+        readonly userCharLimit?: number;
         readonly embedder?: {
             readonly provider?: 'ollama';
             readonly model?: string;
@@ -79,7 +136,16 @@ export interface TeamHandlerConfig {
     };
 
     readonly mcp?: McpConfig;
+    /** Off by default; when `enabled` + `extractorModel` set, runs fire-and-forget post-turn extraction. */
+    readonly commitments?: {
+        readonly enabled?: boolean;
+        readonly maxPerDay?: number;
+        readonly minConfidence?: number;
+    };
+    /** Pre-built SessionExtractor; prefer `extractorModel`. Kept for tests that mock the extractor. */
     readonly sessionExtractor?: SessionExtractor;
+    /** Auxiliary model used by the internally-built SessionExtractor (typically the fast tier). */
+    readonly extractorModel?: BaseChatModel;
     readonly modelRouter?: ModelRouter;
     readonly modelRouters?: ReadonlyMap<string, ModelRouter>;
     readonly personalities?: PersonalityRegistry;
@@ -112,7 +178,8 @@ export class TeamHandler implements AgentHandler {
     private mcpReady: Promise<readonly BridgedTool[]> = Promise.resolve([]);
     private mcpSkipReasons: Readonly<Record<string, string>> = {};
     private readonly mcpToolCounts = new Map<string, number>();
-    private readonly sessionExtractor?: SessionExtractor;
+    private sessionExtractor?: SessionExtractor;
+    private commitmentsExtractor?: CommitmentsExtractor;
     readonly modelRouter?: ModelRouter;
     readonly modelRouters?: ReadonlyMap<string, ModelRouter>;
     readonly personalities?: PersonalityRegistry;
@@ -161,6 +228,7 @@ export class TeamHandler implements AgentHandler {
 
         if (this.personalities) {
             const personalities = this.personalities;
+            // entryDef is assigned later in this constructor; read lazily at call time.
             setPersonalityFacade({
                 list: () =>
                     personalities.list().map((p) => ({
@@ -168,8 +236,13 @@ export class TeamHandler implements AgentHandler {
                         description: p.description,
                     })),
                 getActive: (rawKey) => {
+                    // Mirror buildSystemPrompt: sessionPersonality → defaultPersonality → null.
                     const sessionId = this.resolveActiveSessionId(rawKey);
-                    return sessionId ? this.store.getSessionPersonality(sessionId) : null;
+                    const session = sessionId ? this.store.getSessionPersonality(sessionId) : null;
+                    if (session) return session;
+                    const defaultName = this.entryDef.defaultPersonality ?? null;
+                    if (defaultName && personalities.has(defaultName)) return defaultName;
+                    return null;
                 },
                 setActive: (rawKey, name) => {
                     if (name !== null && !personalities.has(name)) return false;
@@ -268,6 +341,36 @@ export class TeamHandler implements AgentHandler {
             keepLatestPerThread: 60,
         });
 
+        // Build the SessionExtractor against our checkpointer when bootstrap
+        // supplied an `extractorModel` rather than a pre-built extractor.
+        if (!this.sessionExtractor && config.extractorModel) {
+            this.sessionExtractor = new SessionExtractor({
+                model: config.extractorModel,
+                checkpointer: this.checkpointer,
+            });
+        }
+
+        // Inferred-commitments extractor — opt-in; requires extractor model.
+        if (config.commitments?.enabled && config.extractorModel) {
+            this.commitmentsExtractor = new CommitmentsExtractor({
+                model: config.extractorModel,
+                store: this.store,
+                ...(config.commitments.maxPerDay !== undefined
+                    ? { maxPerDay: config.commitments.maxPerDay }
+                    : {}),
+                ...(config.commitments.minConfidence !== undefined
+                    ? { minConfidence: config.commitments.minConfidence }
+                    : {}),
+            });
+            log.info(
+                {
+                    maxPerDay: config.commitments.maxPerDay ?? 3,
+                    minConfidence: config.commitments.minConfidence ?? 0.7,
+                },
+                'commitments extractor ready (opt-in, hidden post-turn pass)',
+            );
+        }
+
         const memoryCfg = config.memory ?? {};
         const memoryEnabled = memoryCfg.enabled !== false;
         const embedderCfg = memoryCfg.embedder;
@@ -280,11 +383,7 @@ export class TeamHandler implements AgentHandler {
                       embedderCfg.baseUrl,
                   )
                 : undefined;
-        // softCapPerNamespace: rough bound on entry COUNT per namespace so the
-        // memory tool's overThreshold flag fires and prompts consolidation.
-        // Hermes-style namespaces (memory, user) are content-bounded by the
-        // memorySnapshot interceptor's character caps; this is a complementary
-        // entry-count guardrail across all namespaces.
+        // softCapPerNamespace: entry-count guardrail across namespaces (content is char-bounded elsewhere).
         this.memoryStore = new SqliteMemoryStore({
             path: resolveWorkspacePath('state', 'memory.db'),
             softCapPerNamespace: 50,
@@ -305,7 +404,7 @@ export class TeamHandler implements AgentHandler {
             persistAcrossGraphEnd: true,
             onUpdate: (threadId, delta, _cumulative, ctx, response) => {
                 const date = localDateString();
-                // modelFallback pins _fallbackTo on response.raw to keep token attribution accurate.
+                // modelFallback pins _fallbackTo on response.raw for accurate token attribution.
                 const fallback = (response.raw as Record<string, unknown> | undefined)?.['_fallbackTo'] as
                     { provider?: string; model?: string } | undefined;
                 this.store.recordTokenUsage({
@@ -401,6 +500,8 @@ export class TeamHandler implements AgentHandler {
 
         const entry = await this.getOrCreateThread(threadId, {
             isProactive: callbacks.channelName === 'proactive',
+            // Drives outputSchema gating in createTeamMember (conditional → schema; else → prose).
+            ...(callbacks.deliveryMode ? { deliveryMode: callbacks.deliveryMode } : {}),
         });
         entry.lastUsedAt = Date.now();
 
@@ -419,7 +520,14 @@ export class TeamHandler implements AgentHandler {
                 threadId,
                 userId: entry.identity.userId,
                 store: this.store,
-                summaryModel: this.config.model,
+                checkpointer: this.checkpointer,
+                // Search summarization runs on the fast tier (same model as
+                // SessionExtractor — typically a cheaper / higher-throughput
+                // tier than the main agent's deepseek-v4-pro). Avoids 503s
+                // from the primary provider being saturated by main-loop
+                // reasoning, and matches the practice of using an auxiliary
+                // model for compression work.
+                summaryModel: this.config.extractorModel ?? this.config.model,
                 channelName: callbacks.channelName,
                 channelCapabilities: callbacks.channelCapabilities,
                 peer: callbacks.peer,
@@ -429,60 +537,46 @@ export class TeamHandler implements AgentHandler {
                 runtimeHints: callbacks.runtimeHints,
                 taskStore: this.store,
                 skillUsageStore: entry.entry.skillUsageStore,
-                onAuthSuccess: async (provider: string) => {
+                onAuthSuccess: (provider: string) => {
+                    // Fire-and-forget; awaiting would block the user's turn for 5-30s on slow MCP restart.
                     if (!this.mcpServersCfg || Object.keys(this.mcpServersCfg).length === 0) return;
-                    let affected: string[] = [];
-                    try {
-                        affected = Object.entries(this.mcpServersCfg)
-                            .filter(([, srv]) =>
-                                srv.enabled !== false &&
-                                srv.requiresAuth?.includes(provider),
-                            )
-                            .map(([name]) => name);
-                        if (affected.length === 0) return;
-                        log.info({ provider, servers: affected }, 'reloading mcp servers after auth');
-                        const { servers } = await loadMcpServers(
-                            Object.fromEntries(
-                                affected.map((n) => [n, this.mcpServersCfg[n]!]),
-                            ),
-                        );
-                        if (servers.length > 0) await this.mcpManager.restartServers(servers);
-                    } catch (err) {
-                        log.warn(
-                            { provider, servers: affected, err: err instanceof Error ? err.message : String(err) },
-                            'onAuthSuccess mcp restart failed — notifying user',
-                        );
+                    void (async () => {
+                        let affected: string[] = [];
                         try {
-                            const serverList = affected.length > 0 ? affected.join(', ') : provider;
-                            await callbacks.onReply(
-                                `✓ Authorized ${provider}, but couldn't restart the connector (${serverList}). Try /doctor, or message me again in ~30s.`,
+                            affected = Object.entries(this.mcpServersCfg)
+                                .filter(([, srv]) =>
+                                    srv.enabled !== false &&
+                                    srv.requiresAuth?.includes(provider),
+                                )
+                                .map(([name]) => name);
+                            if (affected.length === 0) return;
+                            log.info({ provider, servers: affected }, 'reloading mcp servers after auth (background)');
+                            const { servers } = await loadMcpServers(
+                                Object.fromEntries(
+                                    affected.map((n) => [n, this.mcpServersCfg[n]!]),
+                                ),
                             );
-                        } catch (sendErr) {
-                            log.error(
-                                { provider, sendErr: sendErr instanceof Error ? sendErr.message : String(sendErr) },
-                                'failed to notify user about MCP restart failure — they have no signal',
+                            if (servers.length > 0) await this.mcpManager.restartServers(servers);
+                        } catch (err) {
+                            log.warn(
+                                { provider, servers: affected, err: err instanceof Error ? err.message : String(err) },
+                                'onAuthSuccess mcp restart failed — notifying user',
                             );
+                            try {
+                                const serverList = affected.length > 0 ? affected.join(', ') : provider;
+                                await callbacks.onReply(
+                                    `✓ Authorized ${provider}, but couldn't restart the connector (${serverList}). Try /doctor, or message me again in ~30s.`,
+                                );
+                            } catch (sendErr) {
+                                log.error(
+                                    { provider, sendErr: sendErr instanceof Error ? sendErr.message : String(sendErr) },
+                                    'failed to notify user about MCP restart failure — they have no signal',
+                                );
+                            }
                         }
-                    }
+                    })();
                 },
             };
-
-            // Persist BEFORE invoke so the user turn survives an agent crash mid-turn.
-            if (role === 'user') {
-                try {
-                    this.store.recordMessage({
-                        userId: entry.identity.userId,
-                        threadId,
-                        role: 'user',
-                        content: text,
-                    });
-                } catch (err) {
-                    log.warn(
-                        { threadId, err: redactSecrets(err), op: 'recordMessage.user' },
-                        'failed to persist user turn — session search may miss this message',
-                    );
-                }
-            }
 
             const effectiveText = awayRecap
                 ? `[Continuity context — recap of your last session with this user: ${awayRecap}]\n[How to use this: if the user opens with a casual greeting like "hey", "how is everything", "what's up" — DO NOT reply with a generic "How can I help today?". Reference the recap: name what was in flight and ask if they want to continue, or proactively check the next step. If the user asks a direct question, answer it AND, if the recap mentions a pending follow-up, mention it briefly. Only ignore the recap if it's plainly irrelevant to what they just said.]\n\n${text}`
@@ -499,8 +593,7 @@ export class TeamHandler implements AgentHandler {
             type ResultEvent = { type: 'result'; data?: { state?: unknown } };
             type AgentStreamEvent = ChunkEvent | NodeEvent | ResultEvent | { type: string };
 
-            // Tool-call deltas arrive in two parts: the start has name+index, later deltas
-            // carry partial_json args fragments — accumulate args by index for the tool-start emit.
+            // Tool-call deltas arrive split (start has name+index, later deltas carry partial_json).
             let lastToolName: string | undefined;
             let lastToolIndex: number | undefined;
             const toolArgsByIndex = new Map<number, string>();
@@ -521,8 +614,7 @@ export class TeamHandler implements AgentHandler {
                 { threadId, signal: callbacks.signal, configurable },
             );
 
-            // Snapshot pre-turn token totals so we can compute the per-turn delta.
-            // tokenCounter accumulates cumulatively per threadId; we want just this turn.
+            // Snapshot pre-turn token totals (tokenCounter is cumulative per threadId).
             const tokensBefore = this.tokens.getTotals(threadId)
                 ?? { input: 0, output: 0, reasoning: 0, cached: 0, calls: 0 };
 
@@ -571,6 +663,8 @@ export class TeamHandler implements AgentHandler {
                 tokenUsage?: unknown;
                 stoppedByLimit?: unknown;
                 toolStepCount?: unknown;
+                // Populated when agent has outputSchema and called __respond__; read only by proactive path.
+                structured?: unknown;
             };
 
             const messages =
@@ -591,9 +685,6 @@ export class TeamHandler implements AgentHandler {
                     ? `${baseReply}\n\n_(I stopped after ${toolStepCount ?? 'too many'} tool calls — say "continue" if you want me to keep going.)_`
                     : baseReply;
 
-            // Compute the turn's delta from the tokenCounter interceptor's
-            // cumulative totals. Falls back to whatever the graph state happens
-            // to expose, which is currently always undefined.
             const tokensAfter = this.tokens.getTotals(threadId)
                 ?? { input: 0, output: 0, reasoning: 0, cached: 0, calls: 0 };
             const turnDelta = {
@@ -607,22 +698,6 @@ export class TeamHandler implements AgentHandler {
                 | undefined;
             const usage = stateUsage ?? (turnDelta.promptTokens + turnDelta.completionTokens > 0 ? turnDelta : undefined);
 
-            if (reply && reply.trim().length > 0) {
-                try {
-                    this.store.recordMessage({
-                        userId: entry.identity.userId,
-                        threadId,
-                        role: 'assistant',
-                        content: reply,
-                    });
-                } catch (err) {
-                    log.warn(
-                        { threadId, err: redactSecrets(err), op: 'recordMessage.assistant' },
-                        'failed to persist assistant reply — session search may miss this message',
-                    );
-                }
-            }
-
             if (role === 'user') {
                 const peerId = threadId.split('#')[0] ?? threadId;
                 try {
@@ -632,6 +707,29 @@ export class TeamHandler implements AgentHandler {
                         { threadId, err: redactSecrets(err), op: 'session.touch' },
                         'failed to touch session — turn_count + freshness may drift',
                     );
+                }
+
+                // Inferred-commitments extraction — fire-and-forget; never awaits or propagates.
+                if (this.commitmentsExtractor && reply && text) {
+                    // Scope key is `<channel>:<peerId>` so the executor can build it from job.delivery alone.
+                    const scope = `${callbacks.channelName}:${peerId}`;
+                    const ctx = {
+                        scope,
+                        peerId,
+                        channel: callbacks.channelName,
+                        agentId: this.entryDef.name,
+                        userText: text,
+                        agentReply: reply,
+                        sourceTurnId: `${threadId}:${Date.now()}`,
+                    };
+                    void this.commitmentsExtractor
+                        .extract(ctx)
+                        .catch((err) => {
+                            log.warn(
+                                { threadId, peerId, err: redactSecrets(err) },
+                                'commitments extractor threw (non-fatal, ignored)',
+                            );
+                        });
                 }
             }
 
@@ -646,6 +744,7 @@ export class TeamHandler implements AgentHandler {
                         ...(usage.cachedTokens ? { cached: usage.cachedTokens } : {}),
                     }
                     : undefined,
+                ...(result.structured !== undefined ? { structured: result.structured } : {}),
             };
         } catch (err) {
             if (callbacks.signal.aborted) {
@@ -659,14 +758,211 @@ export class TeamHandler implements AgentHandler {
         }
     }
 
+    /**
+     * Stateless single-agent invocation for proactive fires: fresh agent per call,
+     * no thread cache, no worker team, no delegate/spawn/ask_user tools.
+     */
+    async invokeStateless(
+        text: string,
+        threadId: string,
+        options: {
+            readonly deliveryMode?: 'always' | 'conditional' | 'silent';
+            readonly signal?: AbortSignal;
+            readonly personality?: string;
+            readonly runtimeHints?: ReadonlyArray<string>;
+        } = {},
+    ): Promise<AgentResult> {
+        // Per-namespace char budgets — mirror getOrCreateThread's derivation.
+        const memoryCharLimits: Record<string, number> = (() => {
+            const memCfg = this.config.memory ?? {};
+            const memLim = memCfg.memoryCharLimit ?? 2200;
+            const usrLim = memCfg.userCharLimit ?? 1375;
+            return { profile: usrLim, memory: memLim, facts: memLim, directives: memLim };
+        })();
+
+        // Reuse the cached entry's MCP filter so proactive sees the same surface for __load_tool__.
+        const allMcpTools = await this.mcpReady;
+        const filteredMcpTools = filterToolsForAgent(
+            allMcpTools,
+            this.entryDef.name,
+            this.entryDef.mcpServers,
+            this.mcpAssignToMap,
+        );
+        const { staticMcpTools, dynamicMcpTools } = this.partitionMcpToolsByPreload(filteredMcpTools);
+        const mcpTools = dynamicMcpTools as unknown as BaseTool[];
+        const mcpPreloadedTools = staticMcpTools as unknown as BaseTool[];
+
+        const identity = await this.config.resolveThread(threadId);
+
+        const member = createTeamMember(this.entryDef, {
+            model: this.config.model,
+            userId: identity.userId,
+            userName: identity.userName,
+            store: this.store,
+            memoryStore: this.memoryStore,
+            memoryCharLimits,
+            extraInterceptors: [this.tokens],
+            checkpointer: this.checkpointer,
+            extraTools: mcpPreloadedTools.length > 0 ? mcpPreloadedTools : undefined,
+            extraDynamicTools: mcpTools,
+            // Empty roster — `delegate_task` is filtered by `proactiveMode`,
+            // but pass [] so anything else that consults teamRoster sees the
+            // expected "no workers visible" shape.
+            teamRoster: [],
+            personalities: this.personalities,
+            modelCallTimeoutMs: 180_000,
+            // Strips delegate_task, spawn_background_task, ask_user, react, send_poll, manage_schedule.
+            proactiveMode: true,
+            isProactive: true,
+            ...(options.deliveryMode === 'conditional'
+                ? { outputSchema: ProactiveDecisionSchema }
+                : {}),
+            ...(this.config.observability ? { observability: this.config.observability } : {}),
+        });
+
+        const signal = options.signal ?? resolveProactiveTimeoutSignal();
+        const registry = new TaskRegistry();
+
+        // Channel callbacks are no-ops; proactive turns deliver via the engine's channel router.
+        const configurable: Record<string, unknown> = {
+            onReply: async () => {},
+            sendPoll: async () => {},
+            drainPending: () => [] as string[],
+            setDidSendViaTool: () => {},
+            reactToUserMessage: async () => {},
+            eventQueue: {
+                push: () => {},
+                tryDequeue: () => null,
+                waitForEvent: async () => false,
+            },
+            registry,
+            buildSubAgent: () => {
+                throw new Error('proactive single-agent fire cannot delegate to workers — delegate_task was filtered');
+            },
+            depth: 0,
+            threadId,
+            userId: identity.userId,
+            store: this.store,
+            checkpointer: this.checkpointer,
+            summaryModel: this.config.extractorModel ?? this.config.model,
+            channelName: 'proactive',
+            channelCapabilities: [] as readonly string[],
+            peer: { id: 'proactive', type: 'user' as const },
+            taskStore: this.store,
+            skillUsageStore: member.skillUsageStore,
+            ...(options.personality ? { personality: options.personality } : {}),
+            ...(options.runtimeHints
+                ? { runtimeHints: options.runtimeHints }
+                : { runtimeHints: buildProactiveRuntimeHints(options.deliveryMode) }),
+            ...(options.deliveryMode ? { deliveryMode: options.deliveryMode } : {}),
+        };
+
+        const tokensBefore = this.tokens.getTotals(threadId)
+            ?? { input: 0, output: 0, reasoning: 0, cached: 0, calls: 0 };
+
+        type FlopsyStreamChunk = {
+            content?: string;
+            reasoning?: string;
+            toolCallDeltas?: Array<{ index: number; id?: string; name?: string; args?: string }>;
+        };
+        type ChunkEvent = { type: 'message-chunk'; chunk?: FlopsyStreamChunk };
+        type NodeEvent = { type: 'node-start' | 'node-finish'; node: string };
+        type ResultEvent = { type: 'result'; data?: { state?: unknown } };
+        type AgentStreamEvent = ChunkEvent | NodeEvent | ResultEvent | { type: string };
+
+        let resultState: unknown = null;
+
+        try {
+            const stream = (member.agent as unknown as {
+                stream: (
+                    input: { messages: Array<{ role: string; content: unknown }> },
+                    opts: { threadId: string; signal: AbortSignal; configurable: Record<string, unknown> },
+                ) => AsyncIterable<AgentStreamEvent>;
+            }).stream(
+                { messages: [{ role: 'user', content: text }] },
+                { threadId, signal, configurable },
+            );
+
+            for await (const event of stream) {
+                if (event.type === 'result') {
+                    resultState = (event as ResultEvent).data?.state;
+                }
+            }
+
+            if (!resultState) {
+                throw new Error('proactive agent stream completed without a result event');
+            }
+
+            const result = resultState as {
+                messages?: unknown;
+                tokenUsage?: unknown;
+                stoppedByLimit?: unknown;
+                toolStepCount?: unknown;
+                structured?: unknown;
+            };
+
+            const messages =
+                (result.messages as unknown as Array<{ role: string; content: unknown }>) ?? [];
+            const lastAssistant = [...messages].reverse().find((m) => m.role === 'assistant');
+            const reply = lastAssistant
+                ? typeof lastAssistant.content === 'string'
+                    ? lastAssistant.content
+                    : JSON.stringify(lastAssistant.content)
+                : null;
+
+            const tokensAfter = this.tokens.getTotals(threadId)
+                ?? { input: 0, output: 0, reasoning: 0, cached: 0, calls: 0 };
+            const turnDelta = {
+                promptTokens: Math.max(0, tokensAfter.input - tokensBefore.input),
+                completionTokens: Math.max(0, tokensAfter.output - tokensBefore.output),
+                reasoningTokens: Math.max(0, tokensAfter.reasoning - tokensBefore.reasoning),
+                cachedTokens: Math.max(0, tokensAfter.cached - tokensBefore.cached),
+            };
+            const stateUsage = result.tokenUsage as unknown as
+                | { promptTokens: number; completionTokens: number; reasoningTokens?: number; cachedTokens?: number }
+                | undefined;
+            const usage = stateUsage ?? (turnDelta.promptTokens + turnDelta.completionTokens > 0 ? turnDelta : undefined);
+
+            log.info(
+                {
+                    threadId,
+                    op: 'proactive:stateless-return',
+                    hasStructured: result.structured !== undefined,
+                    replyLength: reply?.length ?? 0,
+                    deliveryMode: options.deliveryMode,
+                },
+                'proactive stateless agent returned',
+            );
+
+            return {
+                reply,
+                didSendViaTool: false,
+                tokenUsage: usage
+                    ? {
+                        input: usage.promptTokens,
+                        output: usage.completionTokens,
+                        ...(usage.reasoningTokens ? { reasoning: usage.reasoningTokens } : {}),
+                        ...(usage.cachedTokens ? { cached: usage.cachedTokens } : {}),
+                    }
+                    : undefined,
+                ...(result.structured !== undefined ? { structured: result.structured } : {}),
+            };
+        } catch (err) {
+            if (signal.aborted) {
+                log.debug({ threadId }, 'proactive stateless invoke aborted');
+                return { reply: null, didSendViaTool: false };
+            }
+            log.error({ threadId, err: redactSecrets(err) }, 'proactive stateless invoke failed');
+            throw err;
+        }
+    }
+
     get activeThreadCount(): number {
         return this.threads.size;
     }
 
     queryStatus(rawKey: string): ThreadStatusSnapshot | undefined {
-        // Exact match first (caller may already hold the resolved session key).
-        // Fall back to prefix search: threads are stored as "rawKey#sessionId" but
-        // the channel-worker passes the unresolved raw key.
+        // Try exact match then prefix search: threads keyed as "rawKey#sessionId".
         let entry = this.threads.get(rawKey);
         if (!entry) {
             for (const [threadId, e] of this.threads) {
@@ -836,6 +1132,13 @@ export class TeamHandler implements AgentHandler {
         };
     }
 
+    getCompactorStatus(threadId: string) {
+        const c = getCompactorStatus(this.entryDef.name, threadId);
+        if (!c) return undefined;
+        const { tokens, threshold, percentUsed, tokensRemaining, willCompactNext } = c;
+        return { tokens, threshold, percentUsed, tokensRemaining, willCompactNext };
+    }
+
     async evictThread(threadId: string): Promise<void> {
         const entry = this.threads.get(threadId);
         if (!entry) return;
@@ -892,7 +1195,7 @@ export class TeamHandler implements AgentHandler {
         await Promise.allSettled(
             entries.map((e) => e.entry.harnessInterceptor?.flush() ?? Promise.resolve()),
         );
-        // WAL checkpoint on shutdown — otherwise the next boot replays it.
+        // WAL checkpoint on shutdown — otherwise next boot replays it.
         const closable = this.checkpointer as { close?: () => void | Promise<void> };
         if (typeof closable.close === 'function') {
             try {
@@ -933,7 +1236,7 @@ export class TeamHandler implements AgentHandler {
                 const prevThreadId = `${result.peerId}#${result.previousSessionId}`;
                 const prevSessionId = result.previousSessionId;
                 const peerId = result.peerId;
-                // Fire-and-forget: feeds pendingRecapPromises so the new session's first turn can race it.
+                // Fire-and-forget; feeds pendingRecapPromises for first-turn race.
                 const summaryPromise = this.runSessionExtraction(prevThreadId, prevSessionId, peerId)
                     .then((r) => r?.summary ?? null)
                     .catch(() => null);
@@ -1023,7 +1326,7 @@ export class TeamHandler implements AgentHandler {
             return null;
         });
 
-        // Inline prepend on the next user turn — <last_session> in the system prompt is too weak.
+        // Inline prepend on next user turn — <last_session> in the system prompt is too weak.
         if (extraction?.summary) {
             this.pendingRecapPromises.set(
                 result.threadId,
@@ -1039,10 +1342,8 @@ export class TeamHandler implements AgentHandler {
     }
 
     /**
-     * Compact the peer's active session: summarise the checkpoint message
-     * history via LLM, then replace it with a single synthetic system
-     * message containing that summary. Frees context-window space without
-     * losing continuity. Used by the `/compact` slash command.
+     * Compact the peer's active session: summarise checkpoint message history
+     * then replace it with a single synthetic system message. Used by `/compact`.
      */
     async compactSession(
         rawKey: string,
@@ -1053,90 +1354,50 @@ export class TeamHandler implements AgentHandler {
 
         const threadId = `${peerKey}#${active.sessionId}`;
 
-        // Load the latest checkpoint for this thread.
         const checkpoint = await CheckpointManager.latest<Record<string, unknown>>(
             this.checkpointer,
             threadId,
         );
         if (!checkpoint) return undefined;
 
-        // Extract the messages array from the checkpoint state.
         const rawMessages = checkpoint.state['messages'];
         if (!Array.isArray(rawMessages) || rawMessages.length === 0) return undefined;
 
-        // Require at least 10 messages — below that, compaction is wasteful.
-        const MIN_MESSAGES_FOR_COMPACT = 10;
+        // Matches session-extractor.ts MIN_MESSAGES so /compact rarely refuses.
+        const MIN_MESSAGES_FOR_COMPACT = 4;
         if (rawMessages.length < MIN_MESSAGES_FOR_COMPACT) return undefined;
 
-        // Build transcript text from persisted messages. Cap each message
-        // body to 600 chars so very long assistant replies don't explode the
-        // summarisation prompt.
+        // Cap each body so very long assistant replies don't explode the summary call.
         const PER_MESSAGE_CHAR_LIMIT = 600;
-        const COMPACT_SYSTEM_PROMPT = [
-            'You are a conversation summarizer.',
-            'The following is a conversation between a user and an AI assistant.',
-            'Create a concise but complete summary that preserves:',
-            '- Key decisions and outcomes',
-            '- Important facts or data discussed',
-            '- Any tasks that were started or completed',
-            '- The current state/context the user would need to continue work',
-            '',
-            'Format: A single paragraph or short bullet list. Be concise.',
-        ].join('\n');
-
-        const transcript = rawMessages
-            .map((m: unknown) => {
+        const messagesForSummary: ChatMessage[] = rawMessages
+            .map((m: unknown): ChatMessage | null => {
                 if (!m || typeof m !== 'object') return null;
                 const msg = m as Record<string, unknown>;
-                const role = typeof msg['role'] === 'string' ? msg['role'] : 'unknown';
+                const role = msg['role'];
+                if (role !== 'user' && role !== 'assistant' && role !== 'system' && role !== 'tool') return null;
                 const rawContent = msg['content'];
-                let body: string;
-                if (typeof rawContent === 'string') {
-                    body = rawContent;
-                } else if (Array.isArray(rawContent)) {
+                let body = '';
+                if (typeof rawContent === 'string') body = rawContent;
+                else if (Array.isArray(rawContent)) {
                     body = rawContent
-                        .filter(
-                            (b): b is { type: string; text: string } =>
-                                b !== null &&
-                                typeof b === 'object' &&
-                                (b as Record<string, unknown>)['type'] === 'text' &&
-                                typeof (b as Record<string, unknown>)['text'] === 'string',
+                        .filter((b): b is { type: 'text'; text: string } =>
+                            !!b && typeof b === 'object' &&
+                            (b as Record<string, unknown>)['type'] === 'text' &&
+                            typeof (b as Record<string, unknown>)['text'] === 'string',
                         )
                         .map((b) => b.text)
                         .join('');
-                } else {
-                    return null;
                 }
-                const prefix = role === 'user' ? 'User' : role === 'assistant' ? 'Assistant' : 'System';
-                return `${prefix}: ${body.slice(0, PER_MESSAGE_CHAR_LIMIT)}`;
+                if (!body) return null;
+                return { role, content: body.slice(0, PER_MESSAGE_CHAR_LIMIT) };
             })
-            .filter((line): line is string => line !== null)
-            .join('\n');
+            .filter((m): m is ChatMessage => m !== null);
 
-        if (transcript.trim().length === 0) return undefined;
+        if (messagesForSummary.length === 0) return undefined;
 
         let summary: string;
         try {
-            const signal = AbortSignal.timeout(60_000);
-            const response = await this.config.model.invoke(
-                [
-                    { role: 'system', content: COMPACT_SYSTEM_PROMPT },
-                    { role: 'user', content: `CONVERSATION:\n${transcript}\n\nSummarize concisely.` },
-                ],
-                { signal },
-            );
-            const content = response.content;
-            if (typeof content === 'string') {
-                summary = content.trim();
-            } else if (Array.isArray(content)) {
-                summary = (content as ContentBlock[])
-                    .filter((b): b is TextBlock => b.type === 'text')
-                    .map((b) => b.text)
-                    .join('')
-                    .trim();
-            } else {
-                summary = '';
-            }
+            summary = await summarizeForCompaction(this.config.model, messagesForSummary);
         } catch (err) {
             log.warn({ err: redactSecrets(err), threadId }, '/compact: LLM summarisation failed');
             return undefined;
@@ -1144,7 +1405,6 @@ export class TeamHandler implements AgentHandler {
 
         if (!summary) return undefined;
 
-        // Replace checkpoint state with a single synthetic system message.
         const summaryMessage = {
             role: 'system',
             content: `[Session compacted — ${rawMessages.length} earlier messages summarised]\n\n${summary}`,
@@ -1166,7 +1426,7 @@ export class TeamHandler implements AgentHandler {
             },
         });
 
-        // Evict cached thread so the next invoke reloads from the new checkpoint.
+        // Evict so next invoke reloads from the new checkpoint.
         this.evictPeerThreads(peerKey);
 
         log.info(
@@ -1177,7 +1437,7 @@ export class TeamHandler implements AgentHandler {
         return { messageCount: rawMessages.length, summary };
     }
 
-    // Iterates every matching thread because post-/new the OLD thread is the one users want cleared.
+        // Iterates every matching thread because post-/new the OLD thread is the one users want cleared.
     cancelPlan(rawKey: string): boolean {
         let cleared = false;
         for (const [threadId, entry] of this.threads) {
@@ -1328,7 +1588,7 @@ export class TeamHandler implements AgentHandler {
 
             const newThreadId = `${peerKey}#${newRow.sessionId}`;
 
-            // The `messages` table is FTS-only; the agent's working memory lives in the checkpoint store.
+            // Working memory lives in the checkpoint store (messages table is FTS-only).
             try {
                 await CheckpointManager.fork(this.checkpointer, {
                     sourceThreadId: srcThreadId,
@@ -1405,7 +1665,7 @@ export class TeamHandler implements AgentHandler {
     ): Promise<ExtractionResult | null> {
         if (!this.sessionExtractor) return null;
 
-        const skillsPath = resolveWorkspacePath('skills');
+        const skillsPath = workspace.skills();
         const existingSkills = scanExistingSkills(skillsPath);
 
         const result = await this.sessionExtractor.extract(
@@ -1415,14 +1675,13 @@ export class TeamHandler implements AgentHandler {
         );
         if (!result) return null;
 
-        // Shared store instance for provenance tracking — file-backed, safe to
-        // instantiate ad-hoc since atomic writes prevent partial reads.
+        // File-backed; safe to instantiate ad-hoc since atomic writes prevent partial reads.
         const usageStore = new SkillUsageStore(skillsPath);
 
         try {
             this.store.setSessionSummary(closedSessionId, result.summary);
 
-            // Write under proposed/ so the agent does NOT auto-load unreviewed skills.
+            // Under proposed/ so the agent does NOT auto-load unreviewed skills.
             let proposedSkillName: string | null = null;
             if (result.skill_proposal) {
                 const proposed = result.skill_proposal;
@@ -1456,7 +1715,7 @@ export class TeamHandler implements AgentHandler {
                         );
                         if (ok) {
                             skillsImproved.push(entry.name);
-                            usageStore.bumpPatch(entry.name);
+                            usageStore.patch(entry.name);
                         }
                     } catch (err) {
                         log.warn(
@@ -1467,7 +1726,7 @@ export class TeamHandler implements AgentHandler {
                 }
             }
 
-            // Run curator after all writes so new skills aren't immediately stale-marked.
+            // After all writes so new skills aren't immediately stale-marked.
             try {
                 const curated = runSkillCurator(skillsPath, usageStore);
                 if (curated.markedStale.length > 0 || curated.markedArchived.length > 0) {
@@ -1497,7 +1756,7 @@ export class TeamHandler implements AgentHandler {
             );
         }
 
-        // 24h retention matches proactive reaper default; older child-worker checkpoints get pruned.
+        // 24h retention matches proactive reaper default.
         const sweepable = this.checkpointer as {
             pruneByThreadPrefix?: (prefix: string, olderThanMs: number) => Promise<number>;
         };
@@ -1527,7 +1786,10 @@ export class TeamHandler implements AgentHandler {
 
     private async getOrCreateThread(
         threadId: string,
-        opts: { isProactive?: boolean } = {},
+        opts: {
+            isProactive?: boolean;
+            deliveryMode?: 'always' | 'conditional' | 'silent';
+        } = {},
     ): Promise<ThreadEntry> {
         const existing = this.threads.get(threadId);
         if (existing) return existing;
@@ -1545,26 +1807,48 @@ export class TeamHandler implements AgentHandler {
         const mcpTools = dynamicMcpTools as unknown as BaseTool[];
         const mcpPreloadedTools = staticMcpTools as unknown as BaseTool[];
 
+        // `profile` uses userCharLimit; other namespaces share memoryCharLimit. 0 = free-grow.
+        const memoryCharLimits: Record<string, number> = (() => {
+            const memCfg = this.config.memory ?? {};
+            const memLim = memCfg.memoryCharLimit ?? 2200;
+            const usrLim = memCfg.userCharLimit ?? 1375;
+            return {
+                profile: usrLim,
+                memory: memLim,
+                facts: memLim,
+                directives: memLim,
+            };
+        })();
+
         const member = createTeamMember(this.entryDef, {
             model: this.config.model,
             userId: identity.userId,
             userName: identity.userName,
             store: this.store,
             memoryStore: this.memoryStore,
+            memoryCharLimits,
             extraInterceptors: [this.tokens],
             checkpointer: this.checkpointer,
             extraTools: mcpPreloadedTools.length > 0 ? mcpPreloadedTools : undefined,
             extraDynamicTools: mcpTools,
             teamRoster: this.buildTeamRoster(),
             personalities: this.personalities,
-            // Stall guard: triggers ProviderError(0) → model-fallback before the 10-min turn wall.
-            modelCallTimeoutMs: 45_000,
-            ...(opts.isProactive ? { isProactive: true } : {}),
+            // 180s tolerates Ollama cold-start (large models take 30-60s to load).
+            modelCallTimeoutMs: 180_000,
+            // outputSchema gated on deliveryMode: conditional only (always/silent emit prose).
+            ...(opts.isProactive
+                ? {
+                    isProactive: true,
+                    ...(opts.deliveryMode === 'conditional'
+                        ? { outputSchema: ProactiveDecisionSchema }
+                        : {}),
+                }
+                : {}),
             ...(this.config.observability ? { observability: this.config.observability } : {}),
         });
 
         const registry = new TaskRegistry();
-        const buildSubAgent = this.makeSubAgentFactory(identity, threadId);
+        const buildSubAgent = this.makeSubAgentFactory(identity, threadId, registry);
 
         const entry: ThreadEntry = {
             entry: member,
@@ -1592,12 +1876,12 @@ export class TeamHandler implements AgentHandler {
         return entry;
     }
 
-    private makeSubAgentFactory(identity: ThreadIdentity, threadId: string): SubAgentFactory {
+    private makeSubAgentFactory(identity: ThreadIdentity, threadId: string, registry: TaskRegistry): SubAgentFactory {
         return (workerName: string): SubAgentRunner | undefined => {
             const def = this.allowedWorkers.find((w) => w.name === workerName);
             if (!def) return undefined;
 
-            return async ({ task, signal }) => {
+            return async ({ task, signal, depth, spawnChain }) => {
                 const allMcpTools = await this.mcpReady;
                 const filteredWorkerMcp = filterToolsForAgent(
                     allMcpTools,
@@ -1612,7 +1896,7 @@ export class TeamHandler implements AgentHandler {
 
                 const workerModel = await resolveWorkerModel(def, this.config.model);
 
-                // Catches "disabled in flopsy.json5 but still delegated" before a long, doomed run.
+                // Catches "disabled in flopsy.json5 but still delegated" before a doomed run.
                 const rosterMcpNames = this.mcpServersForWorker(def);
                 if (rosterMcpNames.length > 0 && workerMcpTools.length === 0) {
                     log.warn(
@@ -1625,8 +1909,7 @@ export class TeamHandler implements AgentHandler {
                     );
                 }
 
-                // CheckpointStore is keyed by threadId; child threadId keeps main's slot pristine
-                // and the deterministic hash lets a restarted gateway resume mid-flight.
+                // Deterministic child threadId so a restarted gateway can resume mid-flight.
                 const childThreadId = `${threadId}:worker:${def.name}:${stableHash(task)}`;
 
                 const worker = createTeamMember(def, {
@@ -1634,18 +1917,33 @@ export class TeamHandler implements AgentHandler {
                     userId: identity.userId,
                     userName: identity.userName,
                     store: this.store,
-                    // Worker LLM calls bucket under the same (thread, day, model) key as the main agent.
+                    // Same (thread, day, model) bucket as the main agent.
                     extraInterceptors: [this.tokens],
                     extraTools: workerPreloadedMcp.length > 0 ? workerPreloadedMcp : undefined,
                     extraDynamicTools: workerMcpTools,
-                    modelCallTimeoutMs: 60_000,
+                    // Matches main agent's 180s (60s false-positives on Ollama cold-start).
+                    modelCallTimeoutMs: 180_000,
                     checkpointer: this.checkpointer,
                     ...(this.config.observability ? { observability: this.config.observability } : {}),
                 });
 
                 try {
+                    const startedAt = Date.now();
+                    const taskPreview = task.length > 120 ? task.slice(0, 117) + '…' : task;
+                    log.debug(
+                        { worker: workerName, depth, threadId: childThreadId, taskPreview },
+                        'sub-agent starting',
+                    );
+                    const parentBrief = await buildParentBrief(this.checkpointer, threadId, 5);
+                    const queued = registry.drainTeammateMessages(def.name);
+                    const initialMessages: ChatMessage[] = [];
+                    for (const msg of queued) {
+                        initialMessages.push({ role: 'system', content: msg });
+                    }
+                    initialMessages.push({ role: 'user', content: task });
+
                     const result = await worker.agent.invoke(
-                        { messages: [{ role: 'user', content: task }] },
+                        { messages: initialMessages },
                         {
                             signal,
                             threadId: childThreadId,
@@ -1653,7 +1951,11 @@ export class TeamHandler implements AgentHandler {
                                 userId: identity.userId,
                                 threadId: childThreadId,
                                 parentThreadId: threadId,
-                                depth: 1,
+                                depth: depth ?? 1,
+                                spawnChain: spawnChain ?? [],
+                                registry,
+                                agentName: def.name,
+                                ...(parentBrief ? { parentBrief } : {}),
                             },
                         },
                     );
@@ -1670,11 +1972,16 @@ export class TeamHandler implements AgentHandler {
                     const fullReply = typeof lastAssistant.content === 'string'
                         ? lastAssistant.content
                         : JSON.stringify(lastAssistant.content);
-                    return await this.foldWorkerReply(
+                    const reply = await this.foldWorkerReply(
                         fullReply,
                         workerName,
                         task,
                     );
+                    log.debug(
+                        { worker: workerName, depth, durationMs: Date.now() - startedAt, replyLength: reply.length },
+                        'sub-agent completed',
+                    );
+                    return reply;
                 } finally {
                     await worker.harnessInterceptor?.flush().catch((err: unknown) => {
                         log.warn(
@@ -1718,7 +2025,7 @@ export class TeamHandler implements AgentHandler {
 
         const fs = await import('node:fs');
         const path = await import('node:path');
-        const dir = resolveWorkspacePath('cache', 'worker-outputs');
+        const dir = resolveWorkspacePath('worker', 'worker-outputs');
         try {
             fs.mkdirSync(dir, { recursive: true });
         } catch (err) {
@@ -1754,13 +2061,14 @@ export class TeamHandler implements AgentHandler {
             );
         }
 
-        const relPath = path.relative(resolveWorkspacePath(''), fullPath) || fileName;
+        // Absolute path so read_file (resolves against process.cwd) finds it regardless of launch dir.
+        const absPath = fullPath;
 
         return [
             `[handoff: ${workerName} → orchestrator]`,
             `Reply size: ${fullReply.length.toLocaleString()} chars (${(fullReply.length / 1024).toFixed(1)} KB)`,
-            `Full reply saved to: ${relPath}`,
-            `Use read_file("${relPath}") to load the rest if you need more than the preview below.`,
+            `Full reply saved to: ${absPath}`,
+            `Use read_file("${absPath}") to load the rest if you need more than the preview below.`,
             '',
             '--- preview ---',
             fullReply.slice(0, WORKER_REPLY_PREVIEW_CHARS),
@@ -1855,7 +2163,7 @@ function isThreadForRawKey(threadId: string, rawKey: string): boolean {
     return threadId === rawKey || threadId.startsWith(rawKey + '#');
 }
 
-// FNV-1a 32-bit, base36 — non-cryptographic, deterministic across restarts.
+// FNV-1a 32-bit; deterministic across restarts.
 function stableHash(input: string): string {
     let h = 0x811c9dc5;
     for (let i = 0; i < input.length; i++) {
@@ -1863,6 +2171,52 @@ function stableHash(input: string): string {
         h = Math.imul(h, 0x01000193);
     }
     return (h >>> 0).toString(36);
+}
+
+async function buildParentBrief(
+    checkpointer: CheckpointStore,
+    threadId: string,
+    limit = 5,
+): Promise<string | undefined> {
+    try {
+        const raw = await checkpointer.getThreadMessages<
+            { role?: string; content?: unknown; toolCalls?: unknown[] }
+        >(threadId, { limit: limit * 2 }); // fetch extra to account for tool-result filtering
+        if (!raw || raw.length === 0) return undefined;
+
+        const turns = raw
+            .filter((m) => {
+                if (m.role !== 'user' && m.role !== 'assistant') return false;
+                if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) return false;
+                return true;
+            })
+            .slice(-limit);
+
+        if (turns.length === 0) return undefined;
+
+        const lines = turns.map((m) => {
+            const text = extractMessageText(m.content).slice(0, 300);
+            const label = m.role === 'user' ? 'User' : 'Gandalf';
+            return `  [${label}] ${text}`;
+        });
+
+        return `<parent_context>\nRecent conversation (last ${turns.length} turn${turns.length === 1 ? '' : 's'}):\n${lines.join('\n')}\n</parent_context>`;
+    } catch {
+        return undefined; // best-effort; never break delegation on brief failure
+    }
+}
+
+function extractMessageText(content: unknown): string {
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+        return content
+            .filter((b): b is { type: string; text: string } =>
+                b != null && typeof b === 'object' && 'type' in b && (b as Record<string, unknown>).type === 'text' && 'text' in b,
+            )
+            .map((b) => b.text)
+            .join('');
+    }
+    return '';
 }
 
 const WORKER_REPLY_OFFLOAD_THRESHOLD_CHARS = 1500;
@@ -1939,7 +2293,7 @@ function staticConfigFields(def: AgentDefinition): Partial<import('@flopsy/gatew
 }
 
 
-// Frontmatter `name` MUST match the directory name or the skills() interceptor silently drops it.
+// Frontmatter `name` MUST match the directory name or skills() silently drops it.
 function renderProposedSkillBody(p: SkillProposal): string {
     const cleanBody = p.body.replace(/^---[\s\S]*?\n---\n?/, '').trim();
     const today = new Date().toISOString().slice(0, 10);

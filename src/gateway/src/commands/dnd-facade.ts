@@ -1,4 +1,4 @@
-/** Late-bound bridge between /dnd + mgmt endpoints and PresenceManager. */
+/** Late-bound bridge between /dnd + management endpoints and PresenceManager. */
 
 export interface DndSnapshot {
     readonly active: boolean;

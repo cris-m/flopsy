@@ -1,9 +1,12 @@
 import Database from 'better-sqlite3';
 import { dirname } from 'node:path';
-import { mkdirSync } from 'node:fs';
+import { chmodSync, mkdirSync } from 'node:fs';
 import { createLogger } from '@flopsy/shared';
 
 const log = createLogger('proactive-dedup');
+
+/** Max reported-item rows per (type, source); cap protects disk + lookup time. */
+const MAX_REPORTED_PER_SOURCE = 5000;
 
 const SCHEMA_STATEMENTS = [
     `CREATE TABLE IF NOT EXISTS proactive_deliveries (
@@ -11,12 +14,17 @@ const SCHEMA_STATEMENTS = [
         source TEXT NOT NULL,
         content TEXT NOT NULL,
         embedding BLOB,
-        delivered_at INTEGER NOT NULL
+        delivered_at INTEGER NOT NULL,
+        suppressed INTEGER NOT NULL DEFAULT 0,
+        mode TEXT,
+        overlay TEXT,
+        reason TEXT
     )`,
     `CREATE INDEX IF NOT EXISTS idx_proactive_deliveries_delivered_at
         ON proactive_deliveries(delivered_at DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_proactive_deliveries_source
         ON proactive_deliveries(source)`,
+    // idx_proactive_deliveries_mode created post-migration; requires `mode` column.
     `CREATE TABLE IF NOT EXISTS proactive_reported (
         type TEXT NOT NULL,
         item_id TEXT NOT NULL,
@@ -26,7 +34,6 @@ const SCHEMA_STATEMENTS = [
     )`,
     `CREATE INDEX IF NOT EXISTS idx_proactive_reported_at
         ON proactive_reported(reported_at DESC)`,
-    // Schedules created at runtime, kept distinct from config-defined ones.
     `CREATE TABLE IF NOT EXISTS proactive_runtime_schedules (
         id TEXT PRIMARY KEY,
         kind TEXT NOT NULL,
@@ -57,10 +64,7 @@ export interface SimilarMatch {
     contentPreview: string;
 }
 
-/**
- * SQLite store for proactive delivery history + reported-item tracking.
- * Path: `<FLOPSY_HOME>/state/proactive.db`.
- */
+/** SQLite store for delivery history + reported-item tracking at <FLOPSY_HOME>/state/proactive.db. */
 export class ProactiveDedupStore {
     private readonly db: Database.Database;
     private readonly stmtInsertDelivery: Database.Statement;
@@ -70,6 +74,7 @@ export class ProactiveDedupStore {
     private readonly stmtCheckReported: Database.Statement;
     private readonly stmtListReported: Database.Statement;
     private readonly stmtPruneReported: Database.Statement;
+    private readonly stmtCapReportedPerSource: Database.Statement;
     private readonly stmtInsertSchedule: Database.Statement;
     private readonly stmtListSchedules: Database.Statement;
     private readonly stmtGetSchedule: Database.Statement;
@@ -81,22 +86,69 @@ export class ProactiveDedupStore {
     constructor(dbPath: string) {
         mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 });
         this.db = new Database(dbPath);
+        // Force 0600 — better-sqlite3's umask default is world-readable.
+        try {
+            chmodSync(dbPath, 0o600);
+        } catch {
+            // Permission denied → rely on the dir's 0700 perms.
+        }
         this.db.pragma('journal_mode = WAL');
         this.db.pragma('synchronous = NORMAL');
         this.db.pragma('busy_timeout = 5000');
+        // Cap WAL at 64 MB; paired with default wal_autocheckpoint = 1000.
+        this.db.pragma('journal_size_limit = 67108864');
+        this.db.pragma('wal_autocheckpoint = 1000');
         for (const stmt of SCHEMA_STATEMENTS) {
             this.db.prepare(stmt).run();
         }
 
+        // Column migrations: ALTER ADD COLUMN is no-op on existing column (errors caught).
+        const ensureColumn = (name: string, ddl: string): void => {
+            try {
+                this.db.prepare(`ALTER TABLE proactive_deliveries ADD COLUMN ${ddl}`).run();
+                log.info({ column: name }, 'migrated proactive_deliveries: added column');
+            } catch (err) {
+                // "duplicate column name" is expected on already-migrated DBs.
+                const msg = err instanceof Error ? err.message : String(err);
+                if (!/duplicate column name/i.test(msg)) {
+                    log.warn({ column: name, err: msg }, 'column migration failed');
+                }
+            }
+        };
+        ensureColumn('suppressed', 'suppressed INTEGER NOT NULL DEFAULT 0');
+        ensureColumn('mode', 'mode TEXT');
+        ensureColumn('overlay', 'overlay TEXT');
+        ensureColumn('reason', 'reason TEXT');
+
+        // Index over (source, mode, delivered_at) — needs `mode` column.
+        try {
+            this.db
+                .prepare(
+                    `CREATE INDEX IF NOT EXISTS idx_proactive_deliveries_mode
+                     ON proactive_deliveries(source, mode, delivered_at DESC)`,
+                )
+                .run();
+        } catch (err) {
+            log.warn(
+                { err: err instanceof Error ? err.message : String(err) },
+                'idx_proactive_deliveries_mode creation failed (non-fatal)',
+            );
+        }
+
         this.stmtInsertDelivery = this.db.prepare(
-            `INSERT INTO proactive_deliveries (source, content, embedding, delivered_at)
-             VALUES (?, ?, ?, ?)`,
+            `INSERT INTO proactive_deliveries
+                (source, content, embedding, delivered_at, suppressed, mode, overlay, reason)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         );
+        // Similarity dedup checks DELIVERED only; LIMIT 500 caps the in-memory cosine scan.
         this.stmtSelectRecent = this.db.prepare(
             `SELECT source, content, embedding, delivered_at
              FROM proactive_deliveries
-             WHERE delivered_at >= ? AND embedding IS NOT NULL
-             ORDER BY delivered_at DESC`,
+             WHERE delivered_at >= ?
+               AND embedding IS NOT NULL
+               AND suppressed = 0
+             ORDER BY delivered_at DESC
+             LIMIT 500`,
         );
         this.stmtPruneDeliveries = this.db.prepare(
             `DELETE FROM proactive_deliveries WHERE delivered_at < ?`,
@@ -114,6 +166,21 @@ export class ProactiveDedupStore {
         );
         this.stmtPruneReported = this.db.prepare(
             `DELETE FROM proactive_reported WHERE reported_at < ?`,
+        );
+        // Per-source cap during prune: window-fn keeps N most-recent per (type, source).
+        this.stmtCapReportedPerSource = this.db.prepare(
+            `DELETE FROM proactive_reported
+             WHERE rowid IN (
+                 SELECT rowid FROM (
+                     SELECT rowid,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY type, source
+                                ORDER BY reported_at DESC
+                            ) AS rn
+                     FROM proactive_reported
+                 )
+                 WHERE rn > ?
+             )`,
         );
 
         this.stmtInsertSchedule = this.db.prepare(
@@ -229,38 +296,106 @@ export class ProactiveDedupStore {
         return this.stmtDeleteSchedule.run(id).changes > 0;
     }
 
-    recordDelivery(source: string, content: string, embedding?: number[]): void {
+    /** Record a delivered/suppressed turn; suppressed entries feed the anti-rep block. */
+    recordDelivery(
+        source: string,
+        content: string,
+        embedding?: number[],
+        meta: {
+            suppressed?: boolean;
+            mode?: string | null;
+            overlay?: string | null;
+            reason?: string | null;
+        } = {},
+    ): void {
         const blob = embedding ? floatsToBuffer(embedding) : null;
-        this.stmtInsertDelivery.run(source, content.slice(0, 4000), blob, Date.now());
+        this.stmtInsertDelivery.run(
+            source,
+            content.slice(0, 4000),
+            blob,
+            Date.now(),
+            meta.suppressed ? 1 : 0,
+            meta.mode ?? null,
+            meta.overlay ?? null,
+            meta.reason ? meta.reason.slice(0, 500) : null,
+        );
     }
 
-    /** Newest-first. */
-    listDeliveriesBySource(source: string, limit = 20): Array<{
+    /** Suppress-path: writes to proactive_deliveries with suppressed=1, no embedding. */
+    recordSuppression(
+        source: string,
+        content: string,
+        meta: { mode?: string | null; overlay?: string | null; reason?: string | null } = {},
+    ): void {
+        this.recordDelivery(source, content, undefined, { ...meta, suppressed: true });
+    }
+
+    /** Newest-first. Includes both delivered + suppressed by default. */
+    listDeliveriesBySource(
+        source: string,
+        limit = 20,
+        opts: { includeSuppressed?: boolean } = {},
+    ): Array<{
         deliveredAt: number;
         content: string;
+        suppressed: boolean;
+        mode: string | null;
+        reason: string | null;
     }> {
+        const where = opts.includeSuppressed === false
+            ? `source = ? AND suppressed = 0`
+            : `source = ?`;
         const stmt = this.db.prepare(
-            `SELECT delivered_at, content FROM proactive_deliveries
-             WHERE source = ? ORDER BY delivered_at DESC LIMIT ?`,
+            `SELECT delivered_at, content, suppressed, mode, reason
+             FROM proactive_deliveries
+             WHERE ${where} ORDER BY delivered_at DESC LIMIT ?`,
         );
         const rows = stmt.all(source, Math.max(1, Math.min(500, limit))) as Array<{
             delivered_at: number;
             content: string;
+            suppressed: number;
+            mode: string | null;
+            reason: string | null;
         }>;
-        return rows.map((r) => ({ deliveredAt: r.delivered_at, content: r.content }));
+        return rows.map((r) => ({
+            deliveredAt: r.delivered_at,
+            content: r.content,
+            suppressed: r.suppressed === 1,
+            mode: r.mode,
+            reason: r.reason,
+        }));
     }
 
-    countDeliveriesSince(sinceMs: number): { total: number; bySource: Record<string, number> } {
+    /** Last delivered timestamp per mode for one source (smart-pulse cooldown). */
+    getLastFiredByMode(source: string): Record<string, number> {
+        const stmt = this.db.prepare(
+            `SELECT mode, MAX(delivered_at) AS last_at
+             FROM proactive_deliveries
+             WHERE source = ? AND suppressed = 0 AND mode IS NOT NULL
+             GROUP BY mode`,
+        );
+        const rows = stmt.all(source) as Array<{ mode: string; last_at: number }>;
+        const out: Record<string, number> = {};
+        for (const r of rows) out[r.mode] = r.last_at;
+        return out;
+    }
+
+    /** Delivery counts by source for operator-facing audit (not for prompts). */
+    countDeliveriesSince(
+        sinceMs: number,
+        opts: { excludeSources?: ReadonlySet<string> } = {},
+    ): { total: number; bySource: Record<string, number> } {
         const stmt = this.db.prepare(
             `SELECT source, COUNT(*) as n FROM proactive_deliveries
-             WHERE delivered_at >= ? GROUP BY source`,
+             WHERE delivered_at >= ? AND suppressed = 0 GROUP BY source`,
         );
         const rows = stmt.all(sinceMs) as Array<{ source: string; n: number }>;
+        const exclude = opts.excludeSources;
         const bySource: Record<string, number> = {};
         let total = 0;
         for (const r of rows) {
             bySource[r.source] = r.n;
-            total += r.n;
+            if (!exclude?.has(r.source)) total += r.n;
         }
         return { total, bySource };
     }
@@ -326,7 +461,18 @@ export class ProactiveDedupStore {
         reportedMaxAgeMs: number,
     ): { deliveries: number; reported: number } {
         const deliveries = this.stmtPruneDeliveries.run(Date.now() - deliveryMaxAgeMs).changes;
-        const reported = this.stmtPruneReported.run(Date.now() - reportedMaxAgeMs).changes;
+        const reportedByAge = this.stmtPruneReported.run(Date.now() - reportedMaxAgeMs).changes;
+        // Per-source cap runs after time-based prune (cheaper, index-backed).
+        const reportedByCap = this.stmtCapReportedPerSource.run(MAX_REPORTED_PER_SOURCE).changes;
+        const reported = reportedByAge + reportedByCap;
+        // Force TRUNCATE checkpoint so WAL shrinks alongside the row delete.
+        if (deliveries > 0 || reported > 0) {
+            try {
+                this.db.pragma('wal_checkpoint(TRUNCATE)');
+            } catch {
+                /* best-effort — autocheckpoint will eventually catch up */
+            }
+        }
         if (deliveries > 0 || reported > 0) {
             log.debug({ deliveries, reported }, 'pruned old proactive records');
         }
@@ -337,7 +483,8 @@ export class ProactiveDedupStore {
         if (this.closed) return;
         this.closed = true;
         try {
-            this.db.pragma('wal_checkpoint(PASSIVE)');
+            // TRUNCATE removes .wal from disk (PASSIVE only flushes pages).
+            this.db.pragma('wal_checkpoint(TRUNCATE)');
         } catch {
             /* best-effort */
         }

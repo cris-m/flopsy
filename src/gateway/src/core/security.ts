@@ -230,6 +230,31 @@ export class RateLimiter {
     }
 }
 
+/**
+ * Strip secrets and absolute filesystem paths from an error message
+ * before surfacing it back to the user (channel reply, slash-command
+ * failure, etc.). Mirrors the `channel-worker.ts:sanitizeErrorHint`
+ * implementation; centralised here so the slash-command dispatcher
+ * can use the same redactor.
+ *
+ * Returns `null` for empty/too-short input so callers can pick a
+ * generic fallback string ("Command failed. Try /doctor.") instead of
+ * leaking nothing-useful.
+ */
+export function sanitizeErrorHint(msg: string): string | null {
+    if (!msg) return null;
+    let s = msg
+        .replace(/\bBearer\s+[A-Za-z0-9._\-]+/gi, 'Bearer [REDACTED]')
+        .replace(/\bsk-[A-Za-z0-9_\-]{16,}/g, '[REDACTED]')
+        .replace(/\bya29\.[A-Za-z0-9_\-]+/g, '[REDACTED]')
+        .replace(/(\/[A-Za-z0-9._\-]+)+\/([A-Za-z0-9._\-]+)/g, '…/$2')
+        .split('\n')[0]!
+        .trim();
+    if (s.length > 140) s = s.slice(0, 137) + '…';
+    if (s.length < 4) return null;
+    return s;
+}
+
 export function sanitize(input: string, maxLength: number): string {
     return input.replace(/\0/g, '').trim().slice(0, maxLength);
 }
@@ -251,7 +276,7 @@ export function resolveSafePath(basePath: string, userPath: string): string {
 
 export function verifyWebhookSignature(
     secret: string,
-    body: string,
+    body: string | Buffer,
     signature: string,
     config: WebhookSignatureConfig = { algorithm: 'sha256', format: 'hex' },
 ): boolean {
@@ -262,6 +287,13 @@ export function verifyWebhookSignature(
         provided = provided.slice(config.prefix.length);
     }
 
+    // Discord, Stripe, Slack, GitHub all compute HMAC over RAW BYTES
+    // before the gateway re-decodes them as UTF-8. Pass `body` directly
+    // when it's already a Buffer; only fall back to string→bytes
+    // conversion for callers that haven't migrated yet. Without this,
+    // any provider signing in non-UTF-8 (or whose payload contains
+    // multi-byte sequences split across chunk boundaries that get
+    // canonicalized differently on re-decode) silently 401s.
     const expected = createHmac(config.algorithm, secret).update(body).digest(config.format);
 
     try {

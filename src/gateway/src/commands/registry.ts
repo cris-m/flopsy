@@ -14,6 +14,8 @@ import { personalityCommand } from './handlers/personality';
 import { planCommand } from './handlers/plan';
 import { mcpCommand } from './handlers/mcp';
 import { skillsCommand } from './handlers/skills';
+import { cronCommand } from './handlers/cron';
+import { heartbeatCommand } from './handlers/heartbeat';
 import { buildSkillCommands } from './skill-commands';
 
 const BUILTIN_COMMANDS: readonly CommandDef[] = [
@@ -31,6 +33,8 @@ const BUILTIN_COMMANDS: readonly CommandDef[] = [
     insightsCommand,
     auditCommand,
     skillsCommand,
+    cronCommand,
+    heartbeatCommand,
     helpCommand,
 ];
 

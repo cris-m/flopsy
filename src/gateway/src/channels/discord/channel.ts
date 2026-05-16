@@ -11,12 +11,24 @@ import type {
     ButtonStyle as OurButtonStyle,
 } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
+import { resolveMediaSource } from '@gateway/core/media-resolver';
 import { isSafeMediaUrl } from '@gateway/core/security';
 import type { DiscordChannelConfig } from './types';
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 
 async function downloadAsBase64(url: string): Promise<{ data: string; mimeType: string } | null> {
+    // SSRF gate. Discord attachment URLs are usually CDN paths
+    // (cdn.discordapp.com), but the URL comes from user-controlled
+    // content if a future Discord feature ever lets users specify
+    // attachment paths (already exists for proxies/embeds). Without
+    // this check, an attacker can post a "Discord attachment" pointing
+    // at http://169.254.169.254/ (AWS instance metadata),
+    // http://localhost:<internal-port>/, or file:// URLs and have the
+    // gateway fetch the secret + base64-relay it.
+    if (!isSafeMediaUrl(url)) {
+        return null;
+    }
     try {
         const res = await fetch(url);
         if (!res.ok) return null;
@@ -83,7 +95,16 @@ function buildDiscordComponents(
 
 const INTERACTION_TTL_MS = 14 * 60_000;
 const INTERACTION_SWEEP_MS = 60_000;
+/** Global ceiling on outstanding Discord interactions across all users.
+ *  Prevents memory from growing unbounded if interactions never get
+ *  resolved (bot crashed mid-task, etc.). */
 const MAX_PENDING_INTERACTIONS = 500;
+/** Per-user ceiling. Without this, a single user firing slash commands
+ *  in a loop could fill the entire global queue and lock out every
+ *  other user with "Too many pending requests." 10 is generous — a
+ *  user with 10 simultaneously-pending slash commands is already in
+ *  an unusual state. */
+const MAX_PENDING_PER_USER = 10;
 const MAX_DISCORD_LENGTH = 2000;
 
 export class DiscordChannel extends BaseChannel {
@@ -313,7 +334,23 @@ export class DiscordChannel extends BaseChannel {
 
                 if (this.pendingInteractions.size >= MAX_PENDING_INTERACTIONS) {
                     await interaction.reply({
-                        content: 'Too many pending requests. Try again later.',
+                        content: 'Server is busy. Try again later.',
+                        ephemeral: true,
+                    });
+                    return;
+                }
+                // Per-user quota: count entries owned by this senderId
+                // so one chatty user can't lock out the rest of the
+                // guild. O(n) scan is fine — n is bounded by the
+                // global cap above.
+                let userPending = 0;
+                for (const e of this.pendingInteractions.values()) {
+                    const i = e.interaction as { user?: { id?: string } };
+                    if (i?.user?.id === senderId) userPending++;
+                }
+                if (userPending >= MAX_PENDING_PER_USER) {
+                    await interaction.reply({
+                        content: `You already have ${userPending} pending requests. Wait for them to finish before sending another.`,
                         ephemeral: true,
                     });
                     return;
@@ -351,7 +388,7 @@ export class DiscordChannel extends BaseChannel {
     async send(message: OutboundMessage): Promise<string> {
         if (!this.client) throw new Error('Discord not connected');
 
-        const files = this.buildFileAttachments(message);
+        const files = await this.buildFileAttachments(message);
         // discord.js accepts raw JSON components via the `components` field
         // when its types are loose; we build our own and cast to satisfy TS.
         const components = message.interactive
@@ -518,11 +555,35 @@ export class DiscordChannel extends BaseChannel {
         });
     }
 
-    private buildFileAttachments(message: OutboundMessage): { attachment: string; name: string }[] {
+    private async buildFileAttachments(message: OutboundMessage): Promise<{ attachment: string | Buffer; name: string }[]> {
         if (!message.media?.length) return [];
-        return message.media
-            .filter((m) => isSafeMediaUrl(m.url))
-            .map((m) => ({ attachment: m.url ?? m.data ?? '', name: m.fileName ?? 'file' }));
+        const out: { attachment: string | Buffer; name: string }[] = [];
+        for (const media of message.media) {
+            const resolved = await resolveMediaSource(media);
+            if (!resolved.ok) {
+                this.log.warn(
+                    { mediaType: media.type, mediaUrl: media.url, reason: resolved.reason, detail: resolved.detail, op: 'send:media:rejected' },
+                    'discord send: media resolution failed — skipping attachment',
+                );
+                continue;
+            }
+            // discord.js's AttachmentBuilder accepts a URL string, a local
+            // filesystem path string, or a Buffer. We map each resolved
+            // kind to the appropriate input.
+            const name = media.fileName ?? defaultDiscordAttachmentName(resolved.source, media.type);
+            switch (resolved.source.kind) {
+                case 'remote-url':
+                    out.push({ attachment: resolved.source.url.toString(), name });
+                    break;
+                case 'local-path':
+                    out.push({ attachment: resolved.source.absPath, name });
+                    break;
+                case 'buffer':
+                    out.push({ attachment: resolved.source.data, name });
+                    break;
+            }
+        }
+        return out;
     }
 
     private isGuildAllowed(guildId: string | null, channelId: string): boolean {
@@ -563,4 +624,28 @@ export class DiscordChannel extends BaseChannel {
         }, INTERACTION_SWEEP_MS);
         this.sweepTimer.unref();
     }
+}
+
+/**
+ * Pick a friendly filename for Discord attachments when the agent didn't
+ * supply one. Discord uses the name in the UI ("Open jane.png"), so a
+ * generic "file" or random hash is hostile UX.
+ */
+function defaultDiscordAttachmentName(
+    source: import('@gateway/core/media-resolver').MediaSource,
+    type: 'image' | 'video' | 'audio' | 'document' | 'sticker',
+): string {
+    if (source.kind === 'remote-url') {
+        const last = source.url.pathname.split('/').filter(Boolean).pop();
+        if (last) return last;
+    }
+    if (source.kind === 'local-path') {
+        const last = source.absPath.split('/').filter(Boolean).pop();
+        if (last) return last;
+    }
+    const ext = type === 'image' ? '.png'
+        : type === 'video' ? '.mp4'
+        : type === 'audio' ? '.mp3'
+        : '.bin';
+    return `attachment${ext}`;
 }

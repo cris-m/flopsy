@@ -3,7 +3,7 @@ export type InvokeRole = 'user' | 'system';
 export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
 
 /**
- * Background-task lifecycle event:
+ * Background-task lifecycle event.
  *   task_start    — typing + ⏳ reaction begin
  *   task_progress — refreshes typing only
  *   task_complete — ⏳ → ✅ + agent wake-up turn
@@ -22,12 +22,7 @@ export interface ChannelEvent {
      *   silent      — no agent turn (side-effect only)
      */
     readonly deliveryMode?: 'always' | 'conditional' | 'silent';
-    /**
-     * Set for internal worker tasks (spawn_background_task). When present,
-     * the completion is delivered as a <task-notification> XML block so the
-     * coordinator agent can match it to the spawn call. Absent for external
-     * webhook events, which use <untrusted-data> wrapping instead.
-     */
+    /** Set for spawn_background_task; routes completion via <task-notification>. */
     readonly workerName?: string;
 }
 
@@ -87,6 +82,8 @@ export interface ReplyOptions {
         readonly fileName?: string;
         readonly caption?: string;
     }>;
+    /** Opt-in quote-reply to the user's latest message; default false. */
+    readonly quoteUserMessage?: boolean;
 }
 
 /** Channels without native polls render a numbered text fallback. */
@@ -144,6 +141,9 @@ export interface AgentCallbacks {
     /** Lines rendered verbatim in the system prompt's `<runtime>` block. */
     readonly runtimeHints?: readonly string[];
 
+    /** Proactive only: gates outputSchema enforcement (conditional → structured). */
+    readonly deliveryMode?: 'always' | 'conditional' | 'silent';
+
     /** Wired only when the channel supports edit-based streaming. */
     readonly onChunk?: (chunk: AgentChunk) => void;
 }
@@ -159,6 +159,8 @@ export interface AgentResult {
     readonly reply: string | null;
     readonly didSendViaTool: boolean;
     readonly tokenUsage?: { readonly input: number; readonly output: number; readonly reasoning?: number; readonly cached?: number };
+    /** Schema-validated structured output from the React planner's __respond__ tool. */
+    readonly structured?: unknown;
 }
 
 export interface InboundMedia {
@@ -177,13 +179,27 @@ export interface AgentHandler {
         role?: InvokeRole,
         media?: ReadonlyArray<InboundMedia>,
     ): Promise<AgentResult>;
-    /**
-     * Optional status snapshot for this thread — what workers are running,
-     * what's recently completed. Consumed by the gateway's slash-command
-     * layer (e.g. /status). Returns undefined when the thread hasn't been
-     * instantiated yet.
-     */
+    /** Stateless fresh-agent invocation for proactive fires; falls back to invoke(). */
+    invokeStateless?(
+        text: string,
+        threadId: string,
+        options?: {
+            readonly deliveryMode?: 'always' | 'conditional' | 'silent';
+            readonly signal?: AbortSignal;
+            readonly personality?: string;
+            readonly runtimeHints?: ReadonlyArray<string>;
+        },
+    ): Promise<AgentResult>;
+    /** Status snapshot for /status; returns undefined for un-instantiated threads. */
     queryStatus?(threadId: string): ThreadStatusSnapshot | undefined;
+    /** Compactor state for the thread (used to populate ctx % in chat status bar). */
+    getCompactorStatus?(threadId: string): {
+        tokens: number;
+        threshold: number;
+        percentUsed: number;
+        tokensRemaining: number;
+        willCompactNext: boolean;
+    } | undefined;
     /** Cross-thread task list for `flopsy tasks`. */
     queryAllTasks?(filter?: TaskListFilter): AggregateTaskSummary[];
     /** Maps a proactive fire to the peer's active session threadId. */
@@ -193,27 +209,17 @@ export interface AgentHandler {
         source: 'heartbeat' | 'cron',
     ): string | undefined;
 
-    /**
-     * Force-close the current session and open a fresh one. Awaits a single
-     * LLM extraction to compress + persist profile/notes/directives.
-     */
+    /** Force-rotate the session and persist profile/notes/directives. */
     forceNewSession?(
         rawKey: string,
     ): Promise<{ sessionId: string; summary: string | null } | undefined>;
 
-    /**
-     * Summarise message history into a synthetic system message that
-     * replaces the checkpoint state. Frees context without losing continuity.
-     */
+    /** Summarise history into a synthetic system message replacing the checkpoint. */
     compactSession?(rawKey: string): Promise<
         { messageCount: number; summary: string } | undefined
     >;
 
-    /**
-     * Drop any active plan (drafting or approved). Implementations must
-     * clear all matching cached threads for this peer (multiple sessions
-     * may co-exist after a /new rotation).
-     */
+    /** Drop any active plan across all cached threads for this peer. */
     cancelPlan?(rawKey: string): boolean;
 
     /** Read-only `/plan` diagnostic. Returns null when no plan exists. */

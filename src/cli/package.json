@@ -18,12 +18,14 @@
     "cli-boxes": "^3.0.0",
     "commander": "^12.1.0",
     "dotenv": "^16.4.5",
+    "js-yaml": "^4.1.0",
     "json5": "^2.2.3",
     "log-symbols": "^7.0.1",
     "strip-ansi": "^7.2.0",
     "supports-hyperlinks": "^3.2.0"
   },
   "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
     "@types/node": "^25.5.0",
     "typescript": "^5.9.3",
     "vitest": "^3.2.4"

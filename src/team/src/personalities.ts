@@ -15,7 +15,7 @@
 import { readFileSync, existsSync } from 'fs';
 import * as yaml from 'js-yaml';
 import { z } from 'zod';
-import { createLogger, resolveWorkspacePath } from '@flopsy/shared';
+import { createLogger, workspace } from '@flopsy/shared';
 
 const log = createLogger('personalities');
 
@@ -102,6 +102,7 @@ export interface PersonalityResolutionInput {
  * if a typoed `overrideName` is passed in.
  */
 export function resolvePersonality(input: PersonalityResolutionInput): Personality | null {
+    if (input.role === 'worker') return null;
     if (!input.registry || input.registry.size === 0) return null;
 
     if (input.overrideName) {
@@ -129,7 +130,10 @@ export function resolvePersonality(input: PersonalityResolutionInput): Personali
  * boot if missing.
  */
 function resolveYamlPath(): string {
-    return resolveWorkspacePath('personalities.yaml');
+    // personalities.yaml lives under <HOME>/config/, same as SOUL.md and
+    // AGENTS.md. The legacy <HOME>/personalities.yaml path silently failed
+    // existsSync — no personality overlays loaded, ever.
+    return workspace.config('personalities.yaml');
 }
 
 /**

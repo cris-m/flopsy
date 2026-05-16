@@ -1,4 +1,5 @@
 import { createLogger, deletePromptFile, resolveWorkspacePath, type PromptKind } from '@flopsy/shared';
+import { getSharedLearningStore } from '@flopsy/team';
 import { Cron } from 'croner';
 import { StateStore } from './state/store';
 import { PresenceManager } from './state/presence';
@@ -59,26 +60,19 @@ export interface ProactiveEngineConfig {
     dedupDbPath: string;
     /** Base directory for resolving relative promptFile paths. Defaults to cwd. */
     promptBaseDir?: string;
-    /**
-     * Route proactive messages to the user's last-active channel+peer when
-     * no explicit `delivery` is configured. Falls back to the static target.
-     */
+    /** Route to user's last-active channel/peer when no `delivery` is configured. */
     followActiveChannel?: boolean;
     getActivePeer?: () => { channelName: string; peer: DeliveryTarget['peer'] } | null;
     /** When present, cosine-similarity dedup is active. */
     embedder?: ProactiveEmbedder;
-    /** Raw chat model for structured-output reformatting in conditional mode. */
-    structuredOutputModel?: unknown;
-    /** nomic-embed-text on similar-topic summaries hits ~0.88–0.95. Default 0.88. */
+    /** Default 0.88 (nomic-embed-text on similar-topic summaries hits ~0.88–0.95). */
     similarityThreshold?: number;
     /** Default 48h. */
     similarityWindowMs?: number;
     healthMonitor?: Partial<ChannelHealthConfig>;
-    /**
-     * Resolves the threadId for a proactive fire targeting a known peer.
-     * Supplied by the gateway from `agentHandler.resolveProactiveThreadId`
-     * so heartbeat/cron fires reuse the peer's active session.
-     */
+    /** Default IANA timezone used when heartbeat's activeHours.timezone is unset. */
+    defaultTimezone?: string;
+    /** Resolves threadId so heartbeat/cron fires reuse the peer's active session. */
     threadIdResolver?: (
         channelName: string,
         peer: { id: string; type: 'user' | 'group' | 'channel' },
@@ -88,8 +82,7 @@ export interface ProactiveEngineConfig {
 
 const RETRY_LOOP_INTERVAL_MS = 60_000;
 const PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000;
-// Self-heal cadence — force-fires cron jobs whose lastRunAt is more than
-// 1.5× their period behind. 5min balances OOM recovery against CPU cost.
+// Self-heal cadence — 5min balances OOM recovery against CPU cost.
 const CRON_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 const DELIVERY_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 const REPORTED_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
@@ -102,7 +95,6 @@ export class ProactiveEngine {
     private promptLoader: PromptLoader;
     private promptBaseDir: string;
     private embedder?: ProactiveEmbedder;
-    private structuredOutputModel?: unknown;
     private similarityThreshold: number;
     private similarityWindowMs: number;
     private followActiveChannel: boolean;
@@ -124,12 +116,11 @@ export class ProactiveEngine {
     constructor(config: ProactiveEngineConfig) {
         this.store = new StateStore(config.statePath);
         this.dedupStore = new ProactiveDedupStore(config.dedupDbPath);
-        this.presence = new PresenceManager(this.store);
+        this.presence = new PresenceManager(this.store, config.defaultTimezone);
         this.retryQueue = new RetryQueue(config.retryQueuePath);
         this.promptBaseDir = config.promptBaseDir ?? resolveWorkspacePath();
         this.promptLoader = new PromptLoader(this.promptBaseDir);
         if (config.embedder) this.embedder = config.embedder;
-        if (config.structuredOutputModel) this.structuredOutputModel = config.structuredOutputModel;
         this.similarityThreshold = config.similarityThreshold ?? 0.88;
         this.similarityWindowMs = config.similarityWindowMs ?? 48 * 60 * 60 * 1000;
         this.followActiveChannel = config.followActiveChannel ?? false;
@@ -148,7 +139,12 @@ export class ProactiveEngine {
         if (this.running) return;
         this.running = true;
 
-        this.router = new ChannelRouter(channelChecker, channelSender);
+        // defaultDelivery resolves lazily — set by startHeartbeats/startCronJobs after start().
+        this.router = new ChannelRouter(
+            channelChecker,
+            channelSender,
+            () => this.defaultDelivery,
+        );
 
         await this.retryQueue.load();
 
@@ -162,9 +158,6 @@ export class ProactiveEngine {
             this.retryQueue,
             {
                 ...(this.embedder ? { embedder: this.embedder } : {}),
-                ...(this.structuredOutputModel
-                    ? { structuredOutputModel: this.structuredOutputModel }
-                    : {}),
                 similarityThreshold: this.similarityThreshold,
                 similarityWindowMs: this.similarityWindowMs,
             },
@@ -175,15 +168,12 @@ export class ProactiveEngine {
         this.startPruneLoop();
         this.startCronSweepLoop();
 
-        // Sweep ephemeral `proactive:<jobId>:<timestamp>` checkpoint rows.
-        // driveOwnTimer:false shares the cron-sweep tick — one timer covers
-        // both maintenance jobs.
+        // Reaper shares the cron-sweep tick (driveOwnTimer:false).
         this.reaper = new ProactiveReaper();
         this.reaper.start({ driveOwnTimer: false });
         log.info(
             {
                 embedderEnabled: !!this.embedder,
-                structuredOutputEnabled: !!this.structuredOutputModel,
                 similarityThreshold: this.similarityThreshold,
                 similarityWindowMs: this.similarityWindowMs,
             },
@@ -191,24 +181,39 @@ export class ProactiveEngine {
         );
     }
 
+    /** Mark a channel as alive for the health monitor's staleness check. */
+    recordChannelEvent(channelName: string): void {
+        this.healthMonitor.recordEvent(channelName);
+    }
+
     private startPruneLoop(): void {
-        const prune = () =>
+        const prune = () => {
             this.dedupStore.prune(DELIVERY_RETENTION_MS, REPORTED_RETENTION_MS);
+            // Learning-store rows (token_usage, tool_failures, decisions) grow unbounded.
+            try {
+                const stats = getSharedLearningStore().pruneOldRows();
+                if (stats.tokenUsage + stats.toolFailures + stats.proactiveDecisions > 0) {
+                    log.info(stats, 'learning-store prune complete');
+                }
+            } catch (err) {
+                log.warn(
+                    { err: err instanceof Error ? err.message : String(err) },
+                    'learning-store prune failed (non-fatal)',
+                );
+            }
+        };
         prune();
         this.pruneTimer = setInterval(prune, PRUNE_INTERVAL_MS);
         this.pruneTimer.unref();
     }
 
-    /**
-     * Force-fire cron jobs whose lastRunAt is overdue (daemon outage,
-     * post-fire registration, or upstream silent-swallow bugs).
-     */
+    /** Force-fire overdue cron jobs (daemon outage, post-fire registration, etc.). */
     private startCronSweepLoop(): void {
         this.cronSweeper = new CronHealthSweeper(
             () => this.cron,
             this.store,
         );
-        // Single tick drives both cron self-healing and reaper sweeps.
+        // One tick drives both cron self-healing and reaper sweeps.
         const tick = (): void => {
             void this.cronSweeper!.sweep().catch((err) => {
                 log.error({ err, op: 'cron-sweep' }, 'cron sweep failed');
@@ -219,7 +224,7 @@ export class ProactiveEngine {
                 });
             }
         };
-        // First sweep deferred by one interval to dodge startup races.
+        // First sweep deferred one interval to dodge startup races.
         this.cronSweepTimer = setInterval(tick, CRON_SWEEP_INTERVAL_MS);
         this.cronSweepTimer.unref();
     }
@@ -230,8 +235,7 @@ export class ProactiveEngine {
     }
 
     private startRetryLoop(): void {
-        // setTimeout + reschedule-after-completion (NOT setInterval) so a
-        // slow tick can't overlap and double-fire retries.
+        // setTimeout + reschedule prevents slow ticks from overlapping and double-firing.
         const tick = async (): Promise<void> => {
             if (!this.running) return;
             try {
@@ -277,7 +281,7 @@ export class ProactiveEngine {
             log.error('Cannot start heartbeats: engine not started');
             return;
         }
-        this.defaultDelivery = defaultDelivery;
+        this.setDefaultDelivery(defaultDelivery);
         this.heartbeat = new HeartbeatTrigger(
             this.executor,
             this.presence,
@@ -302,14 +306,13 @@ export class ProactiveEngine {
             log.error('Cannot start cron: engine not started');
             return;
         }
-        this.defaultDelivery = defaultDelivery;
+        this.setDefaultDelivery(defaultDelivery);
         this.cron = new CronTrigger(this.executor, this.store, this.promptLoader);
         this.cron.resolveDelivery = (o) => this.resolveDelivery(o);
         if (this.threadIdResolver) {
             this.cron.threadIdResolver = this.threadIdResolver;
         }
-        // Drop DB rows when one-shots complete so `flopsy cron list` doesn't
-        // accumulate phantom entries.
+        // Drop DB rows when one-shots complete so `flopsy cron list` stays clean.
         this.cron.deleteRuntimeRow = (id) => this.dedupStore.deleteRuntimeSchedule(id);
 
         this.seedSchedulesFromConfigIfNeeded({ jobs });
@@ -320,11 +323,7 @@ export class ProactiveEngine {
         this.flushPendingRegistrations('cron');
     }
 
-    /**
-     * First-boot import of config-defined schedules into proactive.db.
-     * `configSeededAt` marker prevents re-runs; flopsy.json5 schedule
-     * sections become advisory after seeding (DB is authoritative).
-     */
+    /** First-boot import of config-defined schedules into proactive.db (run once). */
     private seedSchedulesFromConfigIfNeeded(input: {
         heartbeats?: HeartbeatDefinition[];
         jobs?: JobDefinition[];
@@ -356,8 +355,7 @@ export class ProactiveEngine {
                 imported++;
             }
         }
-        // Cron is always invoked after heartbeats — write marker once both
-        // halves have had a chance to import.
+        // Cron runs after heartbeats; write marker once both halves are imported.
         if (input.jobs) {
             this.store.markConfigSeeded();
             if (imported > 0) {
@@ -412,8 +410,7 @@ export class ProactiveEngine {
         hb: HeartbeatDefinition,
         createdBy: { threadId?: string; agentName?: string } = {},
     ): boolean {
-        // Persist first so the schedule survives boot races; the pending
-        // queue handles registrations that arrive before the trigger.
+        // Persist first; pending queue handles registrations that arrive before the trigger.
         const id = hb.id ?? `runtime-hb-${hb.name}`;
         const withId: HeartbeatDefinition = { ...hb, id };
         this.dedupStore.insertRuntimeSchedule({
@@ -456,28 +453,14 @@ export class ProactiveEngine {
         }
     }
 
-    /**
-     * Inject the WebhookRouter so `addRuntimeWebhook` / `removeRuntimeWebhook`
-     * can register and tear down HTTP routes live. Called by the gateway
-     * once both the engine and the router are constructed; the router
-     * reference is held for the lifetime of the engine.
-     */
+    /** Inject the WebhookRouter so runtime webhook adds can live-register HTTP routes. */
     setWebhookRouter(router: { addRuntimeRoute(cfg: never): boolean; removeRuntimeRoute(path: string): boolean }): void {
-        // Cast through unknown to bypass the never check — we call
-        // addRuntimeRoute with a concrete config object whose shape matches
-        // ExternalWebhookConfig; the engine doesn't carry that type to
-        // avoid importing from @gateway/core (cycle).
+        // Cast through unknown: engine doesn't import ExternalWebhookConfig (cycle).
         this.webhookRouter = router as unknown as typeof this.webhookRouter;
 
-        // Replay any webhook adds that arrived before the router was wired.
         this.flushPendingRegistrations('webhook');
 
-        // Restore persisted webhook routes from proactive.db. Without this,
-        // every daemon restart silently loses every runtime webhook route
-        // even though they're still in the DB and visible in `flopsy
-        // webhook list`. Mirrors loadRuntimeHeartbeats/CronJobs which run
-        // during their respective startup paths; webhook has no separate
-        // start step, so we hook on the router-wire-up instead.
+        // Restore persisted routes — webhook has no separate start path.
         const liveRouter = this.webhookRouter;
         if (liveRouter) {
             const restored = this.loadRuntimeWebhooks();
@@ -510,8 +493,7 @@ export class ProactiveEngine {
             if (!row.enabled) continue;
             try {
                 const cfg = JSON.parse(row.configJson) as Record<string, unknown>;
-                // Legacy rows stored only `secret` — retro-fill the
-                // signature config so ownsSignature works on restore.
+                // Legacy rows: retro-fill signature config so ownsSignature works.
                 if (typeof cfg['secret'] === 'string' && cfg['secret'] && !cfg['signature']) {
                     cfg['signature'] = {
                         header: 'x-hub-signature-256',
@@ -532,11 +514,7 @@ export class ProactiveEngine {
     }
     private webhookRouter: { addRuntimeRoute(cfg: unknown): boolean; removeRuntimeRoute(path: string): boolean } | null = null;
 
-    /**
-     * Queue of runtime adds that arrived before their subsystem was up.
-     * Every addRuntime* persists to DB unconditionally; this queue handles
-     * the in-memory live-register replay once the subsystem starts.
-     */
+    /** Queue of runtime adds awaiting subsystem startup for live-register replay. */
     private pendingRegistrations: Array<
         | { kind: 'heartbeat'; def: HeartbeatDefinition }
         | { kind: 'cron'; job: JobDefinition }
@@ -571,7 +549,6 @@ export class ProactiveEngine {
         cfg: { name: string; path: string; targetChannel: string; secret?: string; eventTypeHeader?: string; filterActions?: string[]; targetThread?: string; deliveryMode?: 'always' | 'conditional' | 'silent' },
         createdBy: { threadId?: string; agentName?: string } = {},
     ): boolean {
-        // Persist first; pending queue replays after setWebhookRouter wires.
         this.dedupStore.insertRuntimeSchedule({
             id: cfg.name,
             kind: 'webhook',
@@ -628,7 +605,7 @@ export class ProactiveEngine {
         if (!row) return false;
         this.dedupStore.deleteRuntimeSchedule(id);
 
-        // Drop stats + oneshot-circuit-breaker so a re-created id can fire.
+        // Drop stats + oneshot circuit-breaker so a re-created id can fire.
         this.store.deleteJobState(id);
         this.store.clearOneshotCompleted(id);
 
@@ -693,14 +670,144 @@ export class ProactiveEngine {
         return true;
     }
 
+    /** REPLACE semantics: caller computes new array; hot re-registers the trigger. */
+    setRuntimeScheduleSkills(id: string, skills: readonly string[]): boolean {
+        const row = this.dedupStore.getRuntimeSchedule(id);
+        if (!row) return false;
+        // Reject webhooks: would be mis-treated as cron in the else-branch below.
+        if (row.kind !== 'heartbeat' && row.kind !== 'cron') {
+            log.warn({ id, kind: row.kind }, 'setRuntimeScheduleSkills: unsupported kind, refusing');
+            return false;
+        }
+        let config: Record<string, unknown>;
+        try {
+            config = JSON.parse(row.configJson) as Record<string, unknown>;
+        } catch (err) {
+            log.warn(
+                { id, err: err instanceof Error ? err.message : String(err) },
+                'setRuntimeScheduleSkills: configJson parse failed',
+            );
+            return false;
+        }
+        if (row.kind === 'heartbeat') {
+            config['skills'] = [...skills];
+        } else {
+            const payload = (config['payload'] as Record<string, unknown> | undefined) ?? {};
+            payload['skills'] = [...skills];
+            config['payload'] = payload;
+        }
+        this.dedupStore.updateRuntimeScheduleConfig(id, config);
+
+        // Hot re-register; chain removeJob → addJob so concurrent fires can't see partial state.
+        try {
+            if (row.kind === 'heartbeat') {
+                const hb = config as unknown as HeartbeatDefinition;
+                this.heartbeat?.removeHeartbeat(hb.name);
+                if (row.enabled && this.heartbeat && this.defaultDelivery) {
+                    this.heartbeat.addHeartbeat(hb, this.defaultDelivery);
+                }
+            } else if (this.cron) {
+                const job = config as unknown as JobDefinition;
+                void this.cron.removeJob(id).then(() => {
+                    if (row.enabled) return this.cron?.addJob(job);
+                    return undefined;
+                }).catch((err: unknown) => {
+                    log.warn(
+                        { id, err: err instanceof Error ? err.message : String(err) },
+                        'setRuntimeScheduleSkills: cron re-register chain failed',
+                    );
+                });
+            }
+        } catch (err) {
+            log.warn(
+                { id, err: err instanceof Error ? err.message : String(err) },
+                'Hot-(re)register on setRuntimeScheduleSkills failed — will take effect on next restart',
+            );
+        }
+        return true;
+    }
+
     listSchedules(): ReturnType<ProactiveDedupStore['listRuntimeSchedules']> {
         return this.dedupStore.listRuntimeSchedules();
     }
 
     /**
-     * Replace a schedule's config in place, preserving `enabled`, `created_at`,
-     * and run stats. Kind cannot change (heartbeat ↔ cron requires delete+create).
+     * Defensive resync between SQLite runtime schedules and in-memory triggers.
+     * Picks up rows inserted outside the engine's addRuntime* paths.
+     * Heartbeats matched by name; cron by id; webhooks excluded.
      */
+    async reloadSchedules(): Promise<{
+        heartbeatsAdded: number;
+        heartbeatsRemoved: number;
+        cronAdded: number;
+        cronRemoved: number;
+    }> {
+        let heartbeatsAdded = 0;
+        let heartbeatsRemoved = 0;
+        let cronAdded = 0;
+        let cronRemoved = 0;
+
+        if (this.heartbeat && this.defaultDelivery) {
+            const dbHeartbeats = this.loadRuntimeHeartbeats();
+            const liveNames = new Set(this.heartbeat.listNames());
+            const dbNames = new Set<string>();
+            for (const hb of dbHeartbeats) {
+                dbNames.add(hb.name);
+                if (!liveNames.has(hb.name)) {
+                    if (this.heartbeat.addHeartbeat(hb, this.defaultDelivery)) {
+                        heartbeatsAdded++;
+                    }
+                }
+            }
+            for (const name of liveNames) {
+                if (!dbNames.has(name)) {
+                    this.heartbeat.removeHeartbeat(name);
+                    heartbeatsRemoved++;
+                }
+            }
+        }
+
+        if (this.cron) {
+            const dbJobs = this.loadRuntimeCronJobs();
+            const liveIds = new Set(this.cron.listJobs().map((j) => j.id));
+            const dbIds = new Set<string>();
+            for (const job of dbJobs) {
+                dbIds.add(job.id);
+                if (!liveIds.has(job.id)) {
+                    try {
+                        await this.cron.addJob(job);
+                        cronAdded++;
+                    } catch (err) {
+                        log.warn(
+                            { jobId: job.id, err: err instanceof Error ? err.message : String(err) },
+                            'reloadSchedules: cron addJob failed',
+                        );
+                    }
+                }
+            }
+            for (const id of liveIds) {
+                if (!dbIds.has(id)) {
+                    try {
+                        await this.cron.removeJob(id);
+                        cronRemoved++;
+                    } catch (err) {
+                        log.warn(
+                            { jobId: id, err: err instanceof Error ? err.message : String(err) },
+                            'reloadSchedules: cron removeJob failed',
+                        );
+                    }
+                }
+            }
+        }
+
+        log.info(
+            { heartbeatsAdded, heartbeatsRemoved, cronAdded, cronRemoved },
+            'reloadSchedules: resynced runtime triggers from proactive.db',
+        );
+        return { heartbeatsAdded, heartbeatsRemoved, cronAdded, cronRemoved };
+    }
+
+    /** Replace a schedule's config in place; kind changes require delete+create. */
     replaceRuntimeSchedule(
         id: string,
         newConfig: HeartbeatDefinition | JobDefinition,
@@ -734,9 +841,7 @@ export class ProactiveEngine {
                     });
                 }
             } else {
-                // Webhook update not supported — path/secret changes need
-                // route reregistration that's better expressed as
-                // delete+create.
+                // Webhook updates require delete+create.
                 return false;
             }
         } catch (err) {
@@ -748,14 +853,7 @@ export class ProactiveEngine {
         return true;
     }
 
-    /**
-     * Aggregate stats + per-schedule JobState snapshots for observability.
-     * Powers `flopsy status`, `flopsy heartbeat|cron stats`, and the
-     * `/status` chat renderer's "24h" funnel line.
-     *
-     * `windowMs` defaults to 24 hours — callers pass 1h/7d for narrower /
-     * wider windows.
-     */
+    /** Aggregate stats + per-schedule snapshots for observability. */
     async getProactiveStats(windowMs = 24 * 60 * 60 * 1000): Promise<ProactiveStatsSnapshot> {
         const sinceMs = Date.now() - windowMs;
         const deliveryCounts = this.dedupStore.countDeliveriesSince(sinceMs);
@@ -763,8 +861,7 @@ export class ProactiveEngine {
 
         for (const row of this.dedupStore.listRuntimeSchedules()) {
             const cfg = safeParseConfig(row.configJson) as { name?: string };
-            // Webhooks don't keep a JobState (push-driven, no fire count), so
-            // we report zeros for them but still surface their enabled flag.
+            // Webhooks have no JobState — getJobState returns zeros.
             const js = await this.store.getJobState(row.id);
             perSchedule.push({
                 id: row.id,
@@ -799,15 +896,7 @@ export class ProactiveEngine {
         return this.dedupStore.listDeliveriesBySource(id, limit);
     }
 
-    /**
-     * Fire heartbeats/cron jobs whose lastRunAt indicates a missed scheduled
-     * fire during downtime. Capped + staggered to avoid post-outage flood.
-     *
-     * Overdue thresholds: heartbeat/every uses 1.5× interval to skip just-
-     * restarted-and-missed-by-seconds. Cron expressions use croner's
-     * `previousRun(now)`. `at` schedules are reported but delegated to the
-     * trigger's own at-on-register logic.
-     */
+    /** Fire missed schedules whose lastRunAt is overdue; capped + staggered. */
     async catchupMissedFires(
         opts: { maxPerRestart?: number; staggerMs?: number } = {},
     ): Promise<{ fired: number; deferred: number; totalOverdue: number }> {
@@ -852,8 +941,10 @@ export class ProactiveEngine {
             for (const job of this.loadRuntimeCronJobs()) {
                 if (job.enabled === false) continue;
                 if (job.payload.oneshot && this.store.isOneshotCompleted(job.id)) continue;
+                // Skip 'at' jobs — handled by the trigger's register-time scheduleNext.
+                if (job.schedule.kind === 'at') continue;
                 const jobState = await this.store.getJobState(job.id);
-                if (!jobState.lastRunAt && job.schedule.kind !== 'at') continue;
+                if (!jobState.lastRunAt) continue;
 
                 const overdueByMs = detectCronOverdue(job.schedule, jobState.lastRunAt, now);
                 if (overdueByMs !== null && overdueByMs > 0) {
@@ -903,6 +994,26 @@ export class ProactiveEngine {
         return { fired, deferred, totalOverdue };
     }
 
+    /** Single setter for defaultDelivery; warns on divergence between writers. */
+    private setDefaultDelivery(next: DeliveryTarget): void {
+        const cur = this.defaultDelivery;
+        if (
+            cur &&
+            (cur.channelName !== next.channelName || cur.peer.id !== next.peer.id)
+        ) {
+            log.warn(
+                {
+                    prevChannel: cur.channelName,
+                    prevPeer: cur.peer.id,
+                    nextChannel: next.channelName,
+                    nextPeer: next.peer.id,
+                },
+                'engine.defaultDelivery overwrite — heartbeats and cron may now disagree about fallback target',
+            );
+        }
+        this.defaultDelivery = next;
+    }
+
     /** Called at fire time so followActiveChannel picks up the live channel. */
     resolveDelivery(override?: DeliveryTarget): DeliveryTarget | null {
         if (override) return override;
@@ -945,6 +1056,10 @@ export class ProactiveEngine {
             await this.cron.stop();
             this.cron = null;
         }
+        // Drain in-flight fires before closing dedupStore (bounded at 10s).
+        if (this.executor) {
+            await this.executor.waitForInFlight(10_000);
+        }
         this.store.stop();
         this.dedupStore.close();
         this.executor = null;
@@ -953,11 +1068,64 @@ export class ProactiveEngine {
         log.info('Proactive engine stopped');
     }
 
-    async triggerHeartbeat(name: string, context?: Record<string, unknown>): Promise<boolean> {
+    /** Fire-and-forget: returns whether the trigger was accepted, not whether delivery succeeded. */
+    triggerHeartbeat(name: string, context?: Record<string, unknown>): boolean {
         return this.heartbeat?.triggerNow(name, context) ?? false;
     }
 
-    async triggerCronJob(id: string): Promise<boolean> {
+    /** Force-trigger every enabled schedule of a kind; caps + staggers to avoid LLM stampede. */
+    triggerAllSchedules(kind: 'cron' | 'heartbeat'): string[] {
+        const MAX_TICK_DISPATCH = 20;
+        const TICK_STAGGER_MS = 1000;
+        const dispatched: string[] = [];
+        const all = this.dedupStore.listRuntimeSchedules();
+        const candidates: Array<{ id: string; name?: string }> = [];
+        for (const r of all) {
+            if (r.kind !== kind) continue;
+            if (!r.enabled) continue;
+            if (candidates.length >= MAX_TICK_DISPATCH) {
+                log.warn(
+                    { kind, cap: MAX_TICK_DISPATCH, total: all.filter((x) => x.kind === kind && x.enabled).length },
+                    'triggerAllSchedules: capped — extra schedules left to natural ticks',
+                );
+                break;
+            }
+            if (kind === 'heartbeat') {
+                let name: string | undefined;
+                try {
+                    name = (JSON.parse(r.configJson) as { name?: string }).name;
+                } catch {
+                    continue;
+                }
+                if (name) candidates.push({ id: r.id, name });
+            } else {
+                candidates.push({ id: r.id });
+            }
+        }
+
+        // First fires inline so a single-schedule tick feels responsive; rest staggered.
+        candidates.forEach((c, idx) => {
+            const dispatch = () => {
+                if (kind === 'heartbeat' && c.name) {
+                    if (this.triggerHeartbeat(c.name)) dispatched.push(c.id);
+                } else if (kind === 'cron') {
+                    if (this.triggerCronJob(c.id)) dispatched.push(c.id);
+                }
+            };
+            if (idx === 0) {
+                dispatch();
+            } else {
+                const t = setTimeout(dispatch, idx * TICK_STAGGER_MS);
+                t.unref();
+            }
+        });
+
+        return dispatched;
+    }
+
+    /** Fire-and-forget: returns whether the trigger was accepted, not whether delivery succeeded. */
+
+    triggerCronJob(id: string): boolean {
         return this.cron?.triggerNow(id) ?? false;
     }
 
@@ -1043,11 +1211,7 @@ export class ProactiveEngine {
     }
 }
 
-/**
- * Returns positive ms overdue, 0 if not overdue, or null when the schedule
- * shape has no "missed" notion (e.g. future `at`). No 1.5× guard for cron
- * expressions — they fire at specific instants, not every-N intervals.
- */
+/** Positive ms overdue, 0 if not overdue, or null when schedule has no missed notion. */
 function detectCronOverdue(
     schedule:
         | { kind: 'at'; atMs: number }
@@ -1056,10 +1220,8 @@ function detectCronOverdue(
     lastRunAt: number | undefined,
     nowMs: number,
 ): number | null {
-    if (schedule.kind === 'at') {
-        // `at` fires once at register-time from persistence; no catchup here.
-        return null;
-    }
+    // `at` fires once at register-time; no catchup notion.
+    if (schedule.kind === 'at') return null;
 
     if (schedule.kind === 'every') {
         if (!lastRunAt) return null;

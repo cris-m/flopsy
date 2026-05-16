@@ -16,6 +16,10 @@ const SECRETLIKE_KEYS = /(api_?key|secret|token|password|bearer)/i;
 export const auditCommand: CommandDef = {
     name: 'audit',
     description: 'Static security scan of the local setup (no LLM).',
+    // Admin: the report enumerates which secrets are present in config,
+    // workspace permissions, gateway binding — actionable recon for an
+    // attacker who got slash-command access without the host machine.
+    scope: 'admin',
     handler: async () => {
         const findings: Finding[] = [];
         findings.push(...checkEnvFile());
@@ -113,7 +117,11 @@ function checkConfigForPlaintext(): Finding[] {
         if (!SECRETLIKE_KEYS.test(key)) continue;
         if (value.startsWith('${') || value.length < 8) continue;
         if (/^(changeme|xxx+|your[-_]?(key|token|secret))/i.test(value)) continue;
-        hits.push(`${key} = "${value.slice(0, 12)}…"`);
+        // Never show the secret value (not even a prefix) — the audit
+        // reply is sent over the channel and also logged with a
+        // `replyPreview` field. Even 12 chars of `sk-ant-api03-…` is
+        // enough to identify the key family + the specific account.
+        hits.push(`${key} (≈${value.length} chars)`);
     }
     if (hits.length > 0) {
         return [{

@@ -21,22 +21,27 @@ import { stripToolCallNoise } from './tool-call-sanitizer';
 export interface MessageRouterConfig {
     readonly agentHandler: AgentHandler;
     readonly coalesceDelayMs?: number;
-    /**
-     * How to scope group/channel threads. 'per-chat' (default) means every
-     * participant in a shared space writes into one conversation;
-     * 'per-participant' gives each member their own isolated session.
-     */
+    /** 'per-chat' (default): shared thread per space; 'per-participant': per member. */
     readonly groupScope?: GroupScope;
     readonly gatewaySnapshotFn?: () => Omit<GatewayStatusSnapshot, 'activeThreads'>;
     readonly structuredOutputModel?: unknown;
+    /** Optional per-channel lifecycle-reaction policy; undefined preserves legacy behaviour. */
+    readonly getReactionPolicy?: (channelName: string) => {
+        readonly direct: boolean;
+        readonly group: 'always' | 'mentions' | 'never';
+    } | undefined;
+    /** Optional ack emoji lookup; worker reuses it as running indicator to avoid stacking. */
+    readonly getAckEmoji?: (channelName: string) => string | undefined;
 }
 
 /**
- * Dispatches each inbound message to the worker for its routing key. One
- * worker per distinct conversation, lazily created on first message.
- * Workers are keyed by routing key (not channel name), so two users DMing
- * the same platform get separate workers with separate checkpointed state.
+ * Routes inbound messages to per-(channel, peer) workers, lazily created.
+ * Idle workers are evicted hourly so the daemon doesn't accumulate state
+ * across the full uptime; agent thread state lives in flopsygraph anyway.
  */
+const IDLE_TTL_MS = 6 * 60 * 60 * 1000;
+const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+
 export class MessageRouter {
     private readonly log = createLogger('router');
     private readonly workers = new Map<string, ChannelWorker>();
@@ -45,14 +50,49 @@ export class MessageRouter {
     private readonly coalesceDelayMs: number | undefined;
     private readonly groupScope: GroupScope;
     private readonly gatewaySnapshotFn: MessageRouterConfig['gatewaySnapshotFn'];
+    private readonly getReactionPolicy: MessageRouterConfig['getReactionPolicy'];
+    private readonly getAckEmoji: MessageRouterConfig['getAckEmoji'];
     private structuredOutputModel: unknown;
+    private sweepTimer: ReturnType<typeof setInterval> | null = null;
 
     constructor(config: MessageRouterConfig) {
         this.agentHandler = config.agentHandler;
         this.coalesceDelayMs = config.coalesceDelayMs;
         this.groupScope = config.groupScope ?? 'per-chat';
         this.gatewaySnapshotFn = config.gatewaySnapshotFn;
+        this.getReactionPolicy = config.getReactionPolicy;
+        this.getAckEmoji = config.getAckEmoji;
         this.structuredOutputModel = config.structuredOutputModel;
+
+        // .unref() so a quiet test process exits cleanly.
+        this.sweepTimer = setInterval(() => this.sweepIdleWorkers(), SWEEP_INTERVAL_MS);
+        this.sweepTimer.unref();
+    }
+
+    /** Evict workers idle ≥IDLE_TTL_MS with no in-flight state; public for tests + manual GC. */
+    sweepIdleWorkers(): number {
+        const cutoff = Date.now() - IDLE_TTL_MS;
+        const victims: string[] = [];
+        for (const [key, worker] of this.workers) {
+            if (worker.lastActiveAt < cutoff && worker.isIdle) {
+                victims.push(key);
+            }
+        }
+        if (victims.length === 0) return 0;
+        for (const key of victims) {
+            const worker = this.workers.get(key);
+            if (!worker) continue;
+            // Fire-and-forget stop — worker is idle, no drain needed.
+            void worker.stop().catch((err: unknown) => {
+                this.log.warn({ key, err }, 'idle-worker stop failed (non-fatal)');
+            });
+            this.workers.delete(key);
+        }
+        this.log.info(
+            { evicted: victims.length, remaining: this.workers.size },
+            'sweepIdleWorkers: evicted idle workers',
+        );
+        return victims.length;
     }
 
     /** Propagates to existing workers so live threads update without a restart. */
@@ -80,13 +120,7 @@ export class MessageRouter {
         worker.dispatch(message);
     }
 
-    /**
-     * Three resolution layers:
-     *   1. Exact routing-key match.
-     *   2. Channel-name fallback — most-recently-active worker, used by
-     *      inbound webhooks lacking a peer identifier.
-     *   3. undefined — caller logs and drops.
-     */
+    /** Exact routing-key match, then channel-name fallback to most-recent worker. */
     getWorker(keyOrChannel: string): ChannelWorker | undefined {
         const exact = this.workers.get(keyOrChannel);
         if (exact) return exact;
@@ -114,6 +148,10 @@ export class MessageRouter {
 
     async stopAll(): Promise<void> {
         this.log.info({ workers: this.workers.size }, 'stopping all workers');
+        if (this.sweepTimer) {
+            clearInterval(this.sweepTimer);
+            this.sweepTimer = null;
+        }
         const stops = [...this.workers.values()].map((w) => w.stop());
         await Promise.allSettled(stops);
         this.workers.clear();
@@ -126,12 +164,7 @@ export class MessageRouter {
         this.log.debug({ channel: channel.name }, 'channel registered (workers lazy-created)');
     }
 
-    /**
-     * Auto-create a worker for an exact routing key. Used by the inbound-
-     * webhook delivery path with `targetThread` so cold-start delivery
-     * doesn't depend on a prior user message. Returns undefined when the
-     * key's channel isn't registered.
-     */
+    /** Lazy-create a worker for an exact routing key (used by webhook cold-start). */
     getOrCreateWorkerForKey(routingKey: string): ChannelWorker | undefined {
         const existing = this.workers.get(routingKey);
         if (existing) return existing;
@@ -211,14 +244,12 @@ export class MessageRouter {
                           }
                         : undefined;
                 const media = options?.media ? [...options.media] : undefined;
-                // Models occasionally emit raw tool-call format as prose
-                // (tool not in active toolset, or "show your work" prompts).
+                // Strip raw tool-call format that models occasionally emit as prose.
                 const cleaned = stripToolCallNoise(text);
                 try {
                     await channel.send({ peer, body: cleaned, replyTo, interactive, media });
                 } catch (err) {
-                    // Surface at the router so a dropped delivery is visible
-                    // even when the agent reports didSendViaTool=true.
+                    // Surface here so dropped deliveries are visible even with didSendViaTool=true.
                     this.log.error(
                         {
                             channel: channel.name,
@@ -233,8 +264,7 @@ export class MessageRouter {
                 }
             },
             onSendPoll: async (peer, question, options, pollOptions): Promise<void> => {
-                // Fall back to a numbered-list rendering for channels lacking
-                // native polls (iMessage, WhatsApp, Signal).
+                // Fallback: numbered-list rendering for channels lacking native polls.
                 if (typeof channel.sendPoll === 'function') {
                     await channel.sendPoll({
                         peer,
@@ -266,6 +296,18 @@ export class MessageRouter {
                 }
                 : undefined,
             ...(this.structuredOutputModel ? { structuredOutputModel: this.structuredOutputModel } : {}),
+            ...(this.getReactionPolicy
+                ? (() => {
+                    const p = this.getReactionPolicy!(channel.name);
+                    return p ? { reactionPolicy: p } : {};
+                })()
+                : {}),
+            ...(this.getAckEmoji
+                ? (() => {
+                    const e = this.getAckEmoji!(channel.name);
+                    return e ? { ackEmoji: e } : {};
+                })()
+                : {}),
         };
 
         const worker = new ChannelWorker(config);

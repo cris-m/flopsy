@@ -2,7 +2,7 @@
  * `flopsy cron` — full CRUD over runtime cron jobs in proactive.db.
  *
  * Same data model as heartbeats: stored in `~/.flopsy/state/proactive.db`,
- * writes go through the gateway's mgmt HTTP endpoint. Three flavours of
+ * writes go through the gateway's management HTTP endpoint. Three flavours of
  * schedule: `--at <epoch-ms>` (fires once), `--every <ms>` (fixed interval),
  * or `--cron "<expr>" --tz <IANA>` (5-field cron expression).
  */
@@ -12,14 +12,29 @@ import { resolve as resolvePath } from 'node:path';
 import { Command } from 'commander';
 import { truncate } from '@flopsy/shared';
 import { bad, detail, dim } from '../ui/pretty';
+import { mergeSkills, readPromptFrontmatter } from './prompt-frontmatter';
 import {
-    mgmtCreate,
-    mgmtDisable,
-    mgmtEnable,
-    mgmtRemove,
+    managementCreate,
+    managementDisable,
+    managementEnable,
+    managementRemove,
+    managementTick,
+    managementTrigger,
 } from './schedule-client';
+import { editSkills, skillAdd, skillClear, skillList, skillRemove } from './skill-edit-ops';
+
+// Commander's `--option <val>` repeatable pattern: every occurrence calls the
+// collector with (newValue, accumulator). The default empty array seeds the
+// accumulator so a single occurrence still works.
+function collectSkill(value: string, previous: string[]): string[] {
+    const trimmed = value.trim();
+    if (!trimmed) return previous;
+    return previous.includes(trimmed) ? previous : [...previous, trimmed];
+}
 import {
+    loadLastFireDetail,
     renderFires,
+    renderLastFireDetail,
     renderScheduleList,
     renderScheduleShow,
     renderStats,
@@ -50,10 +65,33 @@ export function registerCronCommands(root: Command): void {
         .option('--delivery-mode <mode>', 'always | conditional | silent', 'always')
         .option('--oneshot', 'Fire once then auto-disable', false)
         .option('--thread-id <id>', 'Reuse a thread for agent memory across fires')
+        .option(
+            '--no-agent',
+            'Skip the LLM entirely — run --script and deliver its stdout. Use --script with this.',
+            false,
+        )
+        .option(
+            '--script <path>',
+            'Path under <FLOPSY_HOME>/scripts/. For --no-agent fires the stdout becomes the delivered message.',
+        )
+        .option(
+            '--pre-check-script <path>',
+            'Path under <FLOPSY_HOME>/scripts/. Runs before the agent; can output {"wakeAgent": false} to suppress the fire.',
+        )
+        .option(
+            '--skill <name>',
+            'Bind a skill to this cron — its SKILL.md is injected on every fire. Repeatable.',
+            collectSkill,
+            [],
+        )
         .action(async (opts) => {
             const schedule = buildCronSchedule(opts);
             if (typeof schedule === 'string') {
                 console.log(bad(schedule));
+                process.exit(1);
+            }
+            if (opts.noAgent && !opts.script) {
+                console.log(bad('--no-agent requires --script <path>'));
                 process.exit(1);
             }
             // Resolve --prompt-file to absolute against the user's CWD before
@@ -63,17 +101,25 @@ export function registerCronCommands(root: Command): void {
             // We also fail-fast here with a friendly message if the file is
             // missing — better UX than the daemon's bare copyfile ENOENT.
             let absPromptFile: string | undefined;
+            let frontmatterSkills: string[] | undefined;
             if (opts.promptFile) {
                 absPromptFile = resolvePath(opts.promptFile);
                 if (!existsSync(absPromptFile)) {
                     console.log(bad(`prompt-file not found: ${absPromptFile}`));
                     process.exit(1);
                 }
+                // Read `skills:` from the file's YAML header so the user can
+                // declare intrinsic skills in the prompt itself (matching the
+                // pattern used by .flopsy/content/prompts/*/*.md frontmatter).
+                // Any --skill flags are merged on top — file-declared skills
+                // run first, CLI flags add to the union.
+                frontmatterSkills = readPromptFrontmatter(absPromptFile).skills;
             }
+            const skills = mergeSkills(frontmatterSkills, opts.skill);
             const scheduleId: string =
                 opts.id ??
                 `runtime-cron-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-            await mgmtCreate({
+            await managementCreate({
                 kind: 'cron',
                 id: scheduleId,
                 name: opts.name,
@@ -83,24 +129,28 @@ export function registerCronCommands(root: Command): void {
                 deliveryMode: opts.deliveryMode,
                 oneshot: opts.oneshot,
                 threadId: opts.threadId,
+                noAgent: !!opts.noAgent,
+                script: opts.script,
+                preCheckScript: opts.preCheckScript,
+                ...(skills.length > 0 ? { skills } : {}),
             });
         });
 
     cron.command('disable')
         .description('Disable a cron job by id')
         .argument('<id>', 'Cron job id')
-        .action((id: string) => void mgmtDisable(id));
+        .action((id: string) => void managementDisable(id));
 
     cron.command('enable')
         .description('Re-enable a cron job by id')
         .argument('<id>', 'Cron job id')
-        .action((id: string) => void mgmtEnable(id));
+        .action((id: string) => void managementEnable(id));
 
     cron.command('remove')
         .alias('rm')
         .description('Delete a cron job by id')
         .argument('<id>', 'Cron job id')
-        .action((id: string) => void mgmtRemove(id));
+        .action((id: string) => void managementRemove(id));
 
     cron.command('stats')
         .description('Runs / delivered / suppressed counters; pass id for detail')
@@ -115,7 +165,86 @@ export function registerCronCommands(root: Command): void {
             void renderFires(id, Number(opts.limit ?? 20)),
         );
 
-    cron.action(() => renderList());
+    cron.command('trigger')
+        .description('Force-fire a cron job now (bypasses schedule)')
+        .argument('<id>', 'Cron job id')
+        .action((id: string) => void managementTrigger(id));
+
+    cron.command('tick')
+        .description('Force-fire every enabled cron job NOW (sweep)')
+        .action(() => void managementTick('cron'));
+
+    cron.command('edit')
+        .description('Mutate a cron job: skills only for now (replace / add / remove / clear).')
+        .argument('<id>', 'Cron job id')
+        .option('--skill <name>', 'Replace skills with this list (repeatable)', collectSkill, [])
+        .option('--add-skill <name>', 'Append a skill (repeatable, idempotent)', collectSkill, [])
+        .option('--remove-skill <name>', 'Drop a skill (repeatable)', collectSkill, [])
+        .option('--clear-skills', 'Reset skills to empty before --add', false)
+        .action(async (id: string, opts: {
+            skill: string[];
+            addSkill: string[];
+            removeSkill: string[];
+            clearSkills: boolean;
+        }) => {
+            const noOps =
+                opts.skill.length === 0 &&
+                opts.addSkill.length === 0 &&
+                opts.removeSkill.length === 0 &&
+                !opts.clearSkills;
+            if (noOps) {
+                console.log(bad('flopsy cron edit: no mutations supplied'));
+                console.log(dim('  Use --skill / --add-skill / --remove-skill / --clear-skills'));
+                process.exit(1);
+            }
+            await editSkills('cron', id, {
+                replace: opts.skill.length > 0 ? opts.skill : undefined,
+                addSkills: opts.addSkill,
+                removeSkills: opts.removeSkill,
+                clearAll: opts.clearSkills,
+            });
+        });
+
+    cron.command('why')
+        .description(
+            'Why did the last fire of this cron job behave the way it did? Shows result + reason + 7d suppression breakdown.',
+        )
+        .argument('<id>', 'Cron job id')
+        .action((id: string) => {
+            // Named `fireDetail` rather than `detail` because `detail` is
+            // already imported from `../ui/pretty` as a row renderer.
+            const fireDetail = loadLastFireDetail(id);
+            if (!fireDetail) {
+                console.log(bad(`No fire history for "${id}" yet.`));
+                console.log(dim('  This cron has never fired, or proactive_decisions table is empty.'));
+                return;
+            }
+            renderLastFireDetail(id, fireDetail);
+        });
+
+    const skill = cron.command('skill').description('Manage skills bound to a cron job');
+    skill.command('list')
+        .description('Show skills bound to a cron job')
+        .argument('<id>', 'Cron job id')
+        .action((id: string) => void skillList('cron', id));
+    skill.command('add')
+        .description('Bind a skill to a cron job (idempotent — duplicates skipped)')
+        .argument('<id>', 'Cron job id')
+        .argument('<name>', 'Skill name (must exist under .flopsy/content/skills/)')
+        .action((id: string, name: string) => void skillAdd('cron', id, name));
+    skill.command('remove')
+        .alias('rm')
+        .description('Unbind a skill from a cron job')
+        .argument('<id>', 'Cron job id')
+        .argument('<name>', 'Skill name')
+        .action((id: string, name: string) => void skillRemove('cron', id, name));
+    skill.command('clear')
+        .description('Unbind all skills from a cron job')
+        .argument('<id>', 'Cron job id')
+        .action((id: string) => void skillClear('cron', id));
+    skill.action((_opts: unknown, cmd: { outputHelp(): void }) => cmd.outputHelp());
+
+    cron.action((_opts: unknown, cmd: { outputHelp(): void }) => cmd.outputHelp());
 }
 
 function renderList(): void {

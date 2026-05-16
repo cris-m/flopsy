@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { defineTool } from 'flopsygraph';
+import { numberLooseOptional, stringArrayLooseOptional } from './schema-coerce';
 import {
     createTeammateTask,
     toRunning,
@@ -12,15 +13,18 @@ import type {
 } from './spawn-background-task';
 import { MAX_DELEGATION_DEPTH } from './spawn-background-task';
 
-// Cap aligns with channel-worker's BACKGROUND_TURN_TIMEOUT_MS (15 min) minus jitter buffer.
+// Cap below the gateway's 600s envelope so a delegate timeout surfaces as a tool error.
 export const DEFAULT_DELEGATE_TIMEOUT_MS = 180_000; // 3 min — typical focused sub-task
-export const MAX_DELEGATE_TIMEOUT_MS = 900_000; // 15 min — cap matching retrigger turn
+export const MAX_DELEGATE_TIMEOUT_MS = 480_000;     // 8 min — headroom under the 600s envelope
 
 /** Delegate reuses spawn's configurable shape — same wiring, same factory. */
 export type DelegateTaskConfigurable = Pick<
     SpawnBackgroundTaskConfigurable,
     'registry' | 'buildSubAgent' | 'depth' | 'logger'
->;
+> & {
+    /** Chain of worker names that led to this invocation. */
+    spawnChain?: string[];
+};
 
 const schema = z.object({
     worker: z
@@ -54,74 +58,52 @@ const schema = z.object({
         .describe(
             'Describe what the response should look like: "bullet list", "JSON", "3-paragraph analysis", etc. Appended after the task string. Helps the worker produce output the leader can parse directly.',
         ),
-    tools: z
-        .array(z.string())
-        .optional()
+    tools: stringArrayLooseOptional()
         .describe(
-            'Optional ARRAY of tool-name strings the teammate may use. ' +
-            'Always pass a JSON array, never a bare string. ' +
-            'Examples: ["web_search"], ["web_search", "web_extract"]. ' +
+            'Optional list of tool-name strings the teammate may use. ' +
+            'Pass a JSON array (e.g. ["web_search", "web_extract"]); a bare string ' +
+            'like "web_search" is also accepted and auto-wrapped. ' +
             'Defaults to the teammate\'s configured toolsets.',
         ),
-    timeoutMs: z
-        .number()
-        .int()
-        .positive()
-        .max(MAX_DELEGATE_TIMEOUT_MS)
-        .optional()
+    timeoutMs: numberLooseOptional()
+        .pipe(z.number().int().positive().max(MAX_DELEGATE_TIMEOUT_MS).optional())
         .describe(
             `Soft timeout in ms. Default ${DEFAULT_DELEGATE_TIMEOUT_MS}; max ${MAX_DELEGATE_TIMEOUT_MS}. ` +
+            `Pass as a number (e.g. 120000); a quoted string ("120000") is also accepted. ` +
             `NEVER pass a value below 60000 — workers need time for model inference + tool calls. ` +
             `Omit this parameter unless you have a specific reason to override the default.`,
         ),
 });
 
-type DelegateArgs = z.infer<typeof schema>;
+// Override `tools`/`timeoutMs` so consumers see the post-coercion shape.
+type DelegateArgs = Omit<z.infer<typeof schema>, 'tools' | 'timeoutMs'> & {
+    tools?: string[];
+    timeoutMs?: number;
+};
 
 export const delegateTaskTool = defineTool({
     name: 'delegate_task',
     description: [
-        'Delegate a focused sub-task to a named teammate. BLOCKS this turn until the teammate returns.',
-        'Use for tasks that finish in under 2 minutes AND whose result you need before replying.',
+        'Delegate a focused sub-task to a named teammate and BLOCK until the result returns (synchronous).',
+        'Use this when the work finishes in under 3 minutes (default timeoutMs = 180000, max 480000) AND you need the answer before you can reply. For longer work, use spawn_background_task instead.',
         '',
-        'Workers:',
-        '  - "legolas"  — quick scout + Google Workspace. Web lookups, Gmail/Calendar/Drive/YouTube. "what\'s X?" / "read my inbox" / "any events today?"',
-        '  - "saruman"  — deep researcher (multi-round, inline citations). Landscape briefs, compare angles, surface contradictions. SLOW — prefer spawn_background_task for saruman.',
-        '  - "gimli"    — analysis/criticism + local notes. Pattern check, review a draft, spot flaws, Obsidian/Apple Notes/Reminders/Notion/Todoist.',
-        '  - "aragorn"  — security intel. VirusTotal/Shodan lookups.',
-        '  - "sam"      — media + home. Spotify playback, Home Assistant control.',
+        'Pick by shape of the task:',
+        '  - "legolas"  — quick web scout, Gmail, Calendar, Drive, YouTube. "what\'s X?" / "read my inbox" / "any events today?"',
+        '  - "saruman"  — deep multi-source briefs with citations. SLOW — usually prefer spawn_background_task(saruman).',
+        '  - "gimli"    — analysis, code review, local notes (Obsidian / Apple Notes / Reminders / Notion / Todoist).',
+        '  - "aragorn"  — security intel: VirusTotal, Shodan, sandbox triage.',
+        '  - "sam"      — media + home: Spotify, Home Assistant.',
         '',
-        'Pick by shape of the question, not by keyword:',
-        '  Good: "summarize this doc in 5 bullets"          → legolas (short, one pass)',
-        '  Good: "what emails did I get today"              → legolas (Gmail)',
-        '  Good: "validate this JSON and explain errors"    → gimli (analysis)',
-        '  Good: "write a note in Obsidian about X"         → gimli (local filesystem)',
-        '  Avoid: "research the state of post-quantum crypto" → DO NOT use delegate (too long). Use spawn_background_task(saruman).',
+        'Examples: "summarize this doc" → legolas. "validate this JSON" → gimli. "is this hash malicious" → aragorn.',
+        'Avoid: "research the state of post-quantum crypto" — that\'s a brief, use spawn_background_task(saruman).',
         '',
-        'The teammate has NO memory of this conversation — pack context into the task string.',
-        'The teammate CANNOT delegate further (max depth = 1).',
-        'If the user should not wait, OR the task could take >2 min: use spawn_background_task instead.',
+        'The teammate has NO memory of the conversation — pack context into the task string.',
+        'Workers CAN delegate to other workers when a task crosses domains (max depth = 3, loops are blocked).',
+        'Launch multiple workers concurrently whenever possible. To do that, emit multiple delegate_task tool calls in a SINGLE assistant turn — the runtime executes them in parallel and returns all results before your next step. Never serialise independent delegations one turn at a time.',
+        'For 5+ similar items to the same worker, use execute_code({use_tools: true}) and call parallel_map() inside the sandbox — runs up to 5 concurrently, you only see the final array.',
+        'Long worker replies (>1.5 KB) auto-save to disk and fold to a header + 800-char preview. The handoff message includes the absolute path — pass it verbatim to read_file when you need the full text.',
         '',
-        'PARALLELISM — call multiple delegates in one turn when tasks are independent:',
-        '  Bad:  delegate_task(legolas, "fetch X") → wait → delegate_task(legolas, "fetch Y")',
-        '  Good: emit BOTH delegate_task calls in the SAME assistant turn.',
-        '  Concrete: "validate this JSON AND look up the schema spec" → 2× delegate_task in parallel,',
-        '  not serialized.',
-        '',
-        'BIG FAN-OUT — when you have many (5+) similar items needing the same worker,',
-        'use execute_code with use_tools=true and call parallel_map() inside the sandbox:',
-        '  results = parallel_map("legolas", [f"summarise issue #{i}" for i in range(20)])',
-        'That runs up to 5 delegations concurrently and returns a list — you only see the',
-        'final array in your context, intermediate worker outputs stay isolated.',
-        '',
-        'WORKER REPLY OFFLOAD — long worker replies (>1.5KB) are auto-saved to',
-        '`.flopsy/worker-outputs/<file>.md` and folded down to a header + 800-char preview.',
-        'If you need the full reply, use read_file with the path the handoff header gives you.',
-        '',
-        'ERROR RECOVERY — first attempt failing is data, not a stop:',
-        '  - Worker timed out: spawn a SECOND worker on the same task in parallel; race them.',
-        '  - Worker returned partial / wrong: retry once with a tightened prompt that addresses the failure.',
-        '  - After 2 attempts: surface what you tried + what you got, ask the user what they want to try.',
+        'On error: timed out → spawn a second worker on the same task in parallel and race them. Wrong/partial → retry once with a tighter prompt. After two failures, surface what you tried.',
     ].join('\n'),
     schema,
     execute: async (args, ctx) => {
@@ -130,6 +112,7 @@ export const delegateTaskTool = defineTool({
         if (typeof wiring === 'string') return wiring;
 
         const { registry, buildSubAgent, depth, logger } = wiring;
+        const chain = cfg.spawnChain ?? [];
 
         const taskPreview = args.task.length > 160
             ? args.task.slice(0, 157) + '…'
@@ -149,12 +132,18 @@ export const delegateTaskTool = defineTool({
             return `delegate_task: max delegation depth (${MAX_DELEGATION_DEPTH}) reached. Handle this task directly.`;
         }
 
+        if (chain.includes(args.worker)) {
+            return `delegate_task: loop detected — ${args.worker} already in chain [${chain.join(' → ')}]. Handle directly.`;
+        }
+
         const runner = buildSubAgent(args.worker);
         if (!runner) {
             return `delegate_task: unknown worker "${args.worker}". Ensure it exists in the team and is enabled.`;
         }
 
-        return await runInline(args, { registry, runner, depth, logger, parentSignal: ctx.signal });
+        // Cast to the post-transform shape (TS still types as the input union).
+        const coerced = args as unknown as DelegateArgs;
+        return await runInline(coerced, { registry, runner, depth, chain, logger, parentSignal: ctx.signal });
     },
 });
 
@@ -162,6 +151,7 @@ interface Wiring {
     registry: TaskRegistry;
     buildSubAgent: SubAgentFactory;
     depth: number;
+    chain: string[];
     logger: DelegateTaskConfigurable['logger'];
 }
 
@@ -176,6 +166,7 @@ function validateWiring(cfg: Partial<DelegateTaskConfigurable>): Wiring | string
         registry: cfg.registry,
         buildSubAgent: cfg.buildSubAgent,
         depth: cfg.depth ?? 0,
+        chain: cfg.spawnChain ?? [],
         logger: cfg.logger,
     };
 }
@@ -200,11 +191,12 @@ async function runInline(
         registry: TaskRegistry;
         runner: import('./spawn-background-task').SubAgentRunner;
         depth: number;
+        chain: string[];
         logger: DelegateTaskConfigurable['logger'];
         parentSignal: AbortSignal | undefined;
     },
 ): Promise<string> {
-    const { registry, runner, depth, logger, parentSignal } = deps;
+    const { registry, runner, depth, chain, logger, parentSignal } = deps;
     const timeoutMs = args.timeoutMs ?? DEFAULT_DELEGATE_TIMEOUT_MS;
 
     const task = createTeammateTask({
@@ -212,6 +204,7 @@ async function runInline(
         workerName: args.worker,
         description: args.task.slice(0, 120),
         depth: depth + 1,
+        spawnChain: [...chain, args.worker],
     });
     registry.register(task);
     const running = toRunning(task);
@@ -232,6 +225,8 @@ async function runInline(
             task: buildTaskPrompt(args),
             toolAllowlist: args.tools,
             signal: whole.signal,
+            depth: depth + 1,
+            spawnChain: [...chain, args.worker],
         });
 
         const done = toTerminal(task, 'completed', { result });
@@ -243,7 +238,7 @@ async function runInline(
         return result;
     } catch (err) {
         const aborted = whole.signal.aborted;
-        const timedOut = aborted && Date.now() - startedAt >= timeoutMs - 100; // within jitter
+        const timedOut = aborted && Date.now() - startedAt >= timeoutMs - 100;
         const parentStop = aborted && parentSignal?.aborted === true;
         const message = err instanceof Error ? err.message : String(err);
 

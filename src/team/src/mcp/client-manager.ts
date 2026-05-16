@@ -1,18 +1,6 @@
 /**
- * MCP client manager — owns one Client per loaded server, lazily
- * connected on first tool-list request.
- *
- * Lifecycle:
- *   - `connect(servers)` opens transports + initialize handshakes in
- *     parallel; failures are isolated (one bad server doesn't poison the
- *     others; it just lands in `failed`).
- *   - `listTools(server)` returns the server's tool definitions on
- *     demand; cached after first call.
- *   - `callTool(server, name, args)` proxies to the server.
- *   - `closeAll()` — graceful shutdown on process teardown.
- *
- * Currently supports stdio only. http / sse paths throw "not yet
- * supported" errors — wire when an actual server needs them.
+ * MCP client manager — one Client per loaded server, lazy listTools cache.
+ * stdio only today; http/sse paths throw "not yet supported".
  */
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -21,13 +9,7 @@ import type { Tool as McpTool } from '@modelcontextprotocol/sdk/types.js';
 import { createLogger } from '@flopsy/shared';
 import type { LoadedMcpServer } from './loader';
 
-/**
- * MCP `callTool` returns a union — modern shape with `content[]` plus a
- * deprecated `toolResult` variant. We narrow to the modern shape (the
- * tool-bridge expects it). Spec compliance: every server we'd ship with
- * uses the new shape; defensive narrowing rejects the deprecated path
- * with a clear error.
- */
+/** Narrowed to the modern shape (`content[]`); deprecated `toolResult` is folded to a text item. */
 export interface NormalisedCallToolResult {
     readonly content: ReadonlyArray<{
         readonly type: string;
@@ -61,17 +43,11 @@ export class McpClientManager {
         return Object.fromEntries(this.failed);
     }
 
-    /**
-     * Open clients for every server in parallel. Returns when all
-     * settle (success or fail). Idempotent — already-connected servers
-     * are skipped.
-     */
+    /** Open clients in parallel; idempotent. Failures land in `this.failed`. */
     async connect(servers: readonly LoadedMcpServer[]): Promise<void> {
         const toConnect = servers.filter((s) => !this.clients.has(s.name));
         if (toConnect.length === 0) return;
 
-        // allSettled ensures we don't throw on a single bad server —
-        // failures are captured in `this.failed` by the inner catch.
         await Promise.allSettled(
             toConnect.map(async (server) => {
                 const startedAt = Date.now();
@@ -106,14 +82,47 @@ export class McpClientManager {
             throw new Error(`MCP server "${server.name}" has no command`);
         }
 
-        // Build the transport with merged env: process.env first (so
-        // PATH etc. is available), then server-specific env on top.
-        // SDK's stdio transport spawns the child for us.
+        // Scoped env (default-deny). Inheriting `process.env` would leak FLOPSY_MGMT_TOKEN,
+        // OAuth refresh tokens, and API keys into every MCP child. Allowlist below covers
+        // safe shell vars; server-specific `env` is layered on top.
+        const ENV_ALLOWLIST = [
+            'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL',
+            'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ',
+            'TERM', 'COLORTERM',
+            'TMPDIR', 'TEMP', 'TMP',
+            'NODE_PATH', 'NVM_DIR',
+            // FLOPSY_HOME lets MCPs locate the workspace; NOT the management token.
+            'FLOPSY_HOME',
+        ];
+        const scopedEnv: Record<string, string> = {};
+        for (const key of ENV_ALLOWLIST) {
+            const v = process.env[key];
+            if (typeof v === 'string') scopedEnv[key] = v;
+        }
+        // Server-specific env wins on collision.
+        Object.assign(scopedEnv, server.env);
+
         const transport = new StdioClientTransport({
             command: server.command,
             args: [...server.args],
-            env: { ...(process.env as Record<string, string>), ...server.env },
+            env: scopedEnv,
         });
+
+        // Contain transport errors (EPIPE etc.); without this a crashing MCP kills the gateway.
+        transport.onerror = (err: unknown) => {
+            const message = err instanceof Error ? err.message : String(err);
+            log.warn({ server: server.name, err: message }, 'mcp transport error (contained)');
+            this.failed.set(server.name, message);
+            this.clients.delete(server.name);
+        };
+        transport.onclose = () => {
+            // Close after connect = child died; mark failed so callers get a clean error.
+            if (this.clients.has(server.name)) {
+                log.warn({ server: server.name }, 'mcp transport closed unexpectedly (contained)');
+                this.failed.set(server.name, 'transport closed unexpectedly');
+                this.clients.delete(server.name);
+            }
+        };
 
         const client = new Client(
             {
@@ -125,8 +134,7 @@ export class McpClientManager {
             },
         );
 
-        // Race the connect against a timeout — slow MCP servers are common
-        // (npm install on first run, model loads, etc.) so 30s is generous.
+        // 30s timeout — generous for first-run npm installs and model loads.
         await this.withTimeout(
             client.connect(transport),
             CONNECT_TIMEOUT_MS,
@@ -148,10 +156,7 @@ export class McpClientManager {
         return entry.tools;
     }
 
-    /**
-     * Default per-call timeout for `callTool()`. Guards against a hung MCP
-     * server indefinitely blocking a turn. Callers can override per-invocation.
-     */
+    /** Default per-call timeout; callers can override per-invocation. */
     private static readonly DEFAULT_CALL_TIMEOUT_MS = 30_000;
 
     async callTool(
@@ -164,8 +169,7 @@ export class McpClientManager {
         if (!entry) {
             throw new Error(`MCP server "${serverName}" not connected`);
         }
-        // Resolution order: per-call override → per-server config → global default.
-        // callTimeoutMs === 0 means "no timeout" — we just await the call.
+        // Resolution: per-call → per-server → global default. 0 = no timeout.
         const timeoutMs =
             options?.timeoutMs ??
             entry.server.callTimeoutMs ??
@@ -177,9 +181,7 @@ export class McpClientManager {
                 | { content?: NormalisedCallToolResult['content']; isError?: boolean }
                 | { toolResult?: unknown };
         } else {
-            // Clear the timeout on both resolve and reject paths — otherwise every
-            // successful tool call leaves a pending timer behind for `timeoutMs`,
-            // pinning the event loop and delaying graceful shutdown under load.
+            // Clear the timer on both resolve + reject paths so successful calls don't leak timers.
             let timer: ReturnType<typeof setTimeout> | undefined;
             const timeoutPromise = new Promise<never>((_, reject) => {
                 timer = setTimeout(
@@ -213,11 +215,7 @@ export class McpClientManager {
         };
     }
 
-    /**
-     * Look up which server owns a tool by name. Returns undefined when
-     * the tool isn't registered (collisions resolve to first hit; we log
-     * a warning on collision detection during the build step).
-     */
+    /** Returns the first server that owns the named tool; undefined when unregistered. */
     findServerForTool(toolName: string): string | undefined {
         for (const [server, entry] of this.clients) {
             if (entry.tools?.some((t) => t.name === toolName)) return server;
@@ -225,19 +223,11 @@ export class McpClientManager {
         return undefined;
     }
 
-    /**
-     * Restart specific servers by name — closes the old client (kills the
-     * child process), then reconnects with freshly-loaded server configs.
-     *
-     * Use this after OAuth credentials are saved so the new process spawns
-     * with the updated access/refresh tokens rather than the stale ones
-     * that were baked into the old child's env at startup.
-     */
+    /** Closes + reconnects named servers; use after OAuth refresh so children inherit new tokens. */
     async restartServers(servers: readonly LoadedMcpServer[]): Promise<void> {
         const names = servers.map((s) => s.name);
         log.info({ servers: names }, 'restarting mcp servers after auth update');
 
-        // Close old clients — this kills the stdio child processes.
         await Promise.allSettled(
             names.map(async (name) => {
                 const entry = this.clients.get(name);
@@ -255,7 +245,6 @@ export class McpClientManager {
             }),
         );
 
-        // Re-connect with fresh credentials already baked into LoadedMcpServer.env.
         await this.connect(servers);
     }
 

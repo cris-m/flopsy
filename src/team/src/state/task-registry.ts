@@ -43,6 +43,12 @@ export class TaskRegistry {
         background_job: 0,
         shell: 0,
     };
+    /**
+     * Cross-worker message queue — messages sent via notify_teammate when
+     * the target is not currently active. Survives across tasks so the
+     * next invocation of that worker receives them.
+     */
+    private readonly teammateMessages = new Map<string, string[]>();
 
     /**
      * Hand out the next pretty id for a task type: `t1`, `t2`, `j1`, ...
@@ -54,6 +60,10 @@ export class TaskRegistry {
     nextId(type: TaskType): string {
         const n = ++this.counters[type];
         return `${TASK_ID_PREFIX[type]}${n}`;
+    }
+
+    size(): number {
+        return this.tasks.size;
     }
 
     /** Insert. Duplicate IDs throw — nextId() is monotonic so a collision is a bug. */
@@ -220,8 +230,18 @@ export class TaskRegistry {
         return n;
     }
 
-    /** Count of entries, including terminal. For tests and diagnostics. */
-    size(): number {
-        return this.tasks.size;
+    /** Queue a message for a teammate to receive on their next invocation. */
+    pushTeammateMessage(workerName: string, text: string): void {
+        const q = this.teammateMessages.get(workerName) ?? [];
+        q.push(text);
+        this.teammateMessages.set(workerName, q);
+    }
+
+    /** Atomically drain all queued messages for a teammate. */
+    drainTeammateMessages(workerName: string): string[] {
+        const q = this.teammateMessages.get(workerName);
+        if (!q || q.length === 0) return [];
+        this.teammateMessages.delete(workerName);
+        return q;
     }
 }

@@ -11,26 +11,25 @@
  */
 import { describe, expect, it } from 'vitest';
 import { SessionExtractor } from '@flopsy/team/harness/review/session-extractor';
-import type { MessageRow } from '@flopsy/team/harness/storage';
 
 type ContentBlock = { type: 'text'; text: string };
 
-interface FakeStore {
-    getThreadMessages(threadId: string, limit?: number): MessageRow[];
+interface ExtractorMsg {
+    role: 'user' | 'assistant' | 'system' | 'tool';
+    content: string;
+}
+
+interface FakeCheckpointer {
+    getThreadMessages<M = unknown>(threadId: string, opts?: { limit?: number }): Promise<M[]>;
 }
 
 const PAD = 'lorem ipsum dolor sit amet '.repeat(15);
-function makeMessages(count: number): MessageRow[] {
-    const now = Date.now();
-    const out: MessageRow[] = [];
+function makeMessages(count: number): ExtractorMsg[] {
+    const out: ExtractorMsg[] = [];
     for (let i = 0; i < count; i++) {
         out.push({
-            id: i + 1,
-            userId: '123456789',
-            threadId: 'telegram:dm:123456789#s-1',
             role: i % 2 === 0 ? 'user' : 'assistant',
             content: `message ${i} — ${PAD}`,
-            createdAt: now + i,
         });
     }
     return out;
@@ -50,14 +49,16 @@ function makeModel(opts: FakeModelOpts) {
     };
 }
 
-function makeStore(messages: MessageRow[]): FakeStore {
-    return { getThreadMessages: () => messages };
+function makeCheckpointer(messages: ExtractorMsg[]): FakeCheckpointer {
+    return {
+        getThreadMessages: async <M = unknown>() => messages as unknown as M[],
+    };
 }
 
-function newExtractor(model: ReturnType<typeof makeModel>, store: FakeStore) {
+function newExtractor(model: ReturnType<typeof makeModel>, checkpointer: FakeCheckpointer) {
     return new SessionExtractor({
         model: model as unknown as Parameters<typeof SessionExtractor>[0]['model'],
-        store: store as unknown as Parameters<typeof SessionExtractor>[0]['store'],
+        checkpointer: checkpointer as unknown as Parameters<typeof SessionExtractor>[0]['checkpointer'],
     });
 }
 
@@ -68,7 +69,7 @@ describe('SessionExtractor.extract', () => {
             skill_proposal: null,
             skill_lessons: [],
         });
-        const ex = newExtractor(makeModel({ response: valid }), makeStore(makeMessages(10)));
+        const ex = newExtractor(makeModel({ response: valid }), makeCheckpointer(makeMessages(10)));
 
         const result = await ex.extract('thread-1');
 
@@ -82,7 +83,7 @@ describe('SessionExtractor.extract', () => {
         const block: ContentBlock[] = [
             { type: 'text', text: '{"summary":"hi","skill_proposal":null,"skill_lessons":[]}' },
         ];
-        const ex = newExtractor(makeModel({ response: block }), makeStore(makeMessages(10)));
+        const ex = newExtractor(makeModel({ response: block }), makeCheckpointer(makeMessages(10)));
         const result = await ex.extract('thread-1');
         expect(result?.summary).toBe('hi');
     });
@@ -93,7 +94,7 @@ describe('SessionExtractor.extract', () => {
             JSON.stringify({ summary: 'ok', skill_proposal: null, skill_lessons: [] }),
             '```',
         ].join('\n');
-        const ex = newExtractor(makeModel({ response: fenced }), makeStore(makeMessages(10)));
+        const ex = newExtractor(makeModel({ response: fenced }), makeCheckpointer(makeMessages(10)));
         const result = await ex.extract('thread-1');
         expect(result?.summary).toBe('ok');
     });
@@ -109,7 +110,7 @@ describe('SessionExtractor.extract', () => {
             },
             skill_lessons: [],
         });
-        const ex = newExtractor(makeModel({ response: raw }), makeStore(makeMessages(10)));
+        const ex = newExtractor(makeModel({ response: raw }), makeCheckpointer(makeMessages(10)));
         const result = await ex.extract('thread-1');
         expect(result?.skill_proposal?.name).toBe('memory-debug');
         expect(result?.skill_proposal?.body).toContain('Steps');
@@ -123,7 +124,7 @@ describe('SessionExtractor.extract', () => {
                 { name: 'web-search', lessons: ['rate limits at 100/min', 'use json output'] },
             ],
         });
-        const ex = newExtractor(makeModel({ response: raw }), makeStore(makeMessages(10)));
+        const ex = newExtractor(makeModel({ response: raw }), makeCheckpointer(makeMessages(10)));
         const result = await ex.extract('thread-1');
         expect(result?.skill_lessons).toHaveLength(1);
         expect(result?.skill_lessons[0]?.name).toBe('web-search');
@@ -133,25 +134,25 @@ describe('SessionExtractor.extract', () => {
 
 describe('SessionExtractor.extract — null on failure', () => {
     it('returns null when fewer than 4 messages exist', async () => {
-        const ex = newExtractor(makeModel({ response: '{}' }), makeStore(makeMessages(3)));
+        const ex = newExtractor(makeModel({ response: '{}' }), makeCheckpointer(makeMessages(3)));
         expect(await ex.extract('thread-1')).toBeNull();
     });
 
     it('returns null when the model output is not JSON', async () => {
-        const ex = newExtractor(makeModel({ response: 'sorry, I cannot' }), makeStore(makeMessages(10)));
+        const ex = newExtractor(makeModel({ response: 'sorry, I cannot' }), makeCheckpointer(makeMessages(10)));
         expect(await ex.extract('thread-1')).toBeNull();
     });
 
     it('returns null when the JSON is missing a summary', async () => {
         const wrong = JSON.stringify({ skill_proposal: null, skill_lessons: [] });
-        const ex = newExtractor(makeModel({ response: wrong }), makeStore(makeMessages(10)));
+        const ex = newExtractor(makeModel({ response: wrong }), makeCheckpointer(makeMessages(10)));
         expect(await ex.extract('thread-1')).toBeNull();
     });
 
     it('returns null when model.invoke throws (abort/timeout)', async () => {
         const ex = newExtractor(
             makeModel({ response: '', throwOnInvoke: true }),
-            makeStore(makeMessages(10)),
+            makeCheckpointer(makeMessages(10)),
         );
         expect(await ex.extract('thread-1')).toBeNull();
     });
@@ -164,7 +165,7 @@ describe('SessionExtractor.extract — sanitization', () => {
             skill_proposal: null,
             skill_lessons: [],
         });
-        const ex = newExtractor(makeModel({ response: raw }), makeStore(makeMessages(10)));
+        const ex = newExtractor(makeModel({ response: raw }), makeCheckpointer(makeMessages(10)));
         const result = await ex.extract('thread-1');
         expect(result?.summary.length).toBe(500);
     });
@@ -180,7 +181,7 @@ describe('SessionExtractor.extract — sanitization', () => {
             },
             skill_lessons: [],
         });
-        const ex = newExtractor(makeModel({ response: raw }), makeStore(makeMessages(10)));
+        const ex = newExtractor(makeModel({ response: raw }), makeCheckpointer(makeMessages(10)));
         const result = await ex.extract('thread-1');
         expect(result?.skill_proposal).toBeNull();
     });
@@ -191,7 +192,7 @@ describe('SessionExtractor.extract — sanitization', () => {
             skill_proposal: { name: 'ok-name', description: '', when_to_use: 'x', body: 'y' },
             skill_lessons: [],
         });
-        const ex = newExtractor(makeModel({ response: raw }), makeStore(makeMessages(10)));
+        const ex = newExtractor(makeModel({ response: raw }), makeCheckpointer(makeMessages(10)));
         const result = await ex.extract('thread-1');
         expect(result?.skill_proposal).toBeNull();
     });
@@ -206,7 +207,7 @@ describe('SessionExtractor.extract — sanitization', () => {
             skill_proposal: null,
             skill_lessons: lessons,
         });
-        const ex = newExtractor(makeModel({ response: raw }), makeStore(makeMessages(10)));
+        const ex = newExtractor(makeModel({ response: raw }), makeCheckpointer(makeMessages(10)));
         const result = await ex.extract('thread-1');
         expect(result?.skill_lessons).toHaveLength(10);
         expect(result?.skill_lessons[0]?.lessons.length).toBeLessThanOrEqual(5);

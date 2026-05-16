@@ -40,7 +40,7 @@ export const reactTool = defineTool({
             .string()
             .min(1)
             .max(16)
-            .describe('The emoji to react with (e.g. "👀", "🔥", "😬", "✅").'),
+            .describe('The emoji to react with (e.g. "👀", "🔥", "😬", "🎯").'),
     }),
     execute: async ({ emoji }, ctx) => {
         const cfg = (ctx.configurable ?? {}) as Partial<ReactConfigurable>;

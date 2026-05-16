@@ -7,8 +7,7 @@ import type { FlopsyGateway } from '@flopsy/gateway';
 
 import { TeamHandler } from './handler';
 import type { ThreadIdentity } from './handler';
-import { closeSharedLearningStore, getSharedLearningStore } from './harness';
-import { SessionExtractor } from './harness/review';
+import { closeSharedLearningStore } from './harness';
 import { loadPersonalities } from './personalities';
 import { seedWorkspaceTemplates } from './seed-workspace';
 import { setScheduleFacade } from './tools/schedule-registry';
@@ -102,7 +101,7 @@ export async function startFlopsyBot(
         );
     }
 
-    // preload's loaded order is unspecified — match primary string explicitly.
+    // preload returns in unspecified order; match the primary explicitly.
     const primaryRef = definition.model
         ? loaded.find((ref) => `${ref.provider}:${ref.name}` === definition.model)
         : undefined;
@@ -137,7 +136,7 @@ export async function startFlopsyBot(
 
     const modelRouter = modelRouters.get(definition.name);
 
-    // Run extraction on the fast tier; fall back to primary when unavailable.
+    // Extraction runs on the fast tier; fall back to primary.
     let extractorModel: BaseChatModel = model;
     if (modelRouter) {
         try {
@@ -154,10 +153,7 @@ export async function startFlopsyBot(
             );
         }
     }
-    const sessionExtractor = new SessionExtractor({
-        model: extractorModel,
-        store: getSharedLearningStore(),
-    });
+    // SessionExtractor is built inside TeamHandler so it shares the checkpointer.
 
     const seedStats = seedWorkspaceTemplates();
     log.info(seedStats, 'workspace template seed complete');
@@ -185,7 +181,8 @@ export async function startFlopsyBot(
         maxThreads: 100,
         memory: config.memory,
         mcp: config.mcp,
-        sessionExtractor,
+        extractorModel,
+        ...(config.commitments ? { commitments: config.commitments } : {}),
         modelRouter: modelRouter ?? undefined,
         modelRouters,
         personalities,
@@ -227,11 +224,7 @@ function findAgentDefinition(config: FlopsyConfig, name: string): AgentDefinitio
     return config.agents.find((a) => a.name === name);
 }
 
-/**
- * Build an Observability instance from env. Triggers: OTEL_EXPORTER_OTLP_ENDPOINT,
- * LANGSMITH_API_KEY, or FLOPSY_OBSERVABILITY=1. Returns undefined otherwise.
- * OTel exporter requires @opentelemetry/{api,sdk-trace-base} as peer deps.
- */
+/** Build Observability from env. Triggers: OTEL_EXPORTER_OTLP_ENDPOINT, LANGSMITH_API_KEY, FLOPSY_OBSERVABILITY=1. */
 function buildObservability(): Observability | undefined {
     const otlpEndpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
     const langsmithKey = process.env.LANGSMITH_API_KEY;
@@ -259,10 +252,7 @@ function buildObservability(): Observability | undefined {
     }
 }
 
-/**
- * Probe for flopsy-sandbox:latest. If missing, kick off a background build so
- * gateway start doesn't trip the CLI's ~15s health-check (build takes 2-5 min).
- */
+/** Probe flopsy-sandbox:latest; background-build when missing so gateway start isn't blocked. */
 async function ensureSandboxImageIfNeeded(config: FlopsyConfig): Promise<void> {
     const needsImage = config.agents.some((a) => {
         const sb = (a as { sandbox?: Record<string, unknown> }).sandbox;
@@ -304,13 +294,12 @@ async function ensureSandboxImageIfNeeded(config: FlopsyConfig): Promise<void> {
 }
 
 function defaultResolveThread(threadId: string): ThreadIdentity {
-    // userId is the full peer routing key (`channel:scope:nativeId[:user:senderId]`)
-    // so HarnessInterceptor and SessionExtractor land on the same peer_id row.
+    // userId is the full peer routing key so harness + extractor share the same peer_id row.
     const peerId = threadId.split('#')[0] ?? threadId;
     return { userId: peerId };
 }
 
-// Split on the FIRST `:` only so Ollama tags like `name:latest` stay attached.
+// Split on the FIRST `:` so Ollama tags like `name:latest` stay attached.
 export function parseModelString(s: string): { provider: string; name: string } {
     const i = s.indexOf(':');
     if (i <= 0) {

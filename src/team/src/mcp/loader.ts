@@ -1,23 +1,6 @@
 /**
- * MCP server config loader.
- *
- * Takes the raw `mcp.servers` block from flopsy.json5 and returns a
- * filtered, env-expanded, auth-injected list ready to feed to the
- * client manager.
- *
- * Filtering rules (server is SKIPPED when):
- *   - `enabled: false`
- *   - `platform` set and doesn't match process.platform
- *   - any `requires` env var is missing
- *   - any `requiresAuth` provider has no stored credential
- *
- * Env-var injection (in resolved order, later wins):
- *   1. process.env (inherited base)
- *   2. server.env after `${VAR}` and `${VAR:-default}` expansion
- *   3. auth tokens — `FLOPSY_<PROVIDER>_ACCESS_TOKEN` (plus refresh
- *      token + expiry) for each `requiresAuth` provider, refreshed via
- *      `getValidCredential` so children inherit the longest-lived access
- *      token we can mint.
+ * Filter + expand + auth-inject mcp.servers config for the client manager.
+ * Skip rules: enabled=false; platform mismatch; missing `requires` env; failed `requiresAuth`.
  */
 
 import { createLogger } from '@flopsy/shared';
@@ -33,8 +16,7 @@ export interface LoadedMcpServer {
     readonly args: readonly string[];
     readonly url?: string;
     readonly headers?: Readonly<Record<string, string>>;
-    /** Final env after expansion + auth injection. NOT merged with process.env yet — */
-    /** the spawn helper does that to keep this object portable. */
+    /** Expanded + auth-injected env. NOT merged with process.env (spawn helper does that). */
     readonly env: Readonly<Record<string, string>>;
     readonly assignTo: readonly string[];
     readonly description?: string;
@@ -48,10 +30,7 @@ export interface LoaderResult {
     readonly skipped: Readonly<Record<string, string>>;
 }
 
-/**
- * Resolve `${VAR}` and `${VAR:-default}` references against process.env.
- * Unknown vars become empty strings unless a default is provided.
- */
+/** Resolve `${VAR}` and `${VAR:-default}` against process.env. */
 function expandEnvValue(raw: string): string {
     return raw.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g, (_match, name, dflt) => {
         const v = process.env[name];
@@ -60,9 +39,7 @@ function expandEnvValue(raw: string): string {
     });
 }
 
-/**
- * Filter + expand servers. Async because auth refresh may hit the network.
- */
+/** Async because auth refresh may hit the network. */
 export async function loadMcpServers(
     rawServers: Record<string, McpServerConfig>,
 ): Promise<LoaderResult> {
@@ -80,19 +57,15 @@ export async function loadMcpServers(
             continue;
         }
 
-        // requires: env vars must be set
         const missingEnv = cfg.requires.filter((v) => !process.env[v]);
         if (missingEnv.length > 0) {
             skipped[name] = `missing env: ${missingEnv.join(', ')}`;
             continue;
         }
 
-        // requiresAuth: each provider must have a stored credential.
-        // We refresh now (small upfront cost) so the spawned process gets
-        // a token with the longest possible runway, AND we inject the
-        // full credential set so servers can refresh in-process when the
-        // access token expires mid-lifetime (the MCP SDK's stdio
-        // transport does not auto-respawn children).
+        // Refresh now so spawned children inherit the longest runway. Inject
+        // refresh tokens too so servers can refresh in-process (the MCP SDK
+        // doesn't auto-respawn stdio children).
         const authEnv: Record<string, string> = {};
         let authError: string | undefined;
         for (const providerName of cfg.requiresAuth) {
@@ -114,15 +87,10 @@ export async function loadMcpServers(
             continue;
         }
 
-        // Expand env values, then layer auth tokens on top so server-config
-        // can't accidentally shadow them.
+        // Auth tokens layered LAST so server.env can't shadow them.
         const expandedEnv = Object.fromEntries(
             Object.entries(cfg.env).map(([k, v]) => [k, expandEnvValue(v)]),
         );
-        // Detect shadowing between the two sources — e.g. server-config sets
-        // GOOGLE_ACCESS_TOKEN manually AND requiresAuth also injects it.
-        // Without this warning the user sees a silent override, like the
-        // real incident where a duplicate .env line masked the refresh secret.
         const shadowed = Object.keys(expandedEnv).filter((k) => k in authEnv);
         if (shadowed.length > 0) {
             log.warn(

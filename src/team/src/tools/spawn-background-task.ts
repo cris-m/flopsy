@@ -2,6 +2,7 @@ import { writeFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { z } from 'zod';
 import { defineTool } from 'flopsygraph';
+import { numberLooseOptional, stringArrayLooseOptional } from './schema-coerce';
 import {
     createBackgroundJobTask,
     createTeammateTask,
@@ -10,7 +11,7 @@ import {
 } from '../state/task-state';
 import type { TaskRegistry } from '../state/task-registry';
 
-export const MAX_DELEGATION_DEPTH = 1;
+export const MAX_DELEGATION_DEPTH = 3;
 
 export const DEFAULT_SPAWN_TIMEOUT_MS = 1_800_000; // 30 min
 export const MAX_SPAWN_TIMEOUT_MS = 7_200_000; // 2 hours
@@ -64,6 +65,10 @@ export type SubAgentRunner = (args: {
     task: string;
     toolAllowlist?: readonly string[];
     signal: AbortSignal;
+    /** Delegation depth — defaults to 1 when spawned by the main agent. */
+    depth?: number;
+    /** Chain of worker names that led to this invocation. */
+    spawnChain?: string[];
 }) => Promise<string>;
 
 export type SubAgentFactory = (workerName: string) => SubAgentRunner | undefined;
@@ -74,6 +79,8 @@ export interface SpawnBackgroundTaskConfigurable {
     buildSubAgent: SubAgentFactory;
     /** Main agent is depth 0; a teammate spawned by the main is depth 1. */
     depth?: number;
+    /** Spawn chain tracking for loop prevention. */
+    spawnChain?: string[];
     /** When omitted, spawns run memory-only and don't survive a gateway restart. */
     taskStore?: BackgroundTaskStore;
     /** Parent thread for the task (gateway routing key). Required when taskStore is set. */
@@ -99,13 +106,11 @@ const schema = z.object({
         .describe(
             'Full task description for the teammate. The teammate has no access to conversation history, so include any context needed.',
         ),
-    tools: z
-        .array(z.string())
-        .optional()
+    tools: stringArrayLooseOptional()
         .describe(
-            'Optional ARRAY of tool-name strings the teammate may use. ' +
-            'Always pass a JSON array, never a bare string. ' +
-            'Examples: ["web_search"], ["web_search", "web_extract"]. ' +
+            'Optional list of tool-name strings the teammate may use. ' +
+            'Pass a JSON array (e.g. ["web_search", "web_extract"]); a bare string ' +
+            'like "web_search" is also accepted and auto-wrapped. ' +
             'Defaults to the teammate\'s configured toolsets.',
         ),
     description: z
@@ -114,14 +119,10 @@ const schema = z.object({
         .describe(
             'Short human-readable label for this background job (shown in status queries). Defaults to a truncated task summary.',
         ),
-    timeoutMs: z
-        .number()
-        .int()
-        .positive()
-        .max(MAX_SPAWN_TIMEOUT_MS)
-        .optional()
+    timeoutMs: numberLooseOptional()
+        .pipe(z.number().int().positive().max(MAX_SPAWN_TIMEOUT_MS).optional())
         .describe(
-            `Hard ceiling in ms for how long the teammate can run. Default ${DEFAULT_SPAWN_TIMEOUT_MS} (30 min); max ${MAX_SPAWN_TIMEOUT_MS} (2 h). If it elapses, the teammate is aborted and a task_error event fires — user gets notified.`,
+            `Hard ceiling in ms for how long the teammate can run. Default ${DEFAULT_SPAWN_TIMEOUT_MS} (30 min); max ${MAX_SPAWN_TIMEOUT_MS} (2 h). Pass as a number (e.g. 600000); a quoted string ("600000") is also accepted. If it elapses, the teammate is aborted and a task_error event fires — user gets notified.`,
         ),
     outputFile: z
         .string()
@@ -131,42 +132,33 @@ const schema = z.object({
         ),
 });
 
-type SpawnArgs = z.infer<typeof schema>;
+// Override `tools`/`timeoutMs` so consumers see the post-coercion shape
+// (string[] / number) rather than the union of accepted inputs that
+// `z.infer` reports for `union → transform → optional` fields.
+type SpawnArgs = Omit<z.infer<typeof schema>, 'tools' | 'timeoutMs'> & {
+    tools?: string[];
+    timeoutMs?: number;
+};
 
 export const spawnBackgroundTaskTool = defineTool({
     name: 'spawn_background_task',
     description: [
-        'Start a long-running task in the background. Returns IMMEDIATELY.',
-        'You will be notified via a system task-notification message when it completes.',
-        'You can call this multiple times — tasks run in parallel.',
+        'Start a long-running task in the background and return IMMEDIATELY. You\'ll be notified via a system task-notification message when it completes; multiple spawns run in parallel.',
+        'Use this when the task takes longer than ~2 minutes OR when the user shouldn\'t wait. For quick work you need before replying, use delegate_task instead.',
         '',
-        'Workers:',
-        '  - "legolas"  — quick web scout (<30s). Great when stacking many independent lookups in parallel.',
-        '  - "saruman"  — deep researcher. Multi-round plan → search → summarise → reflect with inline citations. USE THIS for landscape briefs, "state of X", multi-angle research, contradiction-surfacing. Takes 3-15 min. Multiple sarumanis on different angles in parallel is normal and encouraged.',
-        '  - "gimli"    — analysis of large inputs.',
+        'Pick the worker:',
+        '  - "saruman"  — deep multi-round research with citations. Default for "state of X", multi-angle briefs, contradiction-surfacing. 3–15 min.',
+        '  - "legolas"  — quick web scout (<30s). Use when stacking many independent lookups in parallel.',
+        '  - "gimli"    — analysis of large structured inputs.',
         '',
-        'PARALLELISM — spawn multiple in the same turn when topics are INDEPENDENT:',
-        '  Independent = "research X for plan A AND check Y for plan B" — two unrelated reports.',
-        '  Not independent = "compare X vs Y" — that\'s ONE worker covering all angles, not three.',
-        '  Bad:  spawn(saruman, "research X") → wait → spawn(saruman, "research Y")  [serial when independent]',
-        '  Good: emit BOTH spawn() calls in the SAME assistant turn.',
+        'Examples: "state of post-quantum crypto" → saruman. "compare LangGraph vs CrewAI vs AutoGen" → saruman (one worker, multi-angle). "what changed in the Rust 2027 edition?" → legolas. "review this 200-line config" → gimli.',
         '',
-        'Decision rule — bias to saruman over legolas for anything research-shaped:',
-        '  - "state of post-quantum crypto adoption"       → saruman (landscape)',
-        '  - "compare LangGraph vs CrewAI vs AutoGen"       → saruman (multi-angle, one worker)',
-        '  - "what\'s the consensus on topic X"             → saruman (surfaces disagreement)',
-        '  - "what changed in the Rust 2027 edition?"       → legolas (single topic)',
+        'Spawn multiple in the same turn when topics are independent (e.g., "research X for plan A AND check Y for plan B"). Don\'t serialize independent work.',
+        'Right after spawning, call send_message to tell the user it has started.',
         '',
-        'When you spawn: the teammate has NO memory of this conversation — pack everything into the task string:',
-        '  - angles / sub-topics / regions / timeframes that matter',
-        '  - source hints ("prefer primary sources", "avoid reddit")',
-        '  - any specific claims the user wants fact-checked',
-        '  - output shape (length, citation style)',
+        'The teammate has NO memory of the conversation — pack into the task string: angles, source hints, claims to fact-check, output shape. The teammate CAN delegate further if the task crosses domains (max depth = 3, loops are blocked).',
         '',
-        'IMMEDIATELY after calling this, call send_message to tell the user it has started.',
-        'Do NOT use this when you need the result before you can reply — use delegate_task instead.',
-        '',
-        'Example call shape (note: tools is an ARRAY of strings):',
+        'Example call:',
         '  {',
         '    "worker": "saruman",',
         '    "task": "Brief on the post-quantum crypto landscape, 5 angles, primary sources only.",',
@@ -182,7 +174,7 @@ export const spawnBackgroundTaskTool = defineTool({
         const wiring = validateWiring(cfg);
         if (typeof wiring === 'string') return wiring;
 
-        const { registry, eventQueue, buildSubAgent, depth, logger, taskStore, threadId } = wiring;
+        const { registry, eventQueue, buildSubAgent, depth, chain, logger, taskStore, threadId } = wiring;
 
         const taskPreview = args.task.length > 160
             ? args.task.slice(0, 157) + '…'
@@ -202,13 +194,19 @@ export const spawnBackgroundTaskTool = defineTool({
             return `spawn_background_task: max delegation depth (${MAX_DELEGATION_DEPTH}) reached. Handle this task directly.`;
         }
 
+        if (chain.includes(args.worker)) {
+            return `spawn_background_task: loop detected — ${args.worker} already in chain [${chain.join(' → ')}]. Handle directly.`;
+        }
+
         const runner = buildSubAgent(args.worker);
         if (!runner) {
             return `spawn_background_task: unknown worker "${args.worker}". Ensure it exists in the team and is enabled.`;
         }
 
-        const timeoutMs = args.timeoutMs ?? DEFAULT_SPAWN_TIMEOUT_MS;
-        return launch(args, { registry, eventQueue, runner, depth, logger, timeoutMs, taskStore, threadId });
+        // Cast to the post-transform shape (TS infers the pre-transform union).
+        const coerced = args as unknown as SpawnArgs;
+        const timeoutMs = coerced.timeoutMs ?? DEFAULT_SPAWN_TIMEOUT_MS;
+        return launch(coerced, { registry, eventQueue, runner, depth, chain, logger, timeoutMs, taskStore, threadId });
     },
 });
 
@@ -217,6 +215,7 @@ interface Wiring {
     eventQueue: BackgroundEventSink;
     buildSubAgent: SubAgentFactory;
     depth: number;
+    chain: string[];
     logger: SpawnBackgroundTaskConfigurable['logger'];
     taskStore: BackgroundTaskStore | undefined;
     threadId: string | undefined;
@@ -239,6 +238,7 @@ function validateWiring(
         eventQueue: cfg.eventQueue,
         buildSubAgent: cfg.buildSubAgent,
         depth: cfg.depth ?? 0,
+        chain: cfg.spawnChain ?? [],
         logger: cfg.logger,
         taskStore: cfg.taskStore,
         threadId: cfg.threadId,
@@ -252,13 +252,14 @@ function launch(
         eventQueue: BackgroundEventSink;
         runner: SubAgentRunner;
         depth: number;
+        chain: string[];
         logger: SpawnBackgroundTaskConfigurable['logger'];
         timeoutMs: number;
         taskStore: BackgroundTaskStore | undefined;
         threadId: string | undefined;
     },
 ): string {
-    const { registry, eventQueue, runner, depth, logger, timeoutMs, taskStore, threadId } = deps;
+    const { registry, eventQueue, runner, depth, chain, logger, timeoutMs, taskStore, threadId } = deps;
 
     const descriptionLabel =
         args.description ?? truncate(args.task, 80);
@@ -268,13 +269,14 @@ function launch(
         workerName: args.worker,
         description: descriptionLabel,
         depth: depth + 1,
+        spawnChain: [...chain, args.worker],
     });
 
     registry.register(task);
     const running = toRunning(task);
     if (running.ok) registry.replace(running.task);
 
-    // Persist BEFORE the detached promise fires so a crash mid-spawn leaves a recoverable trail.
+    // Persist BEFORE the detached promise fires so a crash mid-spawn is recoverable.
     if (taskStore && threadId) {
         try {
             taskStore.recordBackgroundTask({
@@ -284,7 +286,7 @@ function launch(
                 taskPrompt: args.task,
                 toolAllowlist: args.tools ?? null,
                 timeoutMs,
-                deliveryMode: null, // delivery_mode is determined at the receiving channel-worker, not the spawn site
+                deliveryMode: null, // determined by the receiving channel-worker
                 status: 'running',
                 createdAt: Date.now(),
                 endedAt: null,
@@ -310,7 +312,7 @@ function launch(
         completedAt: Date.now(),
     });
 
-    // Aborts the WHOLE abort controller so the runner's LLM call sees signal.aborted.
+    // Aborts the whole controller so the runner's LLM call sees signal.aborted.
     const timeoutTimer = setTimeout(() => {
         logger?.warn?.(
             { taskId: task.id, worker: args.worker, timeoutMs },
@@ -332,6 +334,8 @@ function launch(
         timeoutTimer,
         taskStore,
         outputFile: args.outputFile,
+        spawnChain: [...chain, args.worker],
+        depth: depth + 1,
     });
 
     logger?.info?.(
@@ -361,6 +365,8 @@ async function runInBackground(args: {
     timeoutTimer: NodeJS.Timeout;
     taskStore: BackgroundTaskStore | undefined;
     outputFile: string | undefined;
+    spawnChain: string[];
+    depth: number;
 }): Promise<void> {
     const { taskId, workerName, registry, eventQueue, runner, logger, timeoutTimer, taskStore, outputFile } = args;
     const startedAt = Date.now();
@@ -390,6 +396,8 @@ async function runInBackground(args: {
             task: args.taskPrompt,
             toolAllowlist: args.toolAllowlist,
             signal: args.abortSignal,
+            depth: args.depth,
+            spawnChain: args.spawnChain,
         });
 
         let deliveredResult = result;
@@ -397,7 +405,14 @@ async function runInBackground(args: {
             try {
                 mkdirSync(dirname(outputFile), { recursive: true });
                 writeFileSync(outputFile, result, 'utf8');
-                deliveredResult = `Output written to ${outputFile} (${result.length} chars). Read it with read_file.`;
+                // Inline alongside the file write when small enough; small models otherwise
+                // just say "task done, read the file" and never surface the body.
+                const INLINE_THRESHOLD = 16_000;
+                if (result.length > INLINE_THRESHOLD) {
+                    deliveredResult = `Output written to ${outputFile} (${result.length} chars — too large to inline). Read it with read_file before replying to the user.`;
+                } else {
+                    deliveredResult = `${result}\n\n_(Full output also saved to ${outputFile} for later reference.)_`;
+                }
             } catch (writeErr) {
                 logger?.warn?.(
                     {
@@ -416,7 +431,7 @@ async function runInBackground(args: {
             if (done.ok) registry.replace(done.task);
         }
 
-        // Persist BEFORE eventQueue.push so a crash between the two doesn't strand the row as `running`.
+        // Persist BEFORE eventQueue.push so a crash between the two doesn't strand `running`.
         persistStatus('completed', { result: deliveredResult });
 
         eventQueue.push({

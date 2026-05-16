@@ -8,7 +8,8 @@ import type {
     WebhookChannel,
 } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
-import { isSafeMediaUrl, verifyWebhookSignature } from '@gateway/core/security';
+import { verifyWebhookSignature } from '@gateway/core/security';
+import { resolveMediaSource } from '@gateway/core/media-resolver';
 import type { LineChannelConfig } from './types';
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
@@ -83,24 +84,51 @@ export class LineChannel extends BaseChannel implements WebhookChannel {
 
         if (message.media?.length) {
             for (const media of message.media) {
-                if (!isSafeMediaUrl(media.url)) continue;
+                const resolved = await resolveMediaSource(media);
+                if (!resolved.ok) {
+                    this.log.warn(
+                        { to, mediaType: media.type, mediaUrl: media.url, reason: resolved.reason, detail: resolved.detail, op: 'send:media:rejected' },
+                        'line send: media resolution failed — skipping attachment',
+                    );
+                    continue;
+                }
+                // Line's messaging API ONLY accepts public HTTPS URLs for
+                // image/video/audio (no inline upload, no file path). If
+                // the agent gave us a local path or a base64 buffer we
+                // can't deliver it — log a clear reason instead of silently
+                // dropping. Future improvement: stage local files to a
+                // public URL via a CDN or the gateway's webhook host.
+                if (resolved.source.kind !== 'remote-url') {
+                    this.log.warn(
+                        {
+                            to,
+                            mediaType: media.type,
+                            sourceKind: resolved.source.kind,
+                            reason: 'line-requires-public-https',
+                            op: 'send:media:rejected',
+                        },
+                        'line send: media must be a public HTTPS URL — local paths and inline data not supported. Stage to a CDN first.',
+                    );
+                    continue;
+                }
+                const url = resolved.source.url.toString();
                 switch (media.type) {
                     case 'image':
                         messages.push({
                             type: 'image',
-                            originalContentUrl: media.url ?? '',
-                            previewImageUrl: media.url ?? '',
+                            originalContentUrl: url,
+                            previewImageUrl: url,
                         });
                         break;
                     case 'video':
                         messages.push({
                             type: 'video',
-                            originalContentUrl: media.url ?? '',
-                            previewImageUrl: media.url ?? '',
+                            originalContentUrl: url,
+                            previewImageUrl: url,
                         });
                         break;
                     case 'audio':
-                        messages.push({ type: 'audio', originalContentUrl: media.url ?? '' });
+                        messages.push({ type: 'audio', originalContentUrl: url });
                         break;
                     default:
                         if (media.fileName) {
@@ -122,7 +150,8 @@ export class LineChannel extends BaseChannel implements WebhookChannel {
 
     async sendTyping(_peer: Peer): Promise<void> {}
 
-    // LINE has no bot-side reactions API (@line/bot-sdk 10.x).
+    /** No-op — the LINE Messaging API does not expose a bot-side reactions
+     *  endpoint as of @line/bot-sdk 10.x. Not advertised in capabilities. */
     async react(_options: ReactionOptions): Promise<void> {}
 
     async handleWebhookEvent(event: {
@@ -169,14 +198,34 @@ export class LineChannel extends BaseChannel implements WebhookChannel {
             try {
                 const stream = await this.blobClient.getMessageContent(m.id);
                 const chunks: Buffer[] = [];
+                let totalBytes = 0;
+                let overLimit = false;
+                // Stream-check the running total per chunk instead of
+                // buffering the whole image then checking. A malicious
+                // or just-large 50 MB image would otherwise sit fully
+                // in RAM before the MAX_IMAGE_BYTES check rejected it.
+                // We accumulate up to MAX_IMAGE_BYTES + one chunk, then
+                // mark overLimit and stop collecting (still drain the
+                // stream so the upstream isn't left hanging).
                 for await (const chunk of stream as AsyncIterable<Buffer>) {
+                    totalBytes += chunk.length;
+                    if (totalBytes > MAX_IMAGE_BYTES) {
+                        overLimit = true;
+                        chunks.length = 0;
+                        // Destroy the upstream so we stop pulling bytes
+                        // immediately instead of draining the rest.
+                        (stream as unknown as { destroy?: (err?: Error) => void }).destroy?.(
+                            new Error('over MAX_IMAGE_BYTES'),
+                        );
+                        break;
+                    }
                     chunks.push(chunk);
                 }
-                const buffer = Buffer.concat(chunks);
-                if (buffer.length <= MAX_IMAGE_BYTES) {
-                    media.push({ type: 'image', data: buffer.toString('base64'), mimeType: 'image/jpeg' });
-                } else {
+                if (overLimit) {
                     media.push({ type: 'image' });
+                } else {
+                    const buffer = Buffer.concat(chunks);
+                    media.push({ type: 'image', data: buffer.toString('base64'), mimeType: 'image/jpeg' });
                 }
             } catch {
                 media.push({ type: 'image' });

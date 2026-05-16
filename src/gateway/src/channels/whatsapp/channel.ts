@@ -82,15 +82,21 @@ export class WhatsAppChannel extends BaseChannel {
             });
 
             this.socket.ev.on('messages.upsert', async ({ messages }) => {
-                for (const msg of messages) {
+                // Process the batch in parallel via Promise.allSettled.
+                // Previously the for-loop awaited downloadMediaMessage
+                // serially — a burst of 10 images stalled subsequent
+                // text-only messages behind 10 sequential downloads.
+                // Per-message try/catch (existing) prevents one failure
+                // from breaking the rest.
+                await Promise.allSettled(messages.map(async (msg) => {
                     try {
-                        if (!msg.message || msg.key.fromMe) continue;
+                        if (!msg.message || msg.key.fromMe) return;
 
                         const senderId = msg.key.remoteJid ?? '';
                         const isGroup = senderId.endsWith('@g.us');
                         const peerType = isGroup ? ('group' as const) : ('user' as const);
 
-                        if (!this.isAllowed(senderId, peerType)) continue;
+                        if (!this.isAllowed(senderId, peerType)) return;
 
                         // Map insertion-order eviction → LRU-ish.
                         if (msg.key.id) {
@@ -147,7 +153,7 @@ export class WhatsAppChannel extends BaseChannel {
                             if (!body) { body = '[Video]'; synthetic = true; }
                         }
 
-                        if (!body && media.length === 0) continue;
+                        if (!body && media.length === 0) return;
 
                         await this.emit('onMessage', {
                             id: msg.key.id ?? '',
@@ -164,11 +170,22 @@ export class WhatsAppChannel extends BaseChannel {
                     } catch (err) {
                         this.emitError(toError(err));
                     }
-                }
+                }));
             });
         } catch (err) {
             this.setStatus('error');
             this.emitError(toError(err));
+            // Socket leak guard: if makeWASocket returned but a later
+            // call (listener setup, auth load) threw, the socket
+            // reference is held on `this.socket` but never end()-ed.
+            // Subsequent reconnects build another one alongside, slowly
+            // accumulating open Noise handlers until the process OOMs.
+            if (this.socket) {
+                try {
+                    (this.socket as { end?: (err?: unknown) => void }).end?.(undefined);
+                } catch { /* best-effort */ }
+                this.socket = null;
+            }
         } finally {
             this.connecting = false;
         }

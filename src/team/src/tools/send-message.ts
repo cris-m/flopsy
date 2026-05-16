@@ -15,6 +15,14 @@ export interface SendMessageReplyOptions {
         readonly fileName?: string;
         readonly caption?: string;
     }>;
+    /**
+     * When true, attempt to thread this message as a reply to the user's
+     * latest message (Telegram quote-reply, Discord reply, etc.). Channels
+     * that don't support it ignore the flag. The default is false because
+     * quote-reply is visual noise in DMs and only useful in groups or for
+     * disambiguating which question a long answer is replying to.
+     */
+    readonly quoteUserMessage?: boolean;
 }
 
 export interface SendMessageConfigurable {
@@ -85,8 +93,14 @@ export const sendMessageTool = defineTool({
             .describe(
                 'Media attachments (images, videos, audio, documents). Each item must have either `url` OR `data`. Channels that support media (Telegram, Discord, WhatsApp, Signal) upload natively. For polls use `send_poll` — this field is only for file/media attachments.',
             ),
+        replyTo: z
+            .boolean()
+            .optional()
+            .describe(
+                "Set true to thread this message as a quote-reply to the user's last message (Telegram quote, Discord reply, etc.). Only useful in groups or to disambiguate which question a long answer is replying to. Default false — DMs and short replies look better as plain messages. Channels without reply support ignore this flag silently.",
+            ),
     }),
-    execute: async ({ text, buttons, media }, ctx) => {
+    execute: async ({ text, buttons, media, replyTo }, ctx) => {
         const cfg = (ctx.configurable ?? {}) as Partial<SendMessageConfigurable>;
         const onReply = cfg.onReply;
         const setDidSendViaTool = cfg.setDidSendViaTool;
@@ -96,7 +110,13 @@ export const sendMessageTool = defineTool({
         }
 
         try {
-            const options = buttons || media ? { buttons, media } : undefined;
+            const options = (buttons || media || replyTo)
+                ? {
+                    ...(buttons ? { buttons } : {}),
+                    ...(media ? { media } : {}),
+                    ...(replyTo ? { quoteUserMessage: true } : {}),
+                }
+                : undefined;
             await onReply(text, options);
         } catch (err) {
             return `send_message: delivery failed: ${err instanceof Error ? err.message : String(err)}`;

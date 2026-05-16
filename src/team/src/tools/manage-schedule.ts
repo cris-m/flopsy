@@ -2,7 +2,12 @@
 
 import { z } from 'zod';
 import { defineTool } from 'flopsygraph';
-import { copyPromptFile, type HeartbeatDefinitionConfig, type JobDefinitionConfig } from '@flopsy/shared';
+import {
+    copyPromptFile,
+    type HeartbeatDefinitionConfig,
+    type JobDefinitionConfig,
+    validateExternalPromptFile,
+} from '@flopsy/shared';
 import { getScheduleFacade, type ScheduleFacade } from './schedule-registry';
 
 const schema = z.object({
@@ -183,9 +188,10 @@ requires delete+create).`,
                 if (!args.prompt && !args.promptFile) {
                     return 'Missing prompt: provide either `prompt` or `promptFile`.';
                 }
+                // promptFile is LLM-driven; validateExternalPromptFile rejects /etc /proc
+                // /sys /dev /var and null bytes before copyPromptFile touches the fs.
 
-                // Pre-generate the schedule id so we can name the workspace
-                // copy `<id>-<basename>` before creating the schedule row.
+                // Pre-generate the id so we can name the workspace copy `<id>-<basename>`.
                 const scheduleId =
                     args.scheduleType === 'heartbeat'
                         ? (args.id ?? `runtime-hb-${args.name ?? Date.now()}`)
@@ -194,9 +200,11 @@ requires delete+create).`,
                 // Copy absolute promptFile paths into the workspace.
                 let resolvedPromptFile = args.promptFile;
                 if (args.promptFile?.startsWith('/')) {
+                    const pfCheck = validateExternalPromptFile(args.promptFile);
+                    if (!pfCheck.ok) return pfCheck.error;
                     try {
                         resolvedPromptFile = await copyPromptFile(
-                            args.promptFile,
+                            pfCheck.path,
                             scheduleId,
                             args.scheduleType,
                         );
@@ -224,9 +232,11 @@ requires delete+create).`,
 
                 let resolvedPromptFile = args.promptFile;
                 if (args.promptFile?.startsWith('/')) {
+                    const pfCheck = validateExternalPromptFile(args.promptFile);
+                    if (!pfCheck.ok) return pfCheck.error;
                     try {
                         resolvedPromptFile = await copyPromptFile(
-                            args.promptFile,
+                            pfCheck.path,
                             args.id,
                             existing.kind,
                         );
@@ -259,6 +269,8 @@ function createHeartbeat(args: Args, facade: NonNullable<ReturnType<typeof getSc
         prompt: args.prompt ?? '',
         deliveryMode: args.deliveryMode ?? 'always',
         oneshot: args.oneshot ?? false,
+        // Explicit so the Zod-inferred type (defaulted fields read as required) is satisfied.
+        noAgent: false,
         ...(args.promptFile ? { promptFile: args.promptFile } : {}),
         ...(typeof args.activeHoursStart === 'number' && typeof args.activeHoursEnd === 'number'
             ? { activeHours: { start: args.activeHoursStart, end: args.activeHoursEnd } }
@@ -289,7 +301,7 @@ function createCronJob(args: Args, facade: NonNullable<ReturnType<typeof getSche
         };
     }
 
-    // Re-using args.id here keeps id and copied promptFile path in sync.
+    // Reuse args.id so id and copied promptFile path stay in sync.
     const id = args.id ?? `runtime-cron-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const job: JobDefinitionConfig = {
         id,
@@ -299,6 +311,7 @@ function createCronJob(args: Args, facade: NonNullable<ReturnType<typeof getSche
         payload: {
             deliveryMode: args.deliveryMode ?? 'always',
             oneshot: args.oneshot ?? false,
+            noAgent: false,
             ...(args.prompt ? { message: args.prompt } : {}),
             ...(args.promptFile ? { promptFile: args.promptFile } : {}),
         },
@@ -322,7 +335,7 @@ function updateHeartbeat(
         return `Stored config for "${id}" is malformed JSON — cannot update; delete and recreate.`;
     }
 
-    // prompt and promptFile are mutually exclusive — supplying one clears the other.
+    // prompt and promptFile are mutually exclusive.
     const swapToInline = patch.prompt !== undefined;
     const swapToFile = patch.promptFile !== undefined;
 
@@ -357,7 +370,6 @@ function updateCronJob(
         return `Stored config for "${id}" is malformed JSON — cannot update; delete and recreate.`;
     }
 
-    // Schedule patch — the user picks one cronKind; we ignore the others.
     let nextSchedule: JobDefinitionConfig['schedule'] = current.schedule;
     if (patch.cronKind === 'at') {
         if (typeof patch.atMs !== 'number') return 'cronKind="at" requires atMs (absolute epoch ms).';
@@ -378,7 +390,7 @@ function updateCronJob(
         nextSchedule = { ...current.schedule, tz: patch.cronTz };
     }
 
-    // Payload patch — same prompt/promptFile swap rule as heartbeats.
+    // Same prompt/promptFile swap rule as heartbeats.
     const swapToInline = patch.prompt !== undefined;
     const swapToFile = patch.promptFile !== undefined;
     const nextPayload: JobDefinitionConfig['payload'] = {

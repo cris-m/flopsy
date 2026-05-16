@@ -49,8 +49,8 @@ export function registerModelCommand(root: Command): void {
             console.log(dim(`wrote ${file}`));
         });
 
-    // Default: `flopsy model` with no subcommand → list
-    model.action(() => renderList());
+    // Default: `flopsy model` with no subcommand → show help.
+    model.action((_opts: unknown, cmd: { outputHelp(): void }) => cmd.outputHelp());
 }
 
 /** Extended agent shape — reads optional provider-tier fields that aren't

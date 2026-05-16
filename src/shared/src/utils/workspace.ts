@@ -47,14 +47,8 @@ export function resolveWorkspacePath(...parts: string[]): string {
 }
 
 /**
- * Bootstrap-time helper: if `FLOPSY_HOME` is set and RELATIVE (neither
- * absolute nor tilde-prefixed), rewrite it in `process.env` so every
- * downstream `resolveFlopsyHome()` / `workspace.*` call sees an
- * absolute path. Callers pass the dir that relative paths should
- * anchor to — usually the directory containing `flopsy.json5`.
- *
- * Returns the resolved absolute home (whatever `resolveFlopsyHome`
- * would now return). Safe to call more than once; idempotent.
+ * Bootstrap-time: rewrite a RELATIVE `FLOPSY_HOME` in `process.env` to absolute,
+ * anchored against `anchorDir` (usually the flopsy.json5 directory). Idempotent.
  */
 export function primeFlopsyHome(anchorDir: string): string {
     const override = process.env.FLOPSY_HOME?.trim();
@@ -65,10 +59,7 @@ export function primeFlopsyHome(anchorDir: string): string {
     return resolveFlopsyHome();
 }
 
-/**
- * Ensure a directory exists. Called by components that need to write.
- * Pure readers never call this — they just resolve paths.
- */
+/** Create the directory if absent; pure readers don't call this. */
 export function ensureDir(dir: string): string {
     if (!existsSync(dir)) {
         mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -77,32 +68,17 @@ export function ensureDir(dir: string): string {
 }
 
 /**
- * Create a workspace path accessor bound to a specific environment.
+ * Workspace path accessor bound to a specific environment. All accessors are
+ * pure path resolution; writers call `ensureDir()` on the resolved path.
  *
- * All accessors are pure path resolution — no filesystem side effects.
- * Components that write call `ensureDir()` on the path they need.
- *
- * @param env - Environment variables to resolve paths from. Defaults to
- *              `process.env`, but tests can pass a plain object to avoid
- *              mutating the real process environment.
+ * Layout under <HOME>: config/, content/{skills,roles,prompts}, state/*.db,
+ * cache/, auth/ (0700), logs/, work/{audio,video,code,images,docs,exports,scratch},
+ * gateway.pid.
  */
 export function createWorkspace(env: NodeJS.ProcessEnv = process.env) {
     const home = () => resolveFlopsyHome(env);
     const sub = (...parts: string[]) => join(home(), ...parts);
 
-    /**
-     * Workspace layout:
-     *
-     *   <HOME>/
-     *     config/         — human-edited config (flopsy.json5, SOUL.md, AGENTS.md, personalities.yaml)
-     *     content/        — human-authored prompts/skills (skills/, roles/, prompts/)
-     *     state/          — machine-managed databases (proactive.db, memory.db,
-     *                        checkpoints.db, learning.db, *.json snapshots)
-     *     cache/          — regenerable artifacts (tool-outputs/, worker-outputs/)
-     *     auth/           — credentials (mode 0o700)
-     *     logs/           — rotating log files
-     *     gateway.pid     — daemon PID
-     */
     return {
         /** Workspace root (e.g. ~/.flopsy) */
         root: home,
@@ -111,8 +87,11 @@ export function createWorkspace(env: NodeJS.ProcessEnv = process.env) {
         config:        (...parts: string[]) => sub('config', ...parts),
         content:       (...parts: string[]) => sub('content', ...parts),
         skills:        () => sub('content', 'skills'),
+        /** Bundled-but-inactive skills; `flopsy skill install <name>` activates by copying into skills/. */
+        skillsOptional: () => sub('content', 'skills-optional'),
         roles:         () => sub('content', 'roles'),
         prompts:       (...parts: string[]) => sub('content', 'prompts', ...parts),
+        hooks:         (...parts: string[]) => sub('content', 'hooks', ...parts),
 
         // Authoritative config file path — `loadConfig()` reads from here.
         configFile:    () => sub('config', 'flopsy.json5'),
@@ -133,10 +112,31 @@ export function createWorkspace(env: NodeJS.ProcessEnv = process.env) {
         toolOutputs:   () => sub('cache', 'tool-outputs'),
         workerOutputs: () => sub('cache', 'worker-outputs'),
 
+        // The sandbox bind-mounts <HOME> as /workspace; paths under work/ map directly.
+        work:          (...parts: string[]) => sub('work', ...parts),
+        workAudio:     (...parts: string[]) => sub('work', 'audio', ...parts),
+        workVideo:     (...parts: string[]) => sub('work', 'video', ...parts),
+        workCode:      (...parts: string[]) => sub('work', 'code', ...parts),
+        workImages:    (...parts: string[]) => sub('work', 'images', ...parts),
+        workDocs:      (...parts: string[]) => sub('work', 'docs', ...parts),
+        workExports:   (...parts: string[]) => sub('work', 'exports', ...parts),
+        workScratch:   (...parts: string[]) => sub('work', 'scratch', ...parts),
+
         /** <os.tmpdir()>/flopsy-scratch — outside FLOPSY_HOME on purpose. */
         scratch:       () => join(tmpdir(), 'flopsy-scratch'),
     };
 }
+
+/** Subdirs under <HOME>/work the agent uses to organise outputs (iterable by bootstrap). */
+export const WORK_SUBDIRS = [
+    'audio',
+    'video',
+    'code',
+    'images',
+    'docs',
+    'exports',
+    'scratch',
+] as const;
 
 /** Default workspace bound to `process.env`. */
 export const workspace = createWorkspace();

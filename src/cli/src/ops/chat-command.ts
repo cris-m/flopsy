@@ -1,9 +1,10 @@
 import { type Command } from 'commander';
 import { userInfo } from 'node:os';
-import { mgmtUrl } from './schedule-client';
+import { loadMgmtToken } from '@flopsy/shared';
+import { managementUrl } from './schedule-client';
 import { ChatTUI } from '../ui/chat-tui';
 
-// Wire-protocol types (mirror gateway/src/mgmt/chat-handler.ts — no cross-package import needed)
+// Wire-protocol types (mirror gateway/src/management/chat-handler.ts — no cross-package import needed)
 type AgentChunk =
     | { type: 'text_delta';  text: string }
     | { type: 'thinking';    text: string }
@@ -32,19 +33,157 @@ const RECONNECT_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
 const MAX_PENDING_MESSAGES = 50;
 
 export function registerChatCommand(program: Command): void {
-    program
+    const chat = program
         .command('chat')
-        .description('interactive chat with FlopsyBot in the terminal')
+        .description('chat with FlopsyBot (interactive TUI by default; `chat send` for one-shot)')
         .option('--model <name>', 'override model label shown in header')
         .action(async (opts: { model?: string }) => {
             await runChat(opts.model);
         });
+
+    chat
+        .command('send <text...>')
+        .description(
+            'send one message non-interactively. streams the reply to stdout, exits on done. ' +
+            'useful for scripting + automation (e.g. verifying commitments extraction).',
+        )
+        .option('--peer <id>', 'override peer id (default: $USER). routes to a specific chat thread.')
+        .option('--quiet', 'suppress streaming output; only print the final reply')
+        .option('--timeout <seconds>', 'abort if no `done` event by this deadline (default 120)')
+        .action(
+            async (
+                textParts: string[],
+                opts: { peer?: string; quiet?: boolean; timeout?: string },
+            ) => {
+                const text = textParts.join(' ').trim();
+                if (!text) {
+                    process.stderr.write('error: empty message\n');
+                    process.exit(2);
+                }
+                const timeoutMs = Math.max(
+                    1000,
+                    (parseInt(opts.timeout ?? '', 10) || 120) * 1000,
+                );
+                await sendOneShot(text, {
+                    peer: opts.peer,
+                    quiet: !!opts.quiet,
+                    timeoutMs,
+                });
+            },
+        );
+}
+
+/**
+ * One-shot chat: open the management WebSocket, send one message, stream
+ * the reply, exit. Used by automation/scripting and by E1-verify
+ * (commitments extraction round-trip). Exit code:
+ *   0 — agent emitted `done`
+ *   2 — empty input
+ *   3 — timed out before `done`
+ *   4 — ws closed before ready / server error event
+ *   5 — ws connect/transport error
+ */
+async function sendOneShot(
+    text: string,
+    opts: { peer?: string; quiet: boolean; timeoutMs: number },
+): Promise<void> {
+    const wsUrl = managementUrl('/chat').replace(/^http/, 'ws');
+    const peerId =
+        opts.peer ?? (() => { try { return userInfo().username; } catch { return 'local'; } })();
+    const token = loadMgmtToken();
+
+    const fullUrl =
+        `${wsUrl}?user=${encodeURIComponent(peerId)}` +
+        (token ? `&token=${encodeURIComponent(token)}` : '');
+
+    let replyBuf = '';
+    let gotReady = false;
+    let exitCode = 0;
+
+    await new Promise<void>((resolve) => {
+        const ws = new WebSocket(fullUrl);
+        const timer = setTimeout(() => {
+            process.stderr.write(
+                `\n[chat send] timeout after ${Math.round(opts.timeoutMs / 1000)}s\n`,
+            );
+            exitCode = 3;
+            try { ws.close(); } catch { /* ignore */ }
+            resolve();
+        }, opts.timeoutMs);
+
+        ws.addEventListener('open', () => {
+            // Wait for `ready` before sending — the channel registers the
+            // peer on connection; sending immediately would race that.
+        });
+
+        ws.addEventListener('message', (e: MessageEvent) => {
+            let ev: ServerEvent;
+            try { ev = JSON.parse(String(e.data)) as ServerEvent; } catch { return; }
+
+            if (ev.type === 'ready') {
+                gotReady = true;
+                if (!opts.quiet) {
+                    process.stderr.write(`[chat send] thread=${ev.threadId} model=${ev.model ?? '?'}\n`);
+                }
+                const msg: ClientMessage = { type: 'message', text };
+                ws.send(JSON.stringify(msg));
+                return;
+            }
+
+            if (ev.type === 'chunk') {
+                const c = ev.chunk;
+                if (c.type === 'text_delta') {
+                    replyBuf += c.text;
+                    if (!opts.quiet) process.stdout.write(c.text);
+                }
+                return;
+            }
+
+            if (ev.type === 'done') {
+                if (opts.quiet) {
+                    process.stdout.write((ev.text ?? replyBuf) + '\n');
+                } else {
+                    process.stdout.write('\n');
+                }
+                clearTimeout(timer);
+                try { ws.close(); } catch { /* ignore */ }
+                resolve();
+                return;
+            }
+
+            if (ev.type === 'error') {
+                process.stderr.write(`\n[chat send] server error: ${ev.message}\n`);
+                exitCode = 4;
+                clearTimeout(timer);
+                try { ws.close(); } catch { /* ignore */ }
+                resolve();
+                return;
+            }
+        });
+
+        ws.addEventListener('close', () => {
+            if (!gotReady) {
+                process.stderr.write('[chat send] ws closed before ready (gateway not running?)\n');
+                exitCode = 4;
+                clearTimeout(timer);
+                resolve();
+            }
+        });
+
+        ws.addEventListener('error', () => {
+            // The 'close' handler runs right after with a useful message;
+            // suppress this one to avoid double-printing.
+            exitCode = 5;
+        });
+    });
+
+    process.exit(exitCode);
 }
 
 async function runChat(modelOverride?: string): Promise<void> {
-    const wsUrl = mgmtUrl('/chat').replace(/^http/, 'ws');
+    const wsUrl = managementUrl('/chat').replace(/^http/, 'ws');
     const username = (() => { try { return userInfo().username; } catch { return 'local'; } })();
-    const token = process.env['FLOPSY_MGMT_TOKEN'];
+    const token = loadMgmtToken();
 
     const fullUrl = `${wsUrl}?user=${encodeURIComponent(username)}` +
         (token ? `&token=${encodeURIComponent(token)}` : '');
@@ -81,7 +220,7 @@ async function runChat(modelOverride?: string): Promise<void> {
     };
 
     tui = new ChatTUI({
-        onSend(text) {
+        onSend({ display, expanded, pastes }) {
             tui.setCwd(process.cwd());
             // Detect git branch (lightweight, cached in global)
             try {
@@ -93,8 +232,9 @@ async function runChat(modelOverride?: string): Promise<void> {
                 else (globalThis as any).__flopsyGitBranch = '';
             } catch { (globalThis as any).__flopsyGitBranch = ''; }
 
-            // Handle local slash commands
-            const trimmed = text.trim();
+            // Handle local slash commands. Slash commands don't carry pastes,
+            // so display === expanded — either is fine here.
+            const trimmed = expanded.trim();
             if (trimmed === '/exit' || trimmed === '/quit') {
                 quitting = true;
                 if (reconnectTimer) clearTimeout(reconnectTimer);
@@ -132,9 +272,13 @@ async function runChat(modelOverride?: string): Promise<void> {
                 return;
             }
             textBuf = '';
-            tui.addUserMessage(text);
+            // Display the collapsed form (with `[Pasted text #N]` tags) in
+            // chat history, but send the FULL expanded text to the agent.
+            // `pastes` is the id→content map so Ctrl+O can later expand the
+            // placeholders shown in history.
+            tui.addUserMessage(display, pastes);
             tui.setStreaming(true);
-            send({ type: 'message', text });
+            send({ type: 'message', text: expanded });
         },
         onInterrupt() {
             send({ type: 'interrupt' });

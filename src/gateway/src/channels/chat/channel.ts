@@ -11,6 +11,7 @@ export type ChatWsEvent =
     | { type: 'chunk'; chunk: AgentChunk }
     | { type: 'task'; event: 'start' | 'progress' | 'complete' | 'error'; taskId: string; description?: string; result?: string; error?: string }
     | { type: 'done'; text: string | null; usage?: { input: number; output: number; reasoning?: number; cached?: number; contextTokens?: number; contextLimit?: number } }
+    | { type: 'compaction'; threadId: string; tokensBefore: number; tokensAfter: number; threshold: number; strategy: 'clear-tools' | 'summarize' | 'both'; durationMs: number }
     | { type: 'error'; message: string };
 
 export type ChatSendFn = (event: ChatWsEvent) => void;
@@ -37,6 +38,13 @@ export class ChatChannel extends BaseChannel {
     /** Store token + context usage for a peer to be sent with the next done event. */
     setPeerUsage(peerId: string, usage: { input: number; output: number; reasoning?: number; cached?: number; contextTokens?: number; contextLimit?: number }): void {
         this.pendingUsage.set(peerId, usage);
+    }
+
+    /** Push a compaction event live to the peer's TUI. */
+    notifyCompaction(peerId: string, event: { threadId: string; tokensBefore: number; tokensAfter: number; threshold: number; strategy: 'clear-tools' | 'summarize' | 'both'; durationMs: number }): void {
+        const session = this.peers.get(peerId);
+        if (!session || session.ws.readyState !== WS_OPEN) return;
+        session.send({ type: 'compaction', ...event });
     }
 
     /** Returns the active main-agent model name, when known. */

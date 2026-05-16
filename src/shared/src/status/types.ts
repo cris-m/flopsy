@@ -3,7 +3,7 @@
  *
  * Two producers populate it:
  *   - `flopsy status` CLI reads config from disk + optionally fetches live
- *     data from the gateway mgmt HTTP endpoint.
+ *     data from the gateway management HTTP endpoint.
  *   - The slash `/status` handler in the gateway reads directly from the
  *     in-memory engine — no HTTP hop.
  *

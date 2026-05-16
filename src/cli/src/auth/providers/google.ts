@@ -33,14 +33,30 @@ const DEFAULT_SCOPES: readonly string[] = [
 ];
 
 // Every scope here MUST be on Google's device-flow allowlist AND on the consent screen.
+//
+// Empirically verified 2026-05-12 against client `765258968732-ps76a3b...`:
+//   - All Gmail scopes return `invalid_scope` from /device/code, regardless of
+//     consent-screen config. Gmail is a sensitive scope that Google blocks
+//     from the device-flow client type — needs full app verification + a
+//     non-device client. So Gmail is intentionally NOT here.
+//   - Drive: only `drive.file` (per-file, narrow) works. `drive`, `drive.readonly`,
+//     `drive.metadata.readonly` all return `invalid_scope`.
+//   - YouTube: `youtube`, `youtube.readonly`, `youtube.upload` all work.
+//     `youtube.force-ssl` is blocked.
+//   - Calendar: `auth/calendar` works.
 const DEVICE_FLOW_SCOPES: readonly string[] = [
     'openid',
     'email',
     'profile',
-    'https://www.googleapis.com/auth/gmail.readonly',
-    'https://www.googleapis.com/auth/gmail.send',
     'https://www.googleapis.com/auth/calendar',
     'https://www.googleapis.com/auth/drive.file',
+    'https://www.googleapis.com/auth/youtube',
+    'https://www.googleapis.com/auth/youtube.readonly',
+    // NOT included — Google rejects via device flow with this client:
+    //   gmail.readonly, gmail.send, gmail.modify, gmail.compose, gmail.metadata,
+    //   drive (broad), drive.readonly, drive.metadata.readonly, youtube.force-ssl
+    // For Gmail access, use the web-flow path (GOOGLE_CLIENT_ID web client),
+    // which doesn't have device-flow's scope restrictions.
 ];
 
 function requireClientId(): string {

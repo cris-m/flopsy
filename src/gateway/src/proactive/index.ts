@@ -8,6 +8,23 @@ export { JobExecutor, parseConditionalResponse } from './pipeline/executor';
 export { HeartbeatTrigger } from './triggers/heartbeat';
 export { CronTrigger } from './triggers/cron';
 export { ChannelHealthMonitor } from './health/monitor';
+// New proactive decision schema (commit 2 of the structured-output rework).
+// Baked into the React planner via `outputSchema` so structured output is
+// guaranteed in-loop, no post-hoc reformatter needed.
+export {
+    ProactiveDecisionSchema,
+    DeliverCategory,
+    SilenceReason,
+    CitationSchema,
+    ReportedIdsSchema,
+} from './types';
+export type {
+    ProactiveDecision,
+    DeliverCategoryT,
+    SilenceReasonT,
+    Citation,
+    ReportedIds,
+} from './types';
 export type {
     CronSchedule,
     DeliveryMode,
@@ -25,7 +42,6 @@ export type {
     UserPresence,
     RetryTask,
     ProactiveState,
-    RunHistoryEntry,
     ChannelHealthConfig,
     ChannelChecker,
     ChannelSender,

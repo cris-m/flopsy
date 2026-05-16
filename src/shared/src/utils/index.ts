@@ -9,6 +9,12 @@ export {
     type WorkspacePathResolver,
 } from './workspace';
 export { installWarningFilter, shouldIgnoreWarning } from './warning-filter';
+export { loadMgmtToken, resolveOrCreateMgmtToken } from './mgmt-token';
+export {
+    validateExternalPromptFile,
+    validateScriptPath,
+    validatePathIdentifier,
+} from './path-validators';
 export { sequential } from './sequential';
 export { registerCleanup, runCleanup } from './cleanup-registry';
 export {

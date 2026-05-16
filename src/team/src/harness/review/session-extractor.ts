@@ -1,7 +1,16 @@
 import { createLogger } from '@flopsy/shared';
-import type { BaseChatModel } from 'flopsygraph';
-import type { LearningStore, MessageRow } from '../storage';
+import type { BaseChatModel, CheckpointStore } from 'flopsygraph';
 import type { SkillCatalogEntry } from './skill-scanner';
+
+/**
+ * Subset of ChatMessage we read from the checkpoint state. Defined here
+ * (rather than imported from flopsygraph's llm types) so the extractor
+ * stays decoupled from the message schema — we only need role + content.
+ */
+interface ExtractorMessage {
+    role?: string;
+    content?: unknown;
+}
 
 const log = createLogger('session-extractor');
 
@@ -37,7 +46,14 @@ const EXTRACTOR_SYSTEM = [
 
 export interface SessionExtractorConfig {
     readonly model: BaseChatModel;
-    readonly store: LearningStore;
+    /**
+     * Source of truth for thread messages. Migrated from LearningStore to
+     * flopsygraph's CheckpointStore on 2026-05-08 so the team layer no
+     * longer mirrors messages into learning.db. The latest checkpoint's
+     * `state.messages` is what we extract from — pre-compaction history
+     * lives in older checkpoints (not currently consulted here).
+     */
+    readonly checkpointer: CheckpointStore;
 }
 
 export interface SkillProposal {
@@ -66,7 +82,16 @@ export class SessionExtractor {
         _peerId?: string,
         existingSkills?: ReadonlyArray<SkillCatalogEntry>,
     ): Promise<ExtractionResult | null> {
-        const messages = this.config.store.getThreadMessages(closedThreadId, MESSAGE_WINDOW);
+        const rawMessages = await this.config.checkpointer.getThreadMessages<ExtractorMessage>(
+            closedThreadId,
+            { limit: MESSAGE_WINDOW },
+        );
+        // Restrict to user/assistant turns — system/tool internals would
+        // otherwise dilute the transcript and leak prompts into the
+        // extraction.
+        const messages = rawMessages.filter(
+            (m) => m.role === 'user' || m.role === 'assistant',
+        );
         if (messages.length < MIN_MESSAGES) {
             log.debug(
                 { threadId: closedThreadId, count: messages.length },
@@ -75,7 +100,10 @@ export class SessionExtractor {
             return null;
         }
 
-        const totalChars = messages.reduce((n, m) => n + m.content.length, 0);
+        const totalChars = messages.reduce(
+            (n, m) => n + extractText(m.content).length,
+            0,
+        );
         const hasTooling = hasToolCallSignal(messages);
         if (!hasTooling && totalChars < MIN_SUBSTANTIVE_CHARS) {
             log.debug(
@@ -136,11 +164,12 @@ export class SessionExtractor {
 
 }
 
-function formatTranscript(messages: ReadonlyArray<MessageRow>): string {
+function formatTranscript(messages: ReadonlyArray<ExtractorMessage>): string {
     return messages
         .map((m) => {
             const role = m.role === 'user' ? 'User' : 'Assistant';
-            const body = m.content.slice(0, PER_MESSAGE_CHAR_LIMIT);
+            const text = extractText(m.content);
+            const body = text.slice(0, PER_MESSAGE_CHAR_LIMIT);
             return `${role}: ${body}`;
         })
         .join('\n');
@@ -155,11 +184,12 @@ const TOOL_SIGNAL_PATTERNS: readonly RegExp[] = [
     /\(stopped after \d+ tool calls?\)/i,
 ];
 
-export function hasToolCallSignal(messages: ReadonlyArray<MessageRow>): boolean {
+export function hasToolCallSignal(messages: ReadonlyArray<ExtractorMessage>): boolean {
     for (const m of messages) {
         if (m.role !== 'assistant') continue;
+        const text = extractText(m.content);
         for (const re of TOOL_SIGNAL_PATTERNS) {
-            if (re.test(m.content)) return true;
+            if (re.test(text)) return true;
         }
     }
     return false;
@@ -167,6 +197,11 @@ export function hasToolCallSignal(messages: ReadonlyArray<MessageRow>): boolean 
 
 export const TRIVIAL_SESSION_CHAR_THRESHOLD = MIN_SUBSTANTIVE_CHARS;
 
+/**
+ * Extract plain text from a ChatMessage `content` field. Handles the
+ * `string | ContentBlock[]` union that flopsygraph's checkpoint state
+ * carries; ContentBlock arrays get flattened by joining `.text` blocks.
+ */
 function extractText(content: unknown): string {
     if (typeof content === 'string') return content;
     if (Array.isArray(content)) {

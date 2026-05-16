@@ -10,17 +10,30 @@ import type {
     InteractiveCapability,
 } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
-import { isSafeMediaUrl } from '@gateway/core/security';
+import { resolveMediaSource, type MediaSource } from '@gateway/core/media-resolver';
+import { DEFAULT_PRESENCE_EMOJIS } from '@gateway/core/presence-emojis';
 import { splitForTelegram } from './message-splitter';
+import { isTelegramRateLimitError, getTelegramRetryAfterMs } from './network-errors';
+import { retryTelegram } from './retry';
 import type { TelegramChannelConfig } from './types';
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
+/** Telegram caption cap; over-limit bodies are sent as a separate chunked text message. */
+const TELEGRAM_CAPTION_MAX = 1024;
 
 // Telegram callback_data is a 1-64 byte opaque string returned on tap.
 const TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64;
 
 function fitsCallback(s: string): boolean {
     return Buffer.byteLength(s, 'utf8') <= TELEGRAM_CALLBACK_DATA_MAX_BYTES;
+}
+
+/** Strip bot tokens from log strings. Telegram tokens appear in file-download URLs. */
+const BOT_TOKEN_RE = /bot[0-9]+:[A-Za-z0-9_-]+/g;
+function redactBotToken(err: unknown): string {
+    const raw = err instanceof Error ? err.message : String(err);
+    return raw.replace(BOT_TOKEN_RE, 'bot<redacted>');
 }
 
 /** Build Telegram's inline_keyboard shape from our InteractiveReply. */
@@ -49,7 +62,6 @@ function buildInlineKeyboard(
                 if (row.length > 0) rows.push(row);
             }
         }
-        // `poll` blocks handled via sendPoll.
     }
 
     return rows.length > 0 ? rows : undefined;
@@ -70,9 +82,10 @@ const TELEGRAM_ALLOWED_REACTIONS: ReadonlySet<string> = new Set([
 // Approximate-match table for agent-emitted emojis outside Telegram's
 // whitelist. Unknown input falls through to 👍.
 const TELEGRAM_REACTION_FALLBACKS: Readonly<Record<string, string>> = {
-    '⏳': '🤔', // in-progress / thinking
-    '✅': '👍', // done / success
-    '❌': '👎', // fail / reject
+    [DEFAULT_PRESENCE_EMOJIS.taskRunning]: '🤔',
+    [DEFAULT_PRESENCE_EMOJIS.taskOk]:      '👍',
+    [DEFAULT_PRESENCE_EMOJIS.taskError]:   '👎',
+    [DEFAULT_PRESENCE_EMOJIS.turnAborted]: '👎',
     '⚙': '🤔',
     '⚙️': '🤔',
     '📝': '✍',
@@ -88,7 +101,6 @@ const TELEGRAM_REACTION_FALLBACKS: Readonly<Record<string, string>> = {
     'ℹ️': '🤔',
     '⚠': '🤔',
     '⚠️': '🤔',
-    '🛑': '👎',
     '⛔': '👎',
     '🤖': '👨‍💻',
     '💻': '👨‍💻',
@@ -104,7 +116,8 @@ function mapToTelegramAllowedEmoji(input: string): string {
 export class TelegramChannel extends BaseChannel {
     readonly name = 'telegram';
     readonly authType = 'token';
-    readonly streaming: StreamingCapability = { editBased: true, minEditIntervalMs: 1000 };
+    /** Streaming-preview toggle; driven by channels.telegram.streaming config. */
+    readonly streaming: StreamingCapability;
     readonly capabilities: readonly InteractiveCapability[] = [
         'buttons',
         'polls',
@@ -117,9 +130,43 @@ export class TelegramChannel extends BaseChannel {
     private botInfo: { id: number; username: string } | null = null;
     private readonly channelConfig: TelegramChannelConfig;
 
+    // Per-chat outbound throttle (~1 msg/sec/chat in groups; cross-chat concurrent).
+    private static readonly SEND_THROTTLE_MS = 250;
+    private readonly sendChain = new Map<string | number, Promise<void>>();
+    /** Pending throttle-release timers; cleared by disconnect() to free the event loop. */
+    private readonly pendingThrottleTimers = new Set<ReturnType<typeof setTimeout>>();
+
+    /** Serialize sends per-chat with a 250ms gap; caller must invoke release in finally. */
+    private async acquireChatSlot(chatId: string | number): Promise<() => void> {
+        const prior = this.sendChain.get(chatId) ?? Promise.resolve();
+        let release!: () => void;
+        const ours = new Promise<void>((r) => { release = r; });
+        this.sendChain.set(chatId, ours);
+        await prior;
+        return () => {
+            // Defer release so the next send waits the full throttle window.
+            const timer = setTimeout(() => {
+                this.pendingThrottleTimers.delete(timer);
+                release();
+                if (this.sendChain.get(chatId) === ours) {
+                    this.sendChain.delete(chatId);
+                }
+            }, TelegramChannel.SEND_THROTTLE_MS);
+            this.pendingThrottleTimers.add(timer);
+        };
+    }
+
     constructor(config: TelegramChannelConfig) {
         super(config);
         this.channelConfig = config;
+        // Per-channel streaming toggle; defaults from schema.
+        const streamCfg = (config as TelegramChannelConfig & {
+            streaming?: { enabled?: boolean; minEditIntervalMs?: number };
+        }).streaming;
+        this.streaming = {
+            editBased: streamCfg?.enabled ?? true,
+            minEditIntervalMs: streamCfg?.minEditIntervalMs ?? 1000,
+        };
     }
 
     async connect(): Promise<void> {
@@ -150,7 +197,11 @@ export class TelegramChannel extends BaseChannel {
 
                 const rawText = msg.text ?? msg.caption ?? '';
                 if (isGroup && this.channelConfig.groupActivation === 'mention') {
-                    if (!rawText.includes(`@${this.botInfo?.username}`)) return;
+                    // Word-boundary match so `@news` doesn't match `@newsbot`.
+                    const botUsername = this.botInfo?.username;
+                    if (!botUsername) return;
+                    const mentionRe = new RegExp(`@${botUsername.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}\\b`, 'i');
+                    if (!mentionRe.test(rawText)) return;
                 }
 
                 const media: Media[] = [];
@@ -270,18 +321,61 @@ export class TelegramChannel extends BaseChannel {
 
     private async downloadTelegramFile(fileId: string): Promise<{ data: string; mimeType: string } | null> {
         if (!this.bot) return null;
+        // URL contains bot token — never log it; sanitize errors via redactBotToken().
+        let file: Awaited<ReturnType<typeof this.bot.api.getFile>> | null = null;
         try {
-            const file = await this.bot.api.getFile(fileId);
-            if (!file.file_path) return null;
-            const url = `https://api.telegram.org/file/bot${this.channelConfig.token}/${file.file_path}`;
-            const res = await fetch(url);
-            if (!res.ok) return null;
+            file = await this.bot.api.getFile(fileId);
+        } catch (err) {
+            this.log.warn(
+                { fileId, err: redactBotToken(err), op: 'download:getFile' },
+                'telegram getFile failed — media will be sent as placeholder',
+            );
+            return null;
+        }
+        if (!file?.file_path) {
+            this.log.warn(
+                { fileId, op: 'download:no-file-path' },
+                'telegram getFile returned no file_path — media will be sent as placeholder',
+            );
+            return null;
+        }
+        // DO NOT LOG `url` — it embeds the bot token in the path.
+        const url = `https://api.telegram.org/file/bot${this.channelConfig.token}/${file.file_path}`;
+        try {
+            const res = await fetch(url, { redirect: 'error' });
+            if (!res.ok) {
+                this.log.warn(
+                    { fileId, status: res.status, op: 'download:http-error' },
+                    'telegram file download HTTP error — media will be sent as placeholder',
+                );
+                return null;
+            }
             const buffer = await res.arrayBuffer();
-            if (buffer.byteLength > MAX_IMAGE_BYTES) return null;
-            const ext = file.file_path.split('.').pop()?.toLowerCase() ?? 'jpg';
-            const mimeType = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
+            if (buffer.byteLength > MAX_IMAGE_BYTES) {
+                this.log.warn(
+                    { fileId, bytes: buffer.byteLength, cap: MAX_IMAGE_BYTES, op: 'download:oversize' },
+                    'telegram file exceeded MAX_IMAGE_BYTES — media will be sent as placeholder',
+                );
+                return null;
+            }
+            const ext = file.file_path.split('.').pop()?.toLowerCase() ?? '';
+            const mimeType = ext === 'png' ? 'image/png'
+                : ext === 'webp' ? 'image/webp'
+                : ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg'
+                : null;
+            if (!mimeType) {
+                this.log.warn(
+                    { fileId, ext, op: 'download:unsupported-type' },
+                    'telegram file extension not in allowlist — media will be sent as placeholder',
+                );
+                return null;
+            }
             return { data: Buffer.from(buffer).toString('base64'), mimeType };
-        } catch {
+        } catch (err) {
+            this.log.warn(
+                { fileId, err: redactBotToken(err), op: 'download:fetch' },
+                'telegram file download threw — media will be sent as placeholder',
+            );
             return null;
         }
     }
@@ -292,6 +386,10 @@ export class TelegramChannel extends BaseChannel {
             this.bot = null;
         }
         this.botInfo = null;
+        // Clear throttle timers so the event loop can exit cleanly.
+        for (const timer of this.pendingThrottleTimers) clearTimeout(timer);
+        this.pendingThrottleTimers.clear();
+        this.sendChain.clear();
         this.setStatus('disconnected');
     }
 
@@ -306,51 +404,70 @@ export class TelegramChannel extends BaseChannel {
             'telegram send: attempting',
         );
 
+        const bodyLen = (message.body ?? '').length;
+        const captionTooLong = bodyLen > TELEGRAM_CAPTION_MAX;
+
         if (message.media?.length) {
             let lastId = 0;
             for (let i = 0; i < message.media.length; i++) {
                 const media = message.media[i]!;
-                const caption = i === 0 ? message.body : undefined;
+                // Drop caption when body exceeds Telegram's caption cap — body sent as text.
+                const caption = i === 0 && !captionTooLong ? message.body : undefined;
                 const { InputFile } = await import('grammy');
-                if (!isSafeMediaUrl(media.url)) continue;
-                const inputFile = new InputFile(new URL(media.url!));
 
+                const resolved = await resolveMediaSource(media);
+                if (!resolved.ok) {
+                    this.log.warn(
+                        { chatId, mediaType: media.type, mediaUrl: media.url, reason: resolved.reason, detail: resolved.detail, op: 'send:media:rejected' },
+                        'telegram send: media resolution failed — skipping attachment',
+                    );
+                    continue;
+                }
+                const inputFile = mediaSourceToInputFile(resolved.source, InputFile);
+
+                // Throttle each media send so multi-attachment doesn't burst N API calls.
+                const release = await this.acquireChatSlot(chatId);
                 let sent;
-                switch (media.type) {
-                    case 'image':
-                        sent = await this.bot.api.sendPhoto(
-                            chatId,
-                            inputFile,
-                            caption ? { caption } : {},
-                        );
-                        break;
-                    case 'video':
-                        sent = await this.bot.api.sendVideo(
-                            chatId,
-                            inputFile,
-                            caption ? { caption } : {},
-                        );
-                        break;
-                    case 'audio':
-                        sent = await this.bot.api.sendAudio(
-                            chatId,
-                            inputFile,
-                            caption ? { caption } : {},
-                        );
-                        break;
-                    case 'document':
-                        sent = await this.bot.api.sendDocument(
-                            chatId,
-                            inputFile,
-                            caption ? { caption } : {},
-                        );
-                        break;
-                    default:
-                        sent = await this.bot.api.sendMessage(chatId, message.body ?? '');
+                try {
+                    switch (media.type) {
+                        case 'image':
+                            sent = await this.bot.api.sendPhoto(
+                                chatId,
+                                inputFile,
+                                caption ? { caption } : {},
+                            );
+                            break;
+                        case 'video':
+                            sent = await this.bot.api.sendVideo(
+                                chatId,
+                                inputFile,
+                                caption ? { caption } : {},
+                            );
+                            break;
+                        case 'audio':
+                            sent = await this.bot.api.sendAudio(
+                                chatId,
+                                inputFile,
+                                caption ? { caption } : {},
+                            );
+                            break;
+                        case 'document':
+                            sent = await this.bot.api.sendDocument(
+                                chatId,
+                                inputFile,
+                                caption ? { caption } : {},
+                            );
+                            break;
+                        default:
+                            sent = await this.bot.api.sendMessage(chatId, message.body ?? '');
+                    }
+                } finally {
+                    release();
                 }
                 lastId = sent.message_id;
             }
-            return String(lastId);
+            // Caption fits → media-only send complete; otherwise body sent as text follow-up.
+            if (!captionTooLong) return String(lastId);
         }
 
         const body = message.body ?? '';
@@ -361,56 +478,79 @@ export class TelegramChannel extends BaseChannel {
             : undefined;
         const replyMarkup = keyboard ? { inline_keyboard: keyboard } : undefined;
 
-        // Bad replyTo (gone / wrong chat / non-integer) makes sendMessage 400 —
-        // the catch below retries without it.
+        // Bad replyTo 400s sendMessage; catch retries without it.
         const replyParameters =
             message.replyTo && /^\d+$/.test(message.replyTo)
                 ? { reply_parameters: { message_id: parseInt(message.replyTo, 10) } }
                 : undefined;
 
-        // Splitter is fence-aware. Reply markup + quote-reply attach to the
-        // last chunk so taps land on the most recent message.
+        // Fence-aware splitter; reply markup + quote-reply attach to the last chunk.
         const chunks = splitForTelegram(body);
         let lastId = '';
         for (let i = 0; i < chunks.length; i++) {
             const isLast = i === chunks.length - 1;
             const chunkBody = chunks[i]!;
-            const sent = await this.bot.api
-                .sendMessage(chatId, chunkBody, {
-                    parse_mode: 'Markdown',
-                    ...(isLast && replyMarkup ? { reply_markup: replyMarkup } : {}),
-                    ...(i === 0 ? (replyParameters ?? {}) : {}),
-                })
-                .catch((mdErr: unknown) => {
-                    // Markdown parse failure → retry as plain text.
-                    this.log.warn(
-                        {
-                            chatId,
-                            err: mdErr instanceof Error ? mdErr.message : String(mdErr),
-                            chunk: i,
-                            chunks: chunks.length,
-                        },
-                        'telegram send: markdown send failed, retrying plain',
-                    );
-                    return this.bot!.api.sendMessage(chatId, chunkBody, {
+            // Per-chunk throttle; chunks share the chat rate bucket.
+            const release = await this.acquireChatSlot(chatId);
+            try {
+            // 429: same-variant retry with retry_after. 400 markdown errors: V2 → legacy → plain.
+            const trySendWith = (parseMode?: 'MarkdownV2' | 'Markdown') =>
+                retryTelegram(
+                    () => this.bot!.api.sendMessage(chatId, chunkBody, {
+                        ...(parseMode ? { parse_mode: parseMode } : {}),
                         ...(isLast && replyMarkup ? { reply_markup: replyMarkup } : {}),
-                    });
-                })
-                .catch((plainErr: unknown) => {
-                    // Plain-text retry failed (403 bot blocked / 400 chat
-                    // not found / 429 rate limit).
-                    this.log.error(
-                        {
-                            chatId,
-                            err: plainErr instanceof Error ? plainErr.message : String(plainErr),
-                            chunk: i,
-                            chunks: chunks.length,
+                        ...(i === 0 ? (replyParameters ?? {}) : {}),
+                    }),
+                    {
+                        shouldRetry: isTelegramRateLimitError,
+                        retryAfterMs: getTelegramRetryAfterMs,
+                        onRetry: ({ attempt, delayMs, err }) => {
+                            this.log.warn(
+                                {
+                                    chatId,
+                                    attempt,
+                                    delayMs,
+                                    parseMode: parseMode ?? 'plain',
+                                    op: 'send:rate-limit-retry',
+                                    err: err instanceof Error ? err.message : String(err),
+                                },
+                                'telegram send: 429 backoff',
+                            );
                         },
-                        'telegram send: BOTH markdown AND plain-text sends failed — message dropped',
+                    },
+                );
+
+            const sent = await trySendWith('MarkdownV2').catch((v2Err: unknown) => {
+                if (isTelegramRateLimitError(v2Err)) throw v2Err; // already retried inside
+                this.log.debug(
+                    { chatId, err: v2Err instanceof Error ? v2Err.message : String(v2Err), chunk: i, op: 'send:retry-legacy-markdown' },
+                    'telegram send: MarkdownV2 failed (format), retrying legacy Markdown',
+                );
+                return trySendWith('Markdown').catch((legacyErr: unknown) => {
+                    if (isTelegramRateLimitError(legacyErr)) throw legacyErr;
+                    this.log.warn(
+                        { chatId, err: legacyErr instanceof Error ? legacyErr.message : String(legacyErr), chunk: i, chunks: chunks.length },
+                        'telegram send: both markdown dialects failed (format), retrying plain',
                     );
-                    throw plainErr;
+                    return trySendWith(undefined);
                 });
+            }).catch((finalErr: unknown) => {
+                this.log.error(
+                    {
+                        chatId,
+                        err: finalErr instanceof Error ? finalErr.message : String(finalErr),
+                        is429: isTelegramRateLimitError(finalErr),
+                        chunk: i,
+                        chunks: chunks.length,
+                    },
+                    'telegram send: all paths exhausted — message dropped',
+                );
+                throw finalErr;
+            });
             lastId = String(sent.message_id);
+            } finally {
+                release();
+            }
         }
         this.log.debug({ chatId, messageId: lastId, chunks: chunks.length }, 'telegram send: ok');
         return lastId;
@@ -457,8 +597,11 @@ export class TelegramChannel extends BaseChannel {
     async react(options: ReactionOptions): Promise<void> {
         if (!this.bot) throw new Error('Telegram not connected');
 
+        // Synthetic / queued messages have empty ids; skip rather than 400.
+        if (!options.messageId) return;
         const chatId = options.peer.id;
         const messageId = parseInt(options.messageId, 10);
+        if (!Number.isFinite(messageId)) return;
 
         if (!options.emoji || options.remove) {
             await this.bot.api.setMessageReaction(chatId, messageId, []);
@@ -473,14 +616,59 @@ export class TelegramChannel extends BaseChannel {
 
     async editMessage(messageId: string, peer: Peer, body: string): Promise<void> {
         if (!this.bot) throw new Error('Telegram not connected');
-        // Telegram caps editMessageText at 4096; truncate the streaming
-        // preview. The final reply goes through `send` which chunks.
+        // Telegram caps editMessageText at 4096; truncate streaming preview.
         const TELEGRAM_EDIT_CAP = 4000;
         const truncated = body.length > TELEGRAM_EDIT_CAP
             ? body.slice(0, TELEGRAM_EDIT_CAP) + '\n\n_… (truncated preview; full reply incoming)_'
             : body;
-        await this.bot.api
-            .editMessageText(peer.id, parseInt(messageId, 10), truncated, { parse_mode: 'Markdown' })
-            .catch(() => this.bot!.api.editMessageText(peer.id, parseInt(messageId, 10), truncated));
+        const msgId = parseInt(messageId, 10);
+
+        // Same split as `send`: 429 → wait retry_after; format error → next variant.
+        const tryEditWith = (parseMode?: 'MarkdownV2' | 'Markdown') =>
+            retryTelegram(
+                () => this.bot!.api.editMessageText(peer.id, msgId, truncated, {
+                    ...(parseMode ? { parse_mode: parseMode } : {}),
+                }),
+                {
+                    shouldRetry: isTelegramRateLimitError,
+                    retryAfterMs: getTelegramRetryAfterMs,
+                    // Streaming edits bounded — worker's circuit breaker handles further protection.
+                    attempts: 2,
+                },
+            );
+
+        await tryEditWith('MarkdownV2').catch((v2Err: unknown) => {
+            if (isTelegramRateLimitError(v2Err)) throw v2Err;
+            return tryEditWith('Markdown').catch((legacyErr: unknown) => {
+                if (isTelegramRateLimitError(legacyErr)) throw legacyErr;
+                return tryEditWith(undefined);
+            });
+        });
+    }
+
+    /** Best-effort delete for orphan stream previews; errors are swallowed. */
+    async deleteMessage(messageId: string, peer: Peer): Promise<void> {
+        if (!this.bot) return;
+        const id = parseInt(messageId, 10);
+        if (!Number.isFinite(id)) return;
+        await this.bot.api.deleteMessage(peer.id, id).catch(() => {
+            /* swallow — best-effort cleanup */
+        });
+    }
+}
+
+/** Convert resolver's MediaSource into grammy's InputFile (lazy-imported). */
+function mediaSourceToInputFile(
+    source: MediaSource,
+    InputFileCtor: typeof import('grammy').InputFile,
+): import('grammy').InputFile {
+    switch (source.kind) {
+        case 'remote-url':
+            return new InputFileCtor(source.url);
+        case 'local-path':
+            // Grammy streams the file at send time — no in-memory buffer.
+            return new InputFileCtor(source.absPath, source.fileName);
+        case 'buffer':
+            return new InputFileCtor(source.data, source.fileName);
     }
 }

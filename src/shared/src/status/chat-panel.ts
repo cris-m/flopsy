@@ -1,7 +1,7 @@
 /**
  * chat-panel — unified renderer for slash-command output in chat.
  *
- * Goal: match the visual register of professional CLI tools (Hermes, kubectl,
+ * Goal: match the visual register of professional CLI tools (kubectl,
  * gh) when rendered in Telegram/Discord/Slack/Mattermost. Both adapters
  * render fenced code blocks with monospace alignment, so we use that as the
  * carrier and avoid bold/italic markdown decoration.

@@ -3,10 +3,10 @@ import { join } from 'path';
 import type { CommandDef } from '../types';
 import { getSharedDispatcher } from '../dispatcher';
 import { COMMANDS } from '../registry';
-import { panel, row, resolveWorkspacePath } from '@flopsy/shared';
+import { panel, row, workspace } from '@flopsy/shared';
 
 function countProposedSkills(): number {
-    const dir = join(resolveWorkspacePath('skills'), 'proposed');
+    const dir = join(workspace.skills(), 'proposed');
     if (!existsSync(dir)) return 0;
     try {
         return readdirSync(dir).filter((name) => {

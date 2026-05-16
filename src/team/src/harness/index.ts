@@ -21,10 +21,11 @@ export type { PairingPending, PairingApproved, RequestCodeResult } from './stora
 export { AgentStateTracker, getAgentStateTracker } from './state';
 
 export type { HarnessInterceptorConfig } from './hooks';
+export { CorrectionInterceptor, setCorrectionStore, getCorrectionStore } from './hooks/correction-interceptor';
 export type { AgentState, AgentStatus, ToolActivity, AgentMetrics } from './state';
 export type {
-    MessageRow,
-    MessageSearchHit,
     SessionRow,
     ToolFailureRow,
+    ProactiveDecisionRow,
+    ProactiveCommitmentRow,
 } from './storage';

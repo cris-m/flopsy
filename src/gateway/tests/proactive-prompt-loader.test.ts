@@ -1,7 +1,8 @@
 /**
  * PromptLoader — kind-namespacing + ENOENT propagation.
  *
- * The proactive system stores prompts under .flopsy/proactive/<kind>/<file>.
+ * The proactive system stores prompts under
+ * `<FLOPSY_HOME>/content/prompts/<kind>/<file>` (heartbeats|cron).
  * Two regressions caused the SEO-snippet incident:
  *   1. callers passed a relative path without `kind` → loader silently fell
  *      back to baseDir → ENOENT → trigger swallowed it → empty prompt.
@@ -24,8 +25,8 @@ describe('PromptLoader', () => {
 
     beforeEach(() => {
         homeDir = mkdtempSync(join(tmpdir(), 'flopsy-prompt-loader-'));
-        mkdirSync(join(homeDir, 'proactive', 'heartbeats'), { recursive: true });
-        mkdirSync(join(homeDir, 'proactive', 'cron'), { recursive: true });
+        mkdirSync(join(homeDir, 'content', 'prompts', 'heartbeats'), { recursive: true });
+        mkdirSync(join(homeDir, 'content', 'prompts', 'cron'), { recursive: true });
         prevHome = process.env.FLOPSY_HOME;
         process.env.FLOPSY_HOME = homeDir;
         loader = new PromptLoader(homeDir, 60_000);
@@ -47,9 +48,9 @@ describe('PromptLoader', () => {
         expect(out).toBe('');
     });
 
-    it('reads heartbeat file under .flopsy/proactive/heartbeats/', async () => {
+    it('reads heartbeat file under content/prompts/heartbeats/', async () => {
         writeFileSync(
-            join(homeDir, 'proactive', 'heartbeats', 'pulse.md'),
+            join(homeDir, 'content', 'prompts', 'heartbeats', 'pulse.md'),
             '## smart-pulse\nbe terse',
             'utf8',
         );
@@ -58,9 +59,9 @@ describe('PromptLoader', () => {
         expect(out).toContain('be terse');
     });
 
-    it('reads cron file under .flopsy/proactive/cron/', async () => {
+    it('reads cron file under content/prompts/cron/', async () => {
         writeFileSync(
-            join(homeDir, 'proactive', 'cron', 'morning.md'),
+            join(homeDir, 'content', 'prompts', 'cron', 'morning.md'),
             'morning briefing prompt',
             'utf8',
         );
@@ -90,7 +91,7 @@ describe('PromptLoader', () => {
     });
 
     it('caches file content within the TTL window', async () => {
-        const path = join(homeDir, 'proactive', 'heartbeats', 'cached.md');
+        const path = join(homeDir, 'content', 'prompts', 'heartbeats', 'cached.md');
         writeFileSync(path, 'v1', 'utf8');
         const first = await loader.resolve('', 'cached.md', 'heartbeat');
         expect(first).toBe('v1');
@@ -103,7 +104,7 @@ describe('PromptLoader', () => {
 
     it('serves fresh content after the TTL elapses', async () => {
         const shortTtl = new PromptLoader(homeDir, 5);
-        const path = join(homeDir, 'proactive', 'heartbeats', 'ttl.md');
+        const path = join(homeDir, 'content', 'prompts', 'heartbeats', 'ttl.md');
         writeFileSync(path, 'v1', 'utf8');
         await shortTtl.resolve('', 'ttl.md', 'heartbeat');
 

@@ -95,6 +95,11 @@ const PII_PATTERNS: Array<{ regex: RegExp; label: string }> = [
     { regex: /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, label: '[JWT]' },
     { regex: /AKIA[0-9A-Z]{16}/g, label: '[AWS_KEY]' },
     { regex: /(sk|pk)_(test|live)_[a-zA-Z0-9]{24,}/g, label: '[STRIPE_KEY]' },
+    { regex: /sk-ant-[a-zA-Z0-9_-]{20,}/g, label: '[ANTHROPIC_KEY]' },
+    { regex: /sk-proj-[a-zA-Z0-9_-]{20,}/g, label: '[OPENAI_KEY]' },
+    { regex: /\bsk-[A-Za-z0-9]{32,}\b/g, label: '[OPENAI_LEGACY_KEY]' },
+    // Telegram bot tokens `<bot_id>:<token>` — leaked via downloadTelegramFile URLs.
+    { regex: /\b\d{8,12}:[A-Za-z0-9_-]{30,}\b/g, label: '[TELEGRAM_TOKEN]' },
 ];
 
 export function scrubPii(text: string): string {
@@ -112,15 +117,9 @@ export interface LoggerOptions {
 }
 
 /**
- * Pino's worker-thread transport adds one `exit` listener to `process` per
- * call. Building a fresh transport on every `createLogger()` invocation
- * piles up listeners (Node warns past 10) and spawns redundant workers.
- *
- * We cache transports keyed by the config that distinguishes them
- * (pretty/file). Every logger with matching config shares one worker.
- * Per-logger level filtering happens on the pino instance itself, so the
- * transport accepts everything (`level: 'trace'`) and the logger's own
- * level gate filters outbound records.
+ * Cache transports per (pretty,file) to avoid pino's per-call worker
+ * threads (Node warns past 10 `exit` listeners). Level filtering happens
+ * on the pino instance; transports accept everything at `trace`.
  */
 let cachedTransport: ReturnType<typeof pino.transport> | undefined;
 let cachedTransportKey: string | undefined;

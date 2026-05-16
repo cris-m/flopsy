@@ -68,6 +68,126 @@ export function registerMemoryCommands(root: Command): void {
                 db.close();
             }
         });
+
+    mem.command('status')
+        .description(
+            'Live memory configuration + per-namespace usage vs char limits.',
+        )
+        .option('--json', 'Emit JSON for monitoring')
+        .action((opts: { json?: boolean }) => {
+            const { config } = readFlopsyConfig();
+            const dbPath = resolveWorkspacePath('state', 'memory.db');
+            const userMdPath = resolveWorkspacePath('config', 'USER.md');
+
+            const memCfg = (config.memory ?? {}) as {
+                enabled?: boolean;
+                userProfileEnabled?: boolean;
+                memoryCharLimit?: number;
+                userCharLimit?: number;
+            };
+            const memoryEnabled = memCfg.enabled !== false;
+            const userProfileEnabled = memCfg.userProfileEnabled !== false;
+            const memoryCharLimit = memCfg.memoryCharLimit ?? 2200;
+            const userCharLimit = memCfg.userCharLimit ?? 1375;
+
+            // Per-namespace char usage (sum of `value` lengths).
+            interface UsageRow {
+                readonly namespace: string;
+                readonly count: number;
+                readonly bytes: number;
+            }
+            let nsRows: UsageRow[] = [];
+            if (existsSync(dbPath)) {
+                const db = new Database(dbPath, { readonly: true });
+                try {
+                    nsRows = db
+                        .prepare(
+                            `SELECT namespace,
+                                    COUNT(*)                      AS count,
+                                    COALESCE(SUM(LENGTH(value)),0) AS bytes
+                             FROM   store_items
+                             GROUP  BY namespace
+                             ORDER  BY bytes DESC`,
+                        )
+                        .all() as UsageRow[];
+                } finally {
+                    db.close();
+                }
+            }
+
+            // USER.md file size — counted toward user_char_limit alongside
+            // the `profile` namespace.
+            let userMdBytes = 0;
+            if (existsSync(userMdPath)) {
+                try {
+                    userMdBytes = require('fs').statSync(userMdPath).size as number;
+                } catch { /* swallow */ }
+            }
+
+            const profileRow = nsRows.find((r) => r.namespace === 'profile');
+            const userProfileChars = (profileRow?.bytes ?? 0) + userMdBytes;
+            const memoryRow = nsRows.find((r) => r.namespace === 'memory');
+            const memoryChars = memoryRow?.bytes ?? 0;
+
+            if (opts.json) {
+                console.log(
+                    JSON.stringify(
+                        {
+                            memory_enabled: memoryEnabled,
+                            user_profile_enabled: userProfileEnabled,
+                            memory_char_limit: memoryCharLimit,
+                            user_char_limit: userCharLimit,
+                            memory_chars: memoryChars,
+                            user_profile_chars: userProfileChars,
+                            user_md_bytes: userMdBytes,
+                            namespaces: nsRows,
+                        },
+                        null,
+                        2,
+                    ),
+                );
+                return;
+            }
+
+            console.log(section('Memory status'));
+            const flag = (b: boolean): string => (b ? ok('on') : bad('off'));
+            console.log(`  memory_enabled         ${flag(memoryEnabled)}`);
+            console.log(`  user_profile_enabled   ${flag(userProfileEnabled)}`);
+            console.log();
+            renderUsageBar('memory       ', memoryChars, memoryCharLimit);
+            renderUsageBar('user profile ', userProfileChars, userCharLimit);
+            console.log(dim(`  (user profile = USER.md ${userMdBytes}B + profile namespace ${profileRow?.bytes ?? 0}B)`));
+            console.log();
+
+            if (nsRows.length === 0) {
+                console.log(`  ${dim('no namespaces yet — memory.db is empty')}`);
+                return;
+            }
+            console.log(section('Per-namespace usage'));
+            for (const r of nsRows) {
+                const pct = memoryCharLimit > 0 ? Math.round((r.bytes / memoryCharLimit) * 100) : 0;
+                const tag = pct >= 80 ? warn(`${pct}%`) : pct >= 50 ? accent(`${pct}%`) : dim(`${pct}%`);
+                console.log(`  ${r.namespace.padEnd(14)} ${String(r.count).padStart(4)} entries  ${String(r.bytes).padStart(6)}B  ${tag}`);
+            }
+        });
+}
+
+/**
+ * Usage bar. Color-codes by percent used and warns when over 80 % — the
+ * threshold where the agent is expected to consolidate entries before
+ * adding new ones.
+ */
+function renderUsageBar(label: string, used: number, limit: number): void {
+    if (limit <= 0) {
+        console.log(`  ${label}  ${dim('no limit set')}`);
+        return;
+    }
+    const pct = Math.min(100, Math.round((used / limit) * 100));
+    const filled = Math.round((pct / 100) * 20);
+    const bar = '█'.repeat(filled) + '░'.repeat(20 - filled);
+    const usageStr = `${used} / ${limit}`;
+    const pctTag = pct >= 80 ? bad(`${pct}%`) : pct >= 50 ? warn(`${pct}%`) : ok(`${pct}%`);
+    console.log(`  ${label}  ${bar}  ${pctTag.padEnd(4)}  ${dim(usageStr)}`);
 }
 
 function renderKpi(db: Database.Database, asJson?: boolean): void {

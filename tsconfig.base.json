@@ -17,6 +17,7 @@
       "@gateway/types": ["./src/gateway/src/types/index.ts"],
       "@gateway/core/*": ["./src/gateway/src/core/*"],
       "@gateway/channels/*": ["./src/gateway/src/channels/*"],
+      "@gateway/commands/*": ["./src/gateway/src/commands/*"],
       "@core/*": ["./flopsygraph/src/core/*"],
       "@llm/*": ["./flopsygraph/src/llm/*"],
       "@agent/*": ["./flopsygraph/src/agent/*"],
