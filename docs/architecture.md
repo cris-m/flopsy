@@ -150,14 +150,11 @@ Three subsystems shape every turn but are easy to miss in a one-pass read.
 
 When a session closes (`/new`, idle timeout, or branch fork), the `SessionExtractor` (`src/team/src/harness/review/session-extractor.ts`) runs an async LLM call over the transcript and extracts:
 
-- A 1–3 sentence **summary** → stored on the session row, surfaced as `<last_session>` recap in the next session's harness block.
-- **Profile patches** (stable preferences) → appended to `profiles.<peerId>`.
-- **Note upserts/deletes** (atomic facts with confidence × recency decay) → upserted into `notes` for the peer.
-- **New directives** (rules the user explicitly stated) → inserted into `directives`.
-- A possible **skill proposal** (kebab-case name + body) → written to `~/.flopsy/skills/proposed/<name>/SKILL.md`. Proposed skills are NOT auto-loaded — review with `/skills review`.
-- **Skill lessons** → appended to existing skills' `LESSONS` block.
+- A 1–3 sentence **summary** → stored on the session row in `learning.db`, surfaced as `<last_session>` recap in the next session's harness block.
+- A possible **skill proposal** (kebab-case name + body) → written to `~/.flopsy/content/skills-proposed/<name>/SKILL.md`. Proposed skills are NOT auto-loaded — review with `/skills proposed` (chat) or `flopsy skill proposed list / accept / reject` (CLI).
+- **Skill lessons** → appended to existing skills' `## Lessons Learned` block (capped at 20 bullets, oldest pruned first).
 
-Trivial sessions (low message count + no tool-call signal) are skipped to keep LLM costs bounded.
+Trivial sessions (low message count + no tool-call signal) are skipped to keep LLM costs bounded. The skill-proposal prompt was loosened from "RARE / NON-OBVIOUS" to "any reusable procedure with 3+ steps" so proposals actually flow into `skills-proposed/`.
 
 ### Personality resolution (per turn)
 

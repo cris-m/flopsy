@@ -4,18 +4,58 @@ Tools are the verbs an agent can invoke during a turn. FlopsyBot ships a small s
 
 ## Built-in tool catalog
 
-| Tool | Purpose | Who typically uses it |
-|---|---|---|
-| `send_message` | Send a text/media message to a channel peer | Any agent with output |
-| `send_poll` | Post a poll (channels that support it) | Main, during planning |
-| `ask_user` | Channel-aware interactive question (buttons on rich channels, numbered prompts on text-only) | Main |
-| `delegate_task` | Hand a task to a worker agent; block until reply | Main |
-| `spawn_background_task` | Run a task asynchronously; reply comes later | Main |
-| `search_past_conversations` | FTS5 query over messages in `state.db` | Any agent |
-| `connect_service` | Initiate OAuth device-flow for a new service | Main |
-| `react` | Add an emoji reaction to a message (channels that support it) | Any agent |
+All tools live in `src/team/src/tools/`. Each is one file exporting a schema + an execute function.
 
-All tools live in `src/team/src/tools/`. Each is a single file exporting a schema + an execute function.
+### Always available to main (gandalf)
+
+| Tool | Purpose |
+|---|---|
+| `send_message` | Send text/media to a channel peer (with optional buttons, polls inline, quote-reply) |
+| `send_poll` | Post a poll on channels that support it; fallback numbered prompt elsewhere |
+| `ask_user` | Channel-aware interactive question — buttons on rich channels, `1./2.` text on plain |
+| `react` | Add an emoji reaction to the user's last message (silent on channels without reactions) |
+| `delegate_task` | Hand work to a worker; block until reply. Depth-3 nesting, loop detection |
+| `spawn_background_task` | Fire-and-forget worker task; result arrives later as `<task-notification>` |
+| `search_conversation_history` | FTS5 query over `learning.db` messages |
+| `connect_service` | Start OAuth device-flow for a new service (Google, Spotify, etc.) |
+| `manage_schedule` | Create/edit cron/heartbeat/webhook schedules in chat |
+| `skill_manage` | Create / append-lessons / patch / bump-version / archive / pin skills |
+
+### Worker control tools
+
+Workers (legolas/gimli/saruman/aragorn) get a smaller control surface:
+
+| Tool | Purpose |
+|---|---|
+| `delegate_task` | Workers can chain further (max depth 3, loops blocked) |
+| `spawn_background_task` | For long-running async work |
+| `notify_teammate` | Push a short note to another worker's thread |
+| `skill_manage` | Workers can also capture procedures they discovered — writes to `skills-proposed/` for human review |
+
+Workers do NOT have `send_message`, `send_poll`, `ask_user`, `react`, or `connect_service` — workers reply to their parent, not to the user.
+
+### Proactive-mode filter
+
+When the main agent fires under a cron/heartbeat (`proactiveMode: true`), these are stripped so the agent must return prose / `__respond__` instead of side-effecting:
+
+```
+delegate_task, spawn_background_task, ask_user, react,
+send_poll, manage_schedule, send_message
+```
+
+`skill_manage` is **not** in this stripped list — agents can still create skills mid-fire.
+
+## Tool anatomy
+
+```mermaid
+flowchart LR
+  LLM["LLM decides to call tool"] --> SCHEMA["Validate args<br/>(Zod)"]
+  SCHEMA -->|ok| EXEC["Execute"]
+  SCHEMA -->|fail| ERR["Tool error → LLM"]
+  EXEC --> EFFECT["Side effect<br/>(channel send, DB write, …)"]
+  EFFECT --> RESULT["Typed result"]
+  RESULT --> LLM
+```
 
 ## Tool anatomy
 
@@ -91,6 +131,27 @@ Enable per-agent:
 ```
 
 The bridge is a localhost HTTP server spawned by the sandbox module; the injected runtime stubs forward calls to the agent's tool set. Code runs in a sandbox (local / Docker / Kubernetes backend).
+
+## Tool quirks (failure surfacing)
+
+Every tool call goes through `HarnessInterceptor.afterToolCall` (`src/team/src/harness/hooks/harness-interceptor.ts`):
+
+- **On error**: writes a row into `tool_failures` keyed `(peerId, toolName, errorPattern)`. Repeated failures bump `count` instead of inserting a duplicate.
+- **On success**: deletes any rows for that `(peerId, toolName)` — failures auto-clear once the tool works again.
+
+At the start of every agent turn, the harness injects the top 5 recent failures (last 7d) into the prompt as a `<tool_quirks>` block:
+
+```
+<tool_quirks description="Tools that have been failing recently for this user...">
+  spawn_background_task: "fetch failed (ollama/kimi-k2.6:cloud): NetworkError" (×3, last 72h ago)
+</tool_quirks>
+```
+
+The agent reads this and avoids retrying the same broken path.
+
+## Self-state (skill catalog telemetry)
+
+The harness also injects a `<self_state>` block once per session showing the agent its own skill catalog metrics — total skills, agent-created count, by_state breakdown, most-used skill, and warnings when no agent-created skills exist. Source: `.skill-state.json` (written by `SkillUsageStore`).
 
 ## Observability
 

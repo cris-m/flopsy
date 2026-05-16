@@ -26,6 +26,15 @@ Running `flopsy` with no arguments shows a welcome panel with `Tips for getting 
 | `flopsy model ...` | List/switch the LLM model per agent | `flopsy.json5` | no (restart to apply) |
 | `flopsy env reload` | Re-read `.env` and restart the gateway if any key changed | — | optional |
 | `flopsy memory ...` | Inspect the harness learning store (skills, lessons, facts) | — | no |
+| `flopsy goal ...` | Inspect + manage `/goal` Ralph-loop sessions | `learning.db` | no |
+| `flopsy commitments ...` | Inspect + dismiss inferred follow-up commitments | `learning.db` | no |
+| `flopsy faq` | Surface recurring questions from session summaries | — | no |
+| `flopsy skill proposed ...` | Review agent-authored skills awaiting promotion | `skills-proposed/` | no |
+| `flopsy hooks list` | Inspect loaded event hooks (`.flopsy/content/hooks/*.yaml`) | — | optional |
+| `flopsy tasks ...` | List + show background tasks across threads | — | no |
+| `flopsy chat send <text>` | Send a message into the chat channel (scripting hook) | — | **yes** |
+| `flopsy sandbox ...` | Inspect / smoke-test the code-execution sandbox | — | no |
+| `flopsy pairing ...` | Pair a chat user with an operator identity | `learning.db` | optional |
 
 ## Discovery
 
@@ -303,16 +312,105 @@ rotating a Telegram token or an API key without wanting to fully bounce.
 
 ### `flopsy memory ...`
 
-Inspect the per-thread learning harness (SQLite-backed, at
-`~/.flopsy/harness/state.db`). Current subcommand:
+Inspect / prune the agent's semantic memory store at `~/.flopsy/state/memory.db`.
 
 ```bash
-flopsy memory kpi                         # summary: strategies, lessons, skills, facts
-flopsy memory kpi --namespace <userId>    # scope to one user/thread
+flopsy memory kpi                         # per-namespace counts + freshness
+flopsy memory kpi --namespace <ns>        # drill into one namespace, list keys
 flopsy memory kpi --json                  # machine-readable
+
+flopsy memory status                      # usage vs configured char limits
+flopsy memory prune --older-than 90       # dry-run: count entries > 90d old
+flopsy memory prune --older-than 90 --yes # actually delete
+flopsy memory prune -n memories:gandalf --older-than 30 --yes
 ```
 
 See [memory.md](./memory.md) for the schema model.
+
+### `flopsy goal ...`
+
+Inspect + manage the `/goal` Ralph-loop self-continuation feature. Goals are
+set per chat thread via the `/goal <text>` slash command; this CLI reads +
+mutates them from outside the gateway.
+
+```bash
+flopsy goal list                          # active + paused goals
+flopsy goal list --all                    # include done/cleared
+flopsy goal show <threadId>               # full row
+flopsy goal pause <threadId>              # stop the loop
+flopsy goal resume <threadId>             # turn counter reset
+flopsy goal clear <threadId>              # delete the goal entirely
+```
+
+See [goal.md](./goal.md) for the loop semantics.
+
+### `flopsy commitments ...`
+
+Inferred follow-ups extracted from chat turns and surfaced by proactive
+fires when their `due_at_ms` elapses.
+
+```bash
+flopsy commitments                        # list pending (default)
+flopsy commitments --all                  # include delivered / dismissed / expired
+flopsy commitments --peer <id>            # filter to one peer
+flopsy commitments dismiss <id>           # mark as dismissed (stops surfacing)
+```
+
+### `flopsy faq`
+
+Deterministic regex over `sessions.summary` — surfaces question-shaped
+lines that recur 2+ times in a window. No LLM cost.
+
+```bash
+flopsy faq                                # top recurring questions, 30d window
+flopsy faq --days 14 --min 3              # tighter scope, stricter threshold
+flopsy faq --json                         # for offline analysis
+```
+
+### `flopsy skill proposed ...`
+
+Review agent-authored skills before they enter the active catalog. Lives
+under `.flopsy/content/skills-proposed/` (sibling of `skills/`).
+
+```bash
+flopsy skill proposed                     # list pending (default)
+flopsy skill proposed show <name>         # print the SKILL.md
+flopsy skill proposed accept <name>       # promote skills-proposed/<name> → skills/<name>
+flopsy skill proposed reject <name>       # delete
+```
+
+See [skills.md](./skills.md) for the full review flow.
+
+### `flopsy hooks list`
+
+Inspect the hook registry — YAML files under `.flopsy/content/hooks/`
+that fire on lifecycle events (`gateway.startup`, `proactive.fire.delivered`,
+`message.inbound`, etc.).
+
+```bash
+flopsy hooks list                         # all configured hooks + enabled state
+flopsy hooks list --json
+```
+
+See [hooks.md](./hooks.md).
+
+### `flopsy tasks ...`
+
+Cross-thread view of background tasks (`spawn_background_task`, `delegate_task`).
+
+```bash
+flopsy tasks list                         # active + recent
+flopsy tasks show <taskId>                # full row
+```
+
+### `flopsy chat send <text>`
+
+Inject a message into the chat channel as if the user typed it. Useful
+for scripting and CI.
+
+```bash
+flopsy chat send "remind me at 4pm to call mom"
+```
 
 ## Scripting
 

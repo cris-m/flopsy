@@ -1,130 +1,131 @@
 # Skills
 
-A **skill** is a reusable chunk of knowledge + instructions that an agent can load on demand. Skills live as plain markdown files under `.flopsy/skills/<skill-name>/SKILL.md`. When an agent is asked a question that matches a skill's trigger, the skill content is spliced into the prompt for that turn only.
+A **skill** is a reusable knowledge + instructions chunk an agent loads on demand. Skills are plain markdown files under `.flopsy/content/skills/<name>/SKILL.md`. The catalog scans this directory at boot and the agent reads bodies via tool calls or proactive-fire frontmatter.
 
-The shipped library has 79 skills spanning research (`arxiv-search`, `web-research`), productivity (`habit-tracker`, `scheduler`), coding (`code-review`, `debugging`, `project-scaffolding`), channel-specific behaviour (`telegram`, `discord`, `whatsapp`), and meta-capabilities (`self-critique`, `summarization`, `step-sequencer`).
+## Three sibling directories
+
+```
+.flopsy/content/
+├── skills/                  # ACTIVE — agents can see + use these
+├── skills-optional/         # BUNDLED but inactive — install with `flopsy skill install <name>`
+└── skills-proposed/         # AGENT-AUTHORED — pending human review
+```
+
+| Path | Who writes | Who reads | Lifecycle |
+|---|---|---|---|
+| `skills/` | Operator (hand-authored), `skill_manage(create)`, or `flopsy skill install` | Agents | Active → stale (30d no read) → archived (90d no read) via curator |
+| `skills-optional/` | Bundled with FlopsyBot | Promoted to `skills/` on install | Static |
+| `skills-proposed/` | `SessionExtractor` at session close (`/new`) OR worker via `skill_manage(create)` | Operator reviews with `flopsy skill proposed` | Manual `accept` → `skills/` or `reject` → deleted |
 
 ## Anatomy of a skill
 
 ```
-.flopsy/skills/
-└── arxiv-search/
-    ├── SKILL.md            # required — front-matter + instructions
-    ├── example-query.md    # optional — reference material loaded on demand
-    └── assets/             # optional — images, templates, scripts
+.flopsy/content/skills/
+└── coding/
+    ├── SKILL.md         # required — frontmatter + body
+    ├── references/      # optional — supporting docs the body links
+    ├── scripts/         # optional — runnable scripts the agent can invoke
+    └── templates/       # optional — file scaffolds
 ```
 
 A minimal `SKILL.md`:
 
 ```markdown
 ---
-name: arxiv-search
-description: Find and summarise papers from arXiv by query or author.
-triggers:
-  - "arxiv"
-  - "paper about"
-  - "latest research on"
-agents: [legolas]
+name: coding
+description: Problem-solving through code. Use when you can't solve a task with existing MCP tools alone.
 ---
 
-When the user asks for papers or research:
+# Coding — Problem-Solving Through Code
 
-1. Call `web_research` with site:arxiv.org scoping.
-2. For each result, fetch the abstract page.
-3. Return title, authors, one-sentence summary, DOI, and pub date.
-4. Offer to delegate a deeper read via `fetch_pdf_and_extract`.
+Write code to solve problems that your existing tools can't handle directly.
+Quick scripts, data transforms, API tests, calculations, automation.
+
+## Critical Operational Rules
+1. NEVER tell the user to run commands — YOU run them.
+2. ...
 ```
 
-Field-by-field:
+Frontmatter fields (only `name` and `description` are required):
 
-- **`name`** — filesystem slug; must match the directory.
-- **`description`** — one-line purpose (shown in `flopsy skills list` and in agent routing decisions).
-- **`triggers`** — literal substrings that suggest this skill is relevant. The skill loader uses fuzzy matching + an LLM-based rerank.
-- **`agents`** — which agents may load this skill. Empty / omitted = available to all.
+| Field | Required | Purpose |
+|---|---|---|
+| `name` | ✅ | kebab-case slug. Must match the directory name. |
+| `description` | ✅ | One-line summary used in the catalog + skill-routing decisions. |
+| `compatibility` | optional | Free-form text — typically `Designed for FlopsyBot agent`. |
+| `version` | optional | semver bumped by `skill_manage(bump_version)`. |
+| `when_to_use` | optional | Trigger description (also embedded inside the body for some skills). |
 
-The markdown body is the **instruction payload** — it goes directly into the system prompt for the turn.
+There is **no** `triggers: [...]` array or `agents: [...]` restriction in the live schema. Catalog scoping happens at job level (proactive fires bind skills via job frontmatter `skills:`) or via DCL match.
 
-## How skills load
+## How skills reach the agent
 
-```mermaid
-flowchart LR
-  MSG[User message] --> TRIGGER{Trigger<br/>match?}
-  TRIGGER -->|yes| SCORE[Score relevance<br/>vs top-K candidates]
-  TRIGGER -->|no| NONE[No skill loaded]
-  SCORE -->|selected| INJECT[Inject SKILL.md into prompt]
-  INJECT --> TURN[Run turn]
-  NONE --> TURN
-```
+There are three load paths:
 
-- The skill loader runs before the LLM call.
-- At most N skills are injected per turn (default 2) to keep the prompt compact.
-- Loaded skills are logged (`flopsy mgmt status` shows recent skill activations).
-- Skills are **cached in memory** at gateway start — editing a `SKILL.md` and restarting the gateway picks up the change.
+1. **Job-bound (proactive)** — a cron/heartbeat job's frontmatter lists `skills: [name1, name2]`. The proactive executor reads those bodies and prepends them as `<active_skills>` for that fire only.
 
-## Built-in skill taxonomy
+2. **Agent-driven (interactive)** — the agent calls `skill_manage(operation: 'view', skillName: 'X')` mid-turn to load a body. Or DCL (Dynamic Catalog Loading) matches a skill description to the user's query.
 
-```mermaid
-flowchart TB
-  SKILLS[skills/]
-  SKILLS --> RESEARCH[Research]
-  SKILLS --> CODING[Coding]
-  SKILLS --> PRODUCTIVITY[Productivity]
-  SKILLS --> COMMUNICATION[Channel-specific]
-  SKILLS --> REASONING[Reasoning / meta]
-  SKILLS --> SECURITY[Security / safety]
+3. **Curator-tracked usage** — every view bumps `view_count` in `.skill-state.json`; the curator transitions skills active → stale → archived based on age + activity.
 
-  RESEARCH --> R1[arxiv-search]
-  RESEARCH --> R2[web-research]
-  RESEARCH --> R3[verification]
-  RESEARCH --> R4[source-assessment]
+## Skill curator
 
-  CODING --> C1[code-review]
-  CODING --> C2[debugging]
-  CODING --> C3[project-scaffolding]
-  CODING --> C4[github]
+Runs at session close (`runSkillCurator` in `src/team/src/harness/review/skill-curator.ts`). Only touches **agent-created** skills (`is_agent_created: true`); hand-authored skills are never auto-archived.
 
-  PRODUCTIVITY --> P1[habit-tracker]
-  PRODUCTIVITY --> P2[daily-rhythm]
-  PRODUCTIVITY --> P3[plan-my-day]
-  PRODUCTIVITY --> P4[scheduler]
+| Trigger | Transition |
+|---|---|
+| `last_viewed_at` older than 30 days, state = `active`, not pinned | → `stale` |
+| `last_viewed_at` older than 90 days, state = `stale`, not pinned | → `archived` |
+| Skill viewed | → `active` (reactivates from any state) |
 
-  COMMUNICATION --> CO1[telegram]
-  COMMUNICATION --> CO2[discord]
-  COMMUNICATION --> CO3[whatsapp]
-  COMMUNICATION --> CO4[slack]
-
-  REASONING --> M1[self-critique]
-  REASONING --> M2[critical-analysis-chain]
-  REASONING --> M3[summarization]
-  REASONING --> M4[step-sequencer]
-
-  SECURITY --> S1[skill-security]
-  SECURITY --> S2[privacy-audit]
-  SECURITY --> S3[propaganda-recognition]
-```
+Archived skills stay on disk but the catalog hides them. Pinned skills bypass everything — `skill_manage(pin, skillName)`.
 
 ## Writing your own skill
 
 ```bash
-# 1. Create the directory
-mkdir -p .flopsy/skills/my-skill
-
-# 2. Write SKILL.md (see template above)
-$EDITOR .flopsy/skills/my-skill/SKILL.md
-
-# 3. Restart the gateway so it's indexed
-flopsy gateway restart
+mkdir -p .flopsy/content/skills/my-skill
+$EDITOR .flopsy/content/skills/my-skill/SKILL.md
+flopsy gateway restart       # re-scan catalog
 ```
 
 Good skills are:
 
-- **Narrow.** One purpose per skill. "Research + summarise + email" → three skills composed by the agent.
-- **Trigger-specific.** Vague triggers (`"help"`) cause noise. Name the domain.
-- **Under 2 KB.** Long skills blow the context budget. If you need more, split into assets loaded conditionally.
-- **Grounded in tools.** Mention which tools (built-in or MCP) the agent should reach for. The agent will follow your instructions before defaulting to general reasoning.
+- **Narrow.** One purpose per skill. "Research + summarise + email" → three skills the agent composes.
+- **Self-contained.** Don't assume context that won't be in the next session's prompt.
+- **Under ~2 KB.** Long skills blow the context budget on the turn they're loaded.
+- **Grounded in tools.** Name the tools the agent should reach for. Specific is better than abstract.
+
+## Agent-authored skills (review flow)
+
+The agent can write skills it discovers via `skill_manage(create)` mid-conversation. The recommended target for new agent-authored skills is `skills-proposed/` so a human can review before the skill influences future turns:
+
+```bash
+flopsy skill proposed list           # what's pending review
+flopsy skill proposed show <name>    # read the SKILL.md
+flopsy skill proposed accept <name>  # promote to skills/ (active)
+flopsy skill proposed reject <name>  # delete
+```
+
+`SessionExtractor` (at `/new` or session close) also writes proposals here. It re-reads the closed transcript and proposes a skill whenever a reusable procedure with 3+ steps emerges.
+
+## Installing optional / external skills
+
+```bash
+flopsy skill list                              # active
+flopsy skill list --optional                   # bundled but not installed
+flopsy skill install web-research              # install from optional/
+flopsy skill install ./my-skill                # local directory
+flopsy skill install ./scratchpad/SKILL.md     # single file
+flopsy skill install https://github.com/foo/bar/tree/main/skills/calendar
+flopsy skill install https://example.com/skill.md
+flopsy skill uninstall <name>                  # active → optional/ (recoverable)
+flopsy skill show <name>                       # print body
+```
+
+Every non-local install runs through a safety scanner (`tools/skills_guard`-style regex) and prompts before writing into `skills/` unless `--force`.
 
 ## Related
 
-- [Agents](./agents.md) — which agents get which skills
-- [Tools](./tools.md) — the tools skills tell agents to use
-- The `skill-creator` shipped skill is a meta-skill that walks you through writing a new one interactively
+- [Agents](./agents.md) — which agents have `skill_manage`
+- [Tools](./tools.md) — `skill_manage` operations and shape
+- The `skill-creator` bundled skill is a meta-skill that walks you through writing a new one interactively

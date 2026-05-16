@@ -7,11 +7,23 @@ FlopsyBot runs a small **team** of agents: one main, several workers. The main t
 | Agent | Role | Type | Default model | Responsibility |
 |---|---|---|---|---|
 | `gandalf` | main | main | `ollama:glm-4.6:cloud` | User-facing coordinator, plans + delegates |
-| `legolas` | worker | worker | `ollama:qwen3.5:27b` | Research / deep-search / summaries |
-| `saruman` | worker | worker | `ollama:qwen3-coder:480b-cloud` | Code generation + review |
-| `gimli` | worker | worker | `ollama:gemma4:e4b` | Schedule + productivity tools |
+| `legolas` | worker | worker | `ollama:qwen3.5:27b` | Web / Google research, summaries |
+| `gimli` | worker | worker | `ollama:gemma4:e4b` | Notion / Obsidian / Apple notes / Apple reminders / Todoist |
+| `saruman` | worker | deep-research | (provider-flex) | Long-horizon multi-round research |
+| `aragorn` | worker | worker | (provider-flex) | OSINT — Twitter, VirusTotal, Shodan |
 
 `flopsy team` shows the roster; `flopsy model list` shows the models; `flopsy model use <agent> <model>` switches one.
+
+### Per-role tool surface
+
+| Role | Always available |
+|---|---|
+| **main** (gandalf) | `send_message`, `send_poll`, `ask_user`, `react`, `delegate_task`, `spawn_background_task`, `search_conversation_history`, `connect_service`, `skill_manage`, `manage_schedule` |
+| **worker** | `delegate_task` (chain up to depth 3), `spawn_background_task`, `notify_teammate`, `skill_manage` |
+
+Workers can author skills — the same `skill_manage(create)` tool gandalf has. The reflection-nudge interceptor fires after 5 tool calls in a turn, prompting the agent to capture reusable procedures.
+
+Under proactive fires (`proactiveMode: true`), the main agent loses `send_message`, `delegate_task`, `spawn_background_task`, `ask_user`, `react`, `send_poll`, and `manage_schedule` — the engine handles delivery, and the agent must return prose or structured `__respond__` output. `skill_manage` stays available.
 
 ## Anatomy of an agent
 

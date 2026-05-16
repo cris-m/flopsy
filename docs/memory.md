@@ -13,7 +13,7 @@ flowchart TB
   end
 
   subgraph DYNAMIC["Dynamic — updated per turn"]
-    STATE[state.db<br/>threads, messages, user facts]
+    STATE[learning.db<br/>threads, messages, user facts]
     MEM[memory.db<br/>vector memory]
     CKPT[checkpoints.db<br/>paused turns]
   end
@@ -30,13 +30,14 @@ flowchart TB
 
 | Layer | Where | Format | Read | Written |
 |---|---|---|---|---|
-| Persona | `.flopsy/SOUL.md` | Markdown | Once per agent build | By you (editor) |
-| Operations manual | `.flopsy/AGENTS.md` | Markdown | Once per agent build | By you (editor) |
-| Skills | `.flopsy/skills/*/SKILL.md` | Markdown + YAML | On turn when triggered | By you (editor) |
-| Thread / message log | `.flopsy/harness/state.db` | SQLite + FTS5 | Every turn | Every turn |
-| User facts (cross-thread) | `.flopsy/harness/state.db` | SQLite table | By memory tool | By memory tool |
-| Vector memory | `.flopsy/harness/memory.db` | SQLite + embeddings | By memory tool | By memory tool |
-| Checkpoints | `.flopsy/harness/checkpoints.db` | SQLite | On resume after crash/pause | During pause |
+| Persona | `.flopsy/content/SOUL.md` | Markdown | Once per agent build | By you (editor) |
+| Operations manual | `.flopsy/content/AGENTS.md` | Markdown | Once per agent build | By you (editor) |
+| User profile | `.flopsy/content/USER.md` | Markdown | Once per agent build | By you (editor) |
+| Skills | `.flopsy/content/skills/<name>/SKILL.md` | Markdown + YAML | On demand (DCL / proactive) | Editor / `skill_manage` / `SessionExtractor` |
+| Learning store | `.flopsy/state/learning.db` | SQLite + FTS5 | Every turn | Every turn |
+| Vector memory | `.flopsy/state/memory.db` | SQLite + embeddings | By `memory_search` tool | By `memory_add` tool |
+| Checkpoints | `.flopsy/state/checkpoints.db` | SQLite | On resume after crash/pause | During pause |
+| Proactive state | `.flopsy/state/proactive.db` | SQLite | Engine + agent (manage_schedule) | Engine + manage_schedule |
 
 ## Static layer: the markdown files
 
@@ -81,9 +82,9 @@ Each skill directory has a `SKILL.md` with frontmatter + instructions. Skills ar
 
 ## Dynamic layer: the SQLite databases
 
-All three databases live in `.flopsy/harness/` and are opened in WAL mode. Do not copy them while the gateway is running — use `flopsy gateway stop` first.
+All databases live in `.flopsy/state/` and are opened in WAL mode. Do not copy them while the gateway is running — use `flopsy gateway stop` first.
 
-### state.db — threads, messages, user facts
+### learning.db — sessions, turns, telemetry
 
 The primary state store. Holds:
 
@@ -132,13 +133,21 @@ Rarely something you inspect manually. `flopsy doctor` reports its writable stat
 
 ## The internal memory tool
 
-Agents don't write to `state.db` / `memory.db` directly — they call memory tools:
+Agents don't write to `learning.db` / `memory.db` directly — they call memory tools (see [tools.md](./tools.md) for the schemas):
+
+| Tool | Writes to | Purpose |
+|---|---|---|
+| `memory_add(content)` | `memory.db` | Save a fact / preference / note for future recall |
+| `memory_search(query)` | `memory.db` (FTS5 + embeddings) | "What do I know about this?" |
+| `search_conversation_history(query)` | `learning.db` (FTS5) | "Did we discuss X before?" |
+
+Operator-only:
 
 | Tool | Writes to | When to use |
 |---|---|---|
-| `remember_fact(fact)` | `state.db.user_facts` | Cross-thread, stable truths about the user |
+| `remember_fact(fact)` | `learning.db.user_facts` | Cross-thread, stable truths about the user |
 | `save_memory(content)` | `memory.db` (vector) | Episodic content worth retrieving later semantically |
-| `search_past_conversations(query)` | reads `state.db` FTS5 | "Did we discuss X before?" |
+| `search_past_conversations(query)` | reads `learning.db` FTS5 | "Did we discuss X before?" |
 | `recall_memory(query)` | reads `memory.db` vectors | "What do I know about topic X?" |
 
 Agents learn to call these through guidance in `AGENTS.md` — e.g. "when the user mentions a preference, call `remember_fact` so it persists across threads".
@@ -149,15 +158,15 @@ No dedicated CLI command exists today. Direct inspection paths:
 
 ```bash
 # Full-text search user facts + messages
-sqlite3 ~/.flopsy/harness/state.db \
+sqlite3 ~/.flopsy/state/learning.db \
   "SELECT role, substr(text, 1, 80) FROM messages ORDER BY created_at DESC LIMIT 20"
 
 # List remembered facts
-sqlite3 ~/.flopsy/harness/state.db \
+sqlite3 ~/.flopsy/state/learning.db \
   "SELECT fact, created_at FROM user_facts ORDER BY created_at DESC"
 
 # How big is memory?
-ls -lah ~/.flopsy/harness/*.db
+ls -lah ~/.flopsy/state/*.db
 ```
 
 A `flopsy memory list|show|clear` command is on the roadmap — it would give the same view without raw SQL.
@@ -169,13 +178,14 @@ FlopsyBot intentionally does **not** use markdown files for user memory. Two rea
 1. **Write contention.** Agents write to memory continuously; flat files would need locking, atomic rename per write, and conflict resolution with concurrent edits. SQLite handles this natively.
 2. **Retrieval.** FTS5 + vector search are the right primitives for "did I already know this?" and "what's similar to this?". Grep over a markdown file doesn't scale past a few hundred entries.
 
-What agents need to know about the user lives in `state.db.user_facts`; what they've discussed lives in `state.db.messages`; what they've learned semantically lives in `memory.db`. The markdown layer is reserved for things you write by hand — voice (SOUL.md), operations (AGENTS.md), and skills.
+What agents need to know about the user lives in `learning.db.user_facts`; what they've discussed lives in `learning.db.messages`; what they've learned semantically lives in `memory.db`. The markdown layer is reserved for things you write by hand — voice (SOUL.md), operations (AGENTS.md), and skills.
 
 ## Backup + hygiene
 
-- **Backup**: stop the gateway, `tar -czf flopsy-backup-$(date +%F).tgz .flopsy/harness/*.db`.
+- **Backup**: stop the gateway, `tar -czf flopsy-backup-$(date +%F).tgz .flopsy/state/*.db`.
 - **Size control**: messages table grows without bound. A future `flopsy memory prune --older-than 90d` command is planned. For now, truncate via SQL if needed.
-- **Reset**: `flopsy gateway stop && rm .flopsy/harness/*.db && flopsy gateway start` — starts from zero memory.
+- **Reset**: `flopsy gateway stop && rm .flopsy/state/*.db && flopsy gateway start` — starts from zero memory.
+- **Prune by age**: `flopsy memory prune --older-than 90` (dry-run); add `--yes` to actually delete. Scope to one namespace with `-n memories:gandalf`.
 
 ## Related
 

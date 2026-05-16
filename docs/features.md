@@ -109,12 +109,12 @@ Openclaw-style. On gateway start the engine scans:
 
 Up to 5 catchup fires per restart, staggered 5s apart (cap prevents post-outage flood). Excess candidates are deferred to their next regular fire.
 
-### Delivery gates (three, all explicit)
+### Delivery gates
 | Gate | Source | When |
 |---|---|---|
 | **DND / quiet hours** | User explicit (`/dnd`, `flopsy dnd`) | `shouldSuppress()` → suppressed |
 | **Conditional mode** | Agent judgement | `deliveryMode: conditional` + `shouldDeliver: false` → suppressed |
-| **Anti-repetition** | Auto content-dedup | Embedding similarity ≥0.88 / topic match / reported-IDs match → suppressed |
+| **Semantic dedup** | Auto content-dedup via embeddings | Cosine similarity ≥0.88 vs the last 48h of delivered messages → suppressed |
 
 If none fire → delivered straight to channel.
 
@@ -135,10 +135,12 @@ flopsy dnd off
 
 Both surfaces hit the same `PresenceManager` via mgmt HTTP. Takes effect instantly, no restart.
 
-### Anti-repetition (three layers)
-1. **Embedding similarity** — auto. Every delivered message is embedded (via `memory.embedder`); next delivery is cosine-compared against the last 48h and suppressed if ≥0.88.
-2. **Topic tags** — agent-aware. The prompt is prepended with `<anti_repetition>` block listing recent topics + cooldown ("DO NOT repeat these — pick a new angle or suppress"). Delivered topics: 3-day cooldown. Suppressed ones: 12h.
-3. **Stable IDs** — agent-emitted. Agent writes `REPORTED: emails=[msg-a, msg-b]` in its reply; parser stores them per type. Future fires see "Already reported IDs: ..." and skip duplicates. News/briefing/digest jobs auto-extract URLs.
+### Prompt blocks injected on every fire
+Each fire assembles a system-prompt prefix with:
+- `<active_skills>` — bound skill bodies (from job frontmatter `skills:`)
+- `<fire_context>` — date, time, timezone
+- `<output_quality>` — quality guidance based on recent fire history
+- `<pre_check>` — output from any `preCheckScript`
 
 See [proactive.md](./proactive.md).
 
@@ -245,6 +247,16 @@ Fast, no-LLM handlers run before any agent turn. Available in every channel:
 | `/doctor` (`/health`, `/check`) | Problem-focused health verdict with remediation hints |
 | `/dnd` (`/quiet`) | Toggle DND — see §3 |
 | `/audit` | Config sanity + credential expiry audit |
+| `/new` | Close the current session and start fresh — fires `SessionExtractor` |
+| `/compact` | Force-compact the session history (the auto-compactor does this automatically when over threshold) |
+| `/branch` | Fork the current session into a named branch |
+| `/personality <name>` | Switch the active voice overlay for this session |
+| `/skills` (`/skills proposed/approve/reject`) | Browse + review skills (incl. agent-authored proposals) |
+| `/mcp` | List configured MCP servers + reload after credential changes |
+| `/plan` | Inspect / cancel the active plan state for this thread |
+| `/cron` / `/heartbeat` | In-chat schedule management (mirrors `flopsy schedule …`) |
+| `/insights` | Token usage + activity summary |
+| `/goal <text>` | Set a standing goal — agent self-continues until done (see [goal.md](./goal.md)) |
 | `/help` (`/?`) | List every registered slash command |
 
 Auto-discoverable — new slash handlers land in `/help` automatically on the next restart.

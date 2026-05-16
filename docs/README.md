@@ -31,7 +31,9 @@ flopsy gateway start       # or: flopsy run start
 | [Channels](./channels.md) | Configuring messaging channels |
 | [Gateway](./gateway.md) | Gateway daemon, management endpoint, lifecycle |
 | [Proactive](./proactive.md) | Heartbeats, cron scheduler, inbound webhooks |
-| [Memory](./memory.md) | SOUL.md, AGENTS.md, state.db, memory.db, the memory tool |
+| [Memory](./memory.md) | SOUL.md, AGENTS.md, learning.db, memory.db, the memory tool |
+| [Goal loop](./goal.md) | The `/goal` Ralph-loop self-continuation feature |
+| [Hooks](./hooks.md) | YAML event hooks (`.flopsy/content/hooks/*.yaml`) |
 
 ## The 30-second mental model
 
@@ -80,17 +82,30 @@ flowchart LR
 ## File locations
 
 ```
-flopsy.json5                     # single source of truth for config
-.env                             # secrets (bot tokens, API keys)
-.flopsy/                         # runtime workspace
-├── SOUL.md                      # persona — voice, tone, mannerisms
-├── AGENTS.md                    # operations manual — what to do
-├── skills/                      # skill library (markdown definitions)
-├── harness/
-│   ├── state.db                 # threads, messages, user facts (SQLite + FTS5)
-│   ├── memory.db                # vector memory (embeddings)
-│   └── checkpoints.db           # paused turns (LangGraph-style)
-└── logs/                        # gateway.log
+flopsy.json5                          # single source of truth for config
+.env                                  # secrets (bot tokens, API keys)
+.flopsy/                              # runtime workspace (FLOPSY_HOME)
+├── config/
+│   └── flopsy.json5                  # alternate config location
+├── content/                          # human-edited content
+│   ├── SOUL.md                       # persona — voice, tone, mannerisms
+│   ├── AGENTS.md                     # operations manual — how Flopsy works
+│   ├── USER.md                       # stable facts about the user
+│   ├── personalities.yaml            # voice overlays toggleable via /personality
+│   ├── skills/                       # active skill library (markdown)
+│   ├── skills-optional/              # bundled-but-inactive — install via CLI
+│   ├── skills-proposed/              # agent-authored awaiting review
+│   ├── prompts/                      # cron + heartbeat prompt files
+│   ├── hooks/                        # YAML-defined event hooks
+│   └── roles/                        # role-delta prompt fragments
+├── state/
+│   ├── learning.db                   # sessions, tool_failures, proactive_decisions, …
+│   ├── memory.db                     # vector memory (embeddings)
+│   ├── checkpoints.db                # paused turns (LangGraph-style)
+│   ├── proactive.db                  # heartbeat/cron/webhook schedules + dedup
+│   └── proactive.json                # presence, queue, oneshot markers
+├── auth/                             # OAuth + pairing material (chmod 0700)
+└── logs/                             # gateway.log
 ```
 
 ## Where to go next

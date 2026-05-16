@@ -102,15 +102,24 @@ When a schedule fires, the engine resolves the target at **fire time** (not regi
 
 "Fire time" matters — `followActiveChannel` picks up the channel where you're chatting **right now**, not where you were when the schedule was registered.
 
-## Anti-repetition
+## Dedup
 
-The engine runs three layers of dedup automatically — no config knobs:
+Every delivered message is embedded (via `memory.embedder`) and the next delivery is cosine-compared against the last 48h. Suppressed if similarity ≥ 0.88. Lives in `proactive_deliveries` inside `proactive.db`.
 
-1. **Semantic topic tags.** In `conditional` mode, the agent returns `topics: ["weather", "stocks"]`. Future fires see "DO NOT repeat: weather (3h ago)" in their prompt and naturally pick a new angle.
-2. **Stable-ID tracking.** Agent writes `REPORTED: news=[url1] emails=[msg-id]` (plain line) or `reportedIds: {...}` (structured). Future fires see the ID list and skip already-covered items. URLs auto-tracked for jobs whose name contains "news", "briefing", or "digest".
-3. **Embedding similarity.** Every delivered message is embedded (via `memory.embedder`). Next delivery is cosine-compared vs the last 48 h. Suppressed if similarity ≥ 0.88. Catches paraphrases that slipped past topic tagging.
+> Earlier versions of FlopsyBot had two additional layers (topic tags + REPORTED-ID tracking) that the agent participated in via an `<anti_repetition>` prompt block. Those were removed — they added prompt bloat for marginal benefit. Embedding similarity is the only auto-dedup gate now.
 
-All of this lives in `proactive.db` — topics in `recentTopics`, reported IDs in `proactive_reported`, delivery embeddings in `proactive_deliveries`.
+## Prompt blocks assembled per fire
+
+Each fire prepends these XML-tagged blocks to the agent's prompt (executor.ts):
+
+| Block | Source | Purpose |
+|---|---|---|
+| `<active_skills>` | Job frontmatter `skills:` resolved by `skill-loader.ts` | Bind specific SKILL.md bodies for this fire |
+| `<fire_context>` | `buildDateContext()` | Current date / time / IANA timezone |
+| `<output_quality>` | `buildQualityGuidance(store)` | Quality guidance derived from recent fire history (categories, silence reasons) |
+| `<pre_check>` | `preCheckScript` output (when configured) | Deterministic script output the agent reads before deciding |
+
+The user's actual `job.prompt` is appended at the end.
 
 ## One-shot
 
@@ -241,8 +250,8 @@ Every fire logs the decision chain:
 | `src/gateway/src/proactive/triggers/cron.ts` | Croner-driven schedule + `at`/`every`/`cron` |
 | `src/gateway/src/proactive/triggers/webhook.ts` | Inbound HTTP route builder |
 | `src/gateway/src/proactive/pipeline/executor.ts` | Runs the agent, applies dedup, delivers |
-| `src/gateway/src/proactive/pipeline/context.ts` | Builds the `<anti_repetition>` prompt block |
-| `src/gateway/src/proactive/state/dedup-store.ts` | SQLite — deliveries + embeddings + reported IDs + runtime schedules |
+| `src/gateway/src/proactive/pipeline/skill-loader.ts` | Resolves job `skills:` frontmatter into `<active_skills>` |
+| `src/gateway/src/proactive/state/dedup-store.ts` | SQLite — deliveries + embeddings + runtime schedules |
 | `src/gateway/src/proactive/state/store.ts` | JSON state — presence, queue, oneshot markers, seed marker |
 | `src/team/src/tools/manage-schedule.ts` | Agent-facing tool |
 | `src/cli/src/ops/schedule-command.ts` | `flopsy schedule` CLI |
