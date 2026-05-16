@@ -81,6 +81,16 @@ export interface StatusSnapshot {
             readonly enabled: boolean;
             readonly embedder?: string;
         };
+        readonly vault?: {
+            readonly initialised: boolean;
+            readonly serverRunning: boolean;
+            readonly mgmtPort?: number;
+            readonly proxyPort?: number;
+            readonly secrets?: number;
+            readonly tokens?: number;
+            readonly rules?: number;
+            readonly hydratedIntoEnv: boolean;
+        };
     };
 
     readonly paths: {

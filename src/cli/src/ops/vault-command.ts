@@ -1,6 +1,7 @@
 import { confirm, password as promptPassword } from '@inquirer/prompts';
 import { Command } from 'commander';
-import { chmodSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, resolve as resolvePath } from 'node:path';
 import { workspace } from '@flopsy/shared';
 import {
@@ -561,46 +562,147 @@ export function registerVaultCommands(root: Command): void {
             console.log(ok(`removed rule ${id}`));
         });
 
-    v.command('server')
-        .description('Run the vault proxy server (CONNECT auth + host ACL; MITM substitution lands in a follow-up)')
+    const srv = v.command('server').description('Vault proxy server (defaults: mgmt 18800, proxy 18801; daemonised by default)');
+
+    srv.command('start', { isDefault: true })
+        .description('Start the vault server as a background daemon (logs to .flopsy/logs/vault.log)')
         .option('--host <addr>', 'Bind address', '127.0.0.1')
-        .option('--mgmt-port <n>', 'Mgmt HTTP port', (s) => parseInt(s, 10), 18791)
-        .option('--proxy-port <n>', 'MITM proxy port', (s) => parseInt(s, 10), 18792)
-        .action(async (opts: { host: string; mgmtPort: number; proxyPort: number }) => {
+        .option('--mgmt-port <n>', 'Mgmt HTTP port', (s) => parseInt(s, 10), 18800)
+        .option('--proxy-port <n>', 'CONNECT proxy port', (s) => parseInt(s, 10), 18801)
+        .option('--foreground', 'Run in the foreground (do not daemonise)', false)
+        .action(async (opts: { host: string; mgmtPort: number; proxyPort: number; foreground?: boolean }) => {
             const path = workspace.vaultDb();
             if (!existsSync(path)) {
                 console.log(bad('vault not initialised — run `flopsy vault init` first'));
                 process.exit(1);
             }
-            const pw = await readMasterPassword('Master password:');
-            let handle;
-            try {
-                handle = await startVaultServer({
-                    vaultDbPath: path,
-                    masterPassword: pw,
-                    host: opts.host,
-                    mgmtPort: opts.mgmtPort,
-                    proxyPort: opts.proxyPort,
-                });
-            } catch (err) {
-                if (err instanceof VaultSealError) {
-                    console.log(bad(err.message));
-                    process.exit(1);
+            const pidFile = workspace.vaultPidFile();
+            if (existsSync(pidFile)) {
+                const pid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10);
+                if (Number.isInteger(pid) && pid > 0) {
+                    try {
+                        process.kill(pid, 0);
+                        console.log(bad(`vault server already running (pid ${pid}) — stop it with \`flopsy vault server stop\``));
+                        process.exit(1);
+                    } catch {
+                        unlinkSync(pidFile);
+                    }
                 }
-                throw err;
+            }
+
+            if (opts.foreground || process.env.FLOPSY_VAULT_DAEMON_CHILD === '1') {
+                const pw = process.env.FLOPSY_VAULT_DAEMON_CHILD === '1'
+                    ? process.env.FLOPSY_VAULT_MASTER_PASSWORD!
+                    : await readMasterPassword('Master password:');
+                let handle;
+                try {
+                    handle = await startVaultServer({
+                        vaultDbPath: path,
+                        masterPassword: pw,
+                        host: opts.host,
+                        mgmtPort: opts.mgmtPort,
+                        proxyPort: opts.proxyPort,
+                    });
+                } catch (err) {
+                    if (err instanceof VaultSealError) {
+                        console.log(bad(err.message));
+                        process.exit(1);
+                    }
+                    throw err;
+                }
+                writeFileSync(pidFile, String(process.pid), { mode: 0o600 });
+                console.log(section('flopsy vault server'));
+                console.log(ok(`mgmt   http://${handle.mgmt.address()}`));
+                console.log(ok(`proxy  http://${handle.proxy.address()}  (HTTPS_PROXY target)`));
+                console.log(info(opts.foreground ? 'CTRL+C to stop' : 'daemonised'));
+                const shutdown = async (signal: string) => {
+                    try { unlinkSync(pidFile); } catch { /* */ }
+                    await handle.stop();
+                    process.exit(0);
+                };
+                process.on('SIGINT', () => void shutdown('SIGINT'));
+                process.on('SIGTERM', () => void shutdown('SIGTERM'));
+                await new Promise(() => { /* hold */ });
+                return;
+            }
+
+            const pw = await readMasterPassword('Master password:');
+            const logFile = workspace.vaultLogFile();
+            mkdirSync(dirname(logFile), { recursive: true });
+            const out = openSync(logFile, 'a');
+            const err = openSync(logFile, 'a');
+            const child = spawn('flopsy', [
+                'vault', 'server', 'start',
+                '--host', opts.host,
+                '--mgmt-port', String(opts.mgmtPort),
+                '--proxy-port', String(opts.proxyPort),
+                '--foreground',
+            ], {
+                detached: true,
+                stdio: ['ignore', out, err],
+                env: {
+                    ...process.env,
+                    FLOPSY_VAULT_DAEMON_CHILD: '1',
+                    FLOPSY_VAULT_MASTER_PASSWORD: pw,
+                },
+            });
+            child.unref();
+            for (let i = 0; i < 30; i++) {
+                await new Promise((resolve) => setTimeout(resolve, 200));
+                if (existsSync(pidFile)) break;
+            }
+            if (!existsSync(pidFile)) {
+                console.log(bad(`vault server did not start — see ${logFile}`));
+                process.exit(1);
             }
             console.log(section('flopsy vault server'));
-            console.log(ok(`mgmt   http://${handle.mgmt.address()}`));
-            console.log(ok(`proxy  http://${handle.proxy.address()}  (HTTPS_PROXY target)`));
-            console.log(info('CTRL+C to stop'));
-            const shutdown = async (signal: string) => {
-                console.log(info(`\n[${signal}] shutting down`));
-                await handle.stop();
-                process.exit(0);
-            };
-            process.on('SIGINT', () => void shutdown('SIGINT'));
-            process.on('SIGTERM', () => void shutdown('SIGTERM'));
-            await new Promise(() => { /* hold open until signal */ });
+            console.log(ok(`started pid ${readFileSync(pidFile, 'utf-8').trim()}`));
+            console.log(`  mgmt   http://${opts.host}:${opts.mgmtPort}`);
+            console.log(`  proxy  http://${opts.host}:${opts.proxyPort}`);
+            console.log(`  logs   ${logFile}`);
+            console.log(info('stop with `flopsy vault server stop`'));
+        });
+
+    srv.command('stop')
+        .description('Stop a running vault server (via pidfile)')
+        .action(() => {
+            const pidFile = workspace.vaultPidFile();
+            if (!existsSync(pidFile)) {
+                console.log(info('vault server not running (no pidfile)'));
+                return;
+            }
+            const pid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10);
+            if (!Number.isInteger(pid) || pid <= 0) {
+                console.log(bad('stale pidfile — removing'));
+                try { unlinkSync(pidFile); } catch { /* */ }
+                return;
+            }
+            try {
+                process.kill(pid, 'SIGTERM');
+                console.log(ok(`sent SIGTERM to pid ${pid}`));
+            } catch (err) {
+                console.log(bad(`failed to signal pid ${pid}: ${err instanceof Error ? err.message : String(err)}`));
+                try { unlinkSync(pidFile); } catch { /* */ }
+                process.exit(1);
+            }
+        });
+
+    srv.command('status')
+        .description('Show running vault server status')
+        .action(() => {
+            const pidFile = workspace.vaultPidFile();
+            if (!existsSync(pidFile)) {
+                console.log(info('vault server not running'));
+                return;
+            }
+            const pid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10);
+            try {
+                process.kill(pid, 0);
+                console.log(ok(`running (pid ${pid})`));
+            } catch {
+                console.log(bad(`stale pidfile (pid ${pid} not alive) — removing`));
+                try { unlinkSync(pidFile); } catch { /* */ }
+            }
         });
 
     v.command('change-password')

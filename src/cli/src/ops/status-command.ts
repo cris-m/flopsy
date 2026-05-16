@@ -26,6 +26,8 @@ import { listCredentialProviders, loadCredential } from '../auth/credential-stor
 import { isColorTty } from '../ui/pretty';
 import { cronJobsOf, heartbeatsOf, inboundWebhooksOf, readFlopsyConfig } from './config-reader';
 import { probeGatewayState } from './gateway-state';
+import { existsSync, readFileSync } from 'node:fs';
+import { workspace } from '@flopsy/shared';
 
 export function registerStatusCommand(root: Command): void {
     root.command('status')
@@ -42,7 +44,7 @@ export function registerStatusCommand(root: Command): void {
             if (opts.verbose) {
                 console.log(renderCliVerbose(snapshot, theme));
             } else {
-                console.log(renderCliCompact(snapshot, theme));
+                console.log(renderCliCompact(snapshot, theme, process.stdout.columns ?? 80));
             }
         });
 }
@@ -253,6 +255,7 @@ async function scanStatus(): Promise<StatusSnapshot> {
                 enabled: config.memory?.enabled !== false,
                 ...(config.memory?.embedder?.model ? { embedder: config.memory.embedder.model } : {}),
             },
+            ...(await probeVault()),
         },
         paths: {
             config: configPath,
@@ -266,6 +269,62 @@ async function scanStatus(): Promise<StatusSnapshot> {
  * `undefined` when the gateway isn't running or the endpoint is
  * unreachable — the CLI is expected to fall back to config-only data.
  */
+async function probeVault(): Promise<{ vault?: StatusSnapshot['integrations']['vault'] }> {
+    const dbPath = workspace.vaultDb();
+    const initialised = existsSync(dbPath);
+    if (!initialised) {
+        return { vault: { initialised: false, serverRunning: false, hydratedIntoEnv: false } };
+    }
+    const pidFile = workspace.vaultPidFile();
+    let serverRunning = false;
+    if (existsSync(pidFile)) {
+        const pid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10);
+        if (Number.isInteger(pid) && pid > 0) {
+            try {
+                process.kill(pid, 0);
+                serverRunning = true;
+            } catch { /* */ }
+        }
+    }
+    let mgmtPort: number | undefined;
+    let proxyPort: number | undefined;
+    let secrets: number | undefined;
+    let tokens: number | undefined;
+    let rules: number | undefined;
+    if (serverRunning) {
+        for (const candidate of [18800, 18791]) {
+            try {
+                const res = await fetch(`http://127.0.0.1:${candidate}/v1/status`, {
+                    signal: AbortSignal.timeout(700),
+                });
+                if (res.ok) {
+                    const body = await res.json() as { secrets?: number; tokens?: number; rules?: number };
+                    mgmtPort = candidate;
+                    proxyPort = candidate === 18800 ? 18801 : 18792;
+                    secrets = body.secrets;
+                    tokens = body.tokens;
+                    rules = body.rules;
+                    break;
+                }
+            } catch { /* try next */ }
+        }
+    }
+    const hydratedIntoEnv = !!process.env['FLOPSY_VAULT_MASTER_PASSWORD'] === false
+        && !!process.env['FLOPSY_VAULT_DAEMON_CHILD'];
+    return {
+        vault: {
+            initialised,
+            serverRunning,
+            ...(mgmtPort !== undefined ? { mgmtPort } : {}),
+            ...(proxyPort !== undefined ? { proxyPort } : {}),
+            ...(secrets !== undefined ? { secrets } : {}),
+            ...(tokens !== undefined ? { tokens } : {}),
+            ...(rules !== undefined ? { rules } : {}),
+            hydratedIntoEnv,
+        },
+    };
+}
+
 async function fetchLive(host: string, port: number): Promise<Record<string, unknown> | undefined> {
     const mgmtPort = port + 1;
     const url = `http://${host}:${mgmtPort}/management/status`;

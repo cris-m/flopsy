@@ -102,6 +102,8 @@ export function createWorkspace(env: NodeJS.ProcessEnv = process.env) {
         auth:          (...parts: string[]) => sub('auth', ...parts),
         logs:          () => sub('logs'),
         pidFile:       () => sub('gateway.pid'),
+        vaultPidFile:  () => sub('vault.pid'),
+        vaultLogFile:  () => sub('logs', 'vault.log'),
 
         // Machine state — DB files live directly under state/.
         state:         (...parts: string[]) => sub('state', ...parts),

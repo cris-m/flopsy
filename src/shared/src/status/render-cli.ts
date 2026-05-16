@@ -26,10 +26,35 @@ export const plainTheme: CliTheme = {
     heading: (s) => s,
 };
 
-/** Compact render: one line per section; fits a ~12-line terminal screen. */
-export function renderCliCompact(s: StatusSnapshot, t: CliTheme = plainTheme): string {
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
+function visLen(s: string): number {
+    return s.replace(ANSI_RE, '').length;
+}
+
+function padTo(s: string, n: number): string {
+    const v = visLen(s);
+    return v >= n ? s : s + ' '.repeat(n - v);
+}
+
+function boxTop(title: string, width: number, t: CliTheme): string {
+    const titleStr = ` ${title} `;
+    const fill = Math.max(1, width - visLen(titleStr) - 3);
+    return t.dim('╭─') + t.heading(titleStr) + t.dim('─'.repeat(fill) + '╮');
+}
+
+function boxRow(content: string, width: number, t: CliTheme): string {
+    const inner = width - 4;
+    return t.dim('│ ') + ' ' + padTo(content, inner - 1) + t.dim(' │');
+}
+
+function boxBottom(width: number, t: CliTheme): string {
+    return t.dim('╰' + '─'.repeat(width - 2) + '╯');
+}
+
+/** Compact render: one rounded box per section. Sized to caller-provided width. */
+export function renderCliCompact(s: StatusSnapshot, t: CliTheme = plainTheme, width = 80): string {
+    const W = Math.max(60, Math.min(width, 120));
     const lines: string[] = [];
-    const label = (name: string) => t.heading(`${GLYPH.diamond} ${name.padEnd(14)}`);
 
     if (s.issues && s.issues.length > 0) {
         for (const i of s.issues) {
@@ -38,13 +63,19 @@ export function renderCliCompact(s: StatusSnapshot, t: CliTheme = plainTheme): s
         }
     }
 
+    const section = (title: string, rows: string[]): void => {
+        lines.push(boxTop(title, W, t));
+        for (const r of rows) lines.push(boxRow(r, W, t));
+        lines.push(boxBottom(W, t));
+    };
+
     {
         const parts: string[] = [];
         if (s.gateway.running) {
             parts.push(t.ok(`${GLYPH.dot} running`));
+            parts.push(t.dim(`${s.gateway.host}:${s.gateway.port}`));
             if (s.gateway.pid !== undefined) parts.push(t.dim(`pid ${s.gateway.pid}`));
             if (s.gateway.uptimeMs !== undefined) parts.push(t.dim(`up ${humanDuration(s.gateway.uptimeMs)}`));
-            parts.push(t.dim(`${s.gateway.host}:${s.gateway.port}`));
             if (s.gateway.activeThreads && s.gateway.activeThreads > 0) {
                 parts.push(t.accent(`${s.gateway.activeThreads} turn${s.gateway.activeThreads === 1 ? '' : 's'}`));
             }
@@ -53,111 +84,135 @@ export function renderCliCompact(s: StatusSnapshot, t: CliTheme = plainTheme): s
             parts.push(t.dim(`${s.gateway.host}:${s.gateway.port}`));
             parts.push(t.dim('run `flopsy gateway start`'));
         }
-        lines.push(`${label('Gateway')}${parts.join(t.dim(' · '))}`);
+        section('Gateway', [parts.join('    ')]);
     }
 
     {
         const enabled = s.channels.filter((c) => c.enabled);
         const disabled = s.channels.filter((c) => !c.enabled);
         const total = s.channels.length;
-        const dots = [
-            ...enabled.map((c) => `${t.ok(GLYPH.dot)} ${c.name}`),
-            ...disabled.map((c) => t.dim(`${GLYPH.circle} ${c.name}`)),
-        ];
-        const countStr = total === 0 ? t.dim('none configured') : `${enabled.length}/${total}`;
-        lines.push(`${label('Channels')}${countStr}   ${dots.join('  ')}`);
+        if (total === 0) {
+            section('Channels', [t.dim('none configured')]);
+        } else {
+            const rows: string[] = [];
+            if (enabled.length > 0) {
+                rows.push(enabled.map((c) => `${t.ok(GLYPH.dot)} ${c.name}`).join('  '));
+            }
+            if (disabled.length > 0) {
+                rows.push(disabled.map((c) => t.dim(`${GLYPH.circle} ${c.name}`)).join('  '));
+            }
+            section(`Channels (${enabled.length}/${total} active)`, rows);
+        }
     }
 
     {
         if (s.team.length === 0) {
-            lines.push(`${label('Team')}${t.dim('none configured')}`);
+            section('Team', [t.dim('none configured')]);
         } else {
-            const working = s.team.filter((m) => m.status === 'working');
             const enabled = s.team.filter((m) => m.enabled);
-            const bits: string[] = [`${enabled.length}/${s.team.length}`];
             const summary = s.team.map((m) => {
                 if (!m.enabled) return t.dim(m.name);
                 if (m.status === 'working') return t.accent(`${m.name}*`);
                 return m.name;
             });
-            bits.push(summary.join(t.dim(' · ')));
+            const rows: string[] = [summary.join('  ')];
+            const working = s.team.filter((m) => m.status === 'working' && m.currentTask);
             if (working.length > 0) {
-                const tasks = working
-                    .filter((m) => m.currentTask)
-                    .map((m) => `${m.name}: ${truncate(m.currentTask!, 30)}`);
-                if (tasks.length > 0) bits.push(t.dim(`[${tasks.join('; ')}]`));
+                rows.push(
+                    t.dim(working.map((m) => `${m.name}: ${truncate(m.currentTask!, 30)}`).join(' · ')),
+                );
             }
-            lines.push(`${label('Team')}${bits.join('  ')}`);
+            section(`Team (${enabled.length}/${s.team.length} ready)`, rows);
         }
     }
 
     {
         const p = s.proactive;
-        const bits: string[] = [];
+        const parts: string[] = [];
         if (!p.enabled) {
-            bits.push(t.dim(`${GLYPH.circle} disabled`));
+            parts.push(t.dim(`${GLYPH.circle} disabled`));
         } else {
-            bits.push(p.running === false ? t.warn(`${GLYPH.circle} stopped`) : t.ok(`${GLYPH.dot} running`));
+            parts.push(p.running === false ? t.warn(`${GLYPH.circle} stopped`) : t.ok(`${GLYPH.dot} running`));
             const triggers: string[] = [];
             if (p.heartbeats.count > 0) triggers.push(`${p.heartbeats.enabled} hb`);
             if (p.cron.count > 0) triggers.push(`${p.cron.enabled} cron`);
             if (p.webhooks.count > 0) triggers.push(`${p.webhooks.count} wh`);
             if (triggers.length === 0) triggers.push('no schedules');
-            bits.push(t.dim(triggers.join(' · ')));
-
-            if (p.stats24h) {
-                const st = p.stats24h;
-                const funnel = [
-                    t.ok(`${GLYPH.delivered}${st.delivered}`),
-                    st.suppressed > 0 ? t.warn(`${GLYPH.suppressed}${st.suppressed}`) : t.dim(`${GLYPH.suppressed}0`),
-                    st.errors > 0 ? t.bad(`${GLYPH.error}${st.errors}`) : t.dim(`${GLYPH.error}0`),
-                ];
-                if (st.retryPending > 0) funnel.push(t.warn(`${GLYPH.queue}${st.retryPending}`));
-                bits.push(t.dim('24h:'));
-                bits.push(funnel.join(' '));
-            }
+            parts.push(t.dim(triggers.join(' · ')));
         }
-        lines.push(`${label('Proactive')}${bits.join('  ')}`);
+        const rows: string[] = [parts.join('    ')];
+        if (p.stats24h) {
+            const st = p.stats24h;
+            const funnel = [
+                t.ok(`${GLYPH.delivered}${st.delivered}`),
+                st.suppressed > 0 ? t.warn(`${GLYPH.suppressed}${st.suppressed}`) : t.dim(`${GLYPH.suppressed}0`),
+                st.errors > 0 ? t.bad(`${GLYPH.error}${st.errors}`) : t.dim(`${GLYPH.error}0`),
+            ];
+            if (st.retryPending > 0) funnel.push(t.warn(`${GLYPH.queue}${st.retryPending}`));
+            rows.push(`${t.dim('24h')}  ${funnel.join(' ')}`);
+        }
+        section('Proactive', rows);
+    }
+
+    if (s.integrations.vault) {
+        const v = s.integrations.vault;
+        const parts: string[] = [];
+        if (!v.initialised) {
+            parts.push(t.dim(`${GLYPH.circle} not initialised`));
+            parts.push(t.dim('run `flopsy vault init`'));
+        } else if (v.serverRunning) {
+            parts.push(t.ok(`${GLYPH.dot} server running`));
+            if (v.mgmtPort !== undefined && v.proxyPort !== undefined) {
+                parts.push(t.dim(`mgmt :${v.mgmtPort}  proxy :${v.proxyPort}`));
+            }
+            const stats: string[] = [];
+            if (v.secrets !== undefined) stats.push(`${v.secrets} secrets`);
+            if (v.tokens !== undefined) stats.push(`${v.tokens} tokens`);
+            if (v.rules !== undefined) stats.push(`${v.rules} rules`);
+            if (stats.length > 0) parts.push(t.dim(stats.join('  ')));
+        } else {
+            parts.push(t.warn(`${GLYPH.circle} server stopped`));
+            parts.push(t.dim('run `flopsy vault server`'));
+        }
+        section('Vault', [parts.join('    ')]);
     }
 
     {
         const i = s.integrations;
-        const bits: string[] = [];
+        const parts: string[] = [];
         if (i.auth.length === 0) {
-            bits.push(t.dim('auth none'));
+            parts.push(t.dim('auth none'));
         } else {
             const ok = i.auth.filter((a) => !a.expired).length;
-            const expired = i.auth.length - ok;
-            if (expired > 0) bits.push(t.warn(`auth ${ok}/${i.auth.length}`));
-            else bits.push(t.ok(`auth ${ok}/${i.auth.length}`));
+            const tag = `auth ${ok}/${i.auth.length}`;
+            parts.push(ok < i.auth.length ? t.warn(tag) : t.ok(tag));
         }
-        if (i.mcp.enabled) bits.push(`${t.ok('mcp')} ${i.mcp.active}/${i.mcp.configured}`);
-        else bits.push(t.dim('mcp off'));
+        parts.push(i.mcp.enabled ? `${t.ok('mcp')} ${i.mcp.active}/${i.mcp.configured}` : t.dim('mcp off'));
         if (i.memory.enabled) {
-            const emb = i.memory.embedder ? t.dim(` · ${i.memory.embedder}`) : '';
-            bits.push(`${t.ok('memory')}${emb}`);
+            const emb = i.memory.embedder ? ` ${t.dim(i.memory.embedder)}` : '';
+            parts.push(`${t.ok(`${GLYPH.dot} memory`)}${emb}`);
         } else {
-            bits.push(t.dim('memory off'));
+            parts.push(t.dim('memory off'));
         }
-        lines.push(`${label('Integrations')}${bits.join('   ')}`);
+        section('Integrations', [parts.join('    ')]);
     }
 
     if (s.work && (s.work.active.length > 0 || (s.work.recent?.length ?? 0) > 0)) {
-        const bits: string[] = [];
+        const parts: string[] = [];
         if (s.work.active.length > 0) {
-            bits.push(t.accent(`${s.work.active.length} active`));
+            parts.push(t.accent(`${s.work.active.length} active`));
             const preview = s.work.active
                 .slice(0, 2)
                 .map((w) => `${w.worker}: ${truncate(w.description, 30)}`);
-            bits.push(t.dim(preview.join(' · ')));
+            parts.push(t.dim(preview.join(' · ')));
         }
         if (s.work.recent && s.work.recent.length > 0) {
-            bits.push(t.dim(`${s.work.recent.length} recent`));
+            parts.push(t.dim(`${s.work.recent.length} recent`));
         }
-        lines.push(`${label('Work')}${bits.join('  ')}`);
+        section('Work', [parts.join('    ')]);
     }
 
-    lines.push(`${label('Paths')}${t.dim(tildePath(s.paths.config))}`);
+    section('Config', [t.dim(tildePath(s.paths.config))]);
 
     return lines.join('\n');
 }
