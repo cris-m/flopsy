@@ -23,6 +23,7 @@ import {
     parseReportedLines,
     stripReportedLines,
 } from './context';
+import { buildPatternFindingsBlock } from './pattern-detector';
 import { runScript } from './script-runner';
 import { loadSkills } from './skill-loader';
 import { emitHook } from '../../hooks';
@@ -227,6 +228,7 @@ export class JobExecutor {
             // Channel-agnostic — reads by peer_id only.
             const peerId = job.delivery?.peer?.id;
             const commitmentsBlock = buildCommitmentsBlock(peerId);
+            const patternBlock = buildPatternFindingsBlock(peerId);
 
             // Resolve job.skills → SKILL.md contents (the HOW for this task's WHAT).
             const { loaded: preloadedSkills, missing: missingSkills } = await loadSkills(
@@ -268,6 +270,7 @@ export class JobExecutor {
                 dateContext +
                 qualityBlock +
                 commitmentsBlock +
+                patternBlock +
                 contextBlock +
                 preCheckBlock +
                 job.prompt;

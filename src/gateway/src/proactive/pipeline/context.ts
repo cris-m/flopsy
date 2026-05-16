@@ -146,6 +146,22 @@ export function buildCommitmentsBlock(
         // Best-effort — never break a fire on missing/unmigrated commitments table.
         return '';
     }
+    let dismissed30d = 0;
+    try {
+        const store = getSharedLearningStore();
+        const since = nowMs - 30 * 24 * 60 * 60 * 1000;
+        const row = (store.getDatabase() as { prepare: (s: string) => { get: (...a: unknown[]) => unknown } })
+            .prepare(
+                `SELECT COUNT(*) AS n FROM proactive_commitments
+                  WHERE peer_id = ? AND status = 'dismissed'
+                    AND coalesce(resolved_at, created_at) >= ?`,
+            )
+            .get(peerId, since) as { n: number } | undefined;
+        dismissed30d = row?.n ?? 0;
+    } catch {
+        /* fall through */
+    }
+
     if (rows.length === 0) return '';
 
     const lines: string[] = [
@@ -172,6 +188,10 @@ export function buildCommitmentsBlock(
             .replace(/<\/pre_check>/gi, '[/pre_check_LITERAL]')
             .replace(/<\/fire_context>/gi, '[/fire_context_LITERAL]');
         lines.push(`      ${safe}`);
+    }
+    if (dismissed30d > 0) {
+        lines.push('');
+        lines.push(`  dismissal_signal: ${dismissed30d} dismissed in 30d — surface only high-conviction commitments.`);
     }
     lines.push('</commitments_due_now>');
     return lines.join('\n') + '\n\n';

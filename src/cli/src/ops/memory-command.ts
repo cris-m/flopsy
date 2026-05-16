@@ -170,6 +170,52 @@ export function registerMemoryCommands(root: Command): void {
                 console.log(`  ${r.namespace.padEnd(14)} ${String(r.count).padStart(4)} entries  ${String(r.bytes).padStart(6)}B  ${tag}`);
             }
         });
+
+    mem.command('prune')
+        .description('Delete memory entries older than N days (decay). Default 90, dry-run unless --yes.')
+        .option('--older-than <days>', 'Age threshold in days', '90')
+        .option('-n, --namespace <ns>', 'Restrict prune to one namespace')
+        .option('--yes', 'Actually delete (without this, prints a dry-run summary)', false)
+        .action((opts: { olderThan: string; namespace?: string; yes?: boolean }) => {
+            readFlopsyConfig();
+            const dbPath = resolveWorkspacePath('state', 'memory.db');
+            if (!existsSync(dbPath)) {
+                console.log(warn('memory.db not found — nothing to prune'));
+                return;
+            }
+            const days = Math.max(1, parseInt(opts.olderThan, 10) || 90);
+            const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+            const db = new Database(dbPath, { readonly: !opts.yes });
+            try {
+                const filters: string[] = ['updated_at < ?'];
+                const params: Array<string | number> = [cutoff];
+                if (opts.namespace) {
+                    filters.push('namespace = ?');
+                    params.push(opts.namespace);
+                }
+                const where = filters.join(' AND ');
+                const countRow = db
+                    .prepare(`SELECT COUNT(*) AS n FROM memory_items WHERE ${where}`)
+                    .get(...params) as { n: number } | undefined;
+                const n = countRow?.n ?? 0;
+                if (n === 0) {
+                    console.log(ok(`No entries older than ${days}d` + (opts.namespace ? ` in "${opts.namespace}"` : '')));
+                    return;
+                }
+                if (!opts.yes) {
+                    console.log(warn(`Would delete ${n} entries older than ${days}d` + (opts.namespace ? ` in "${opts.namespace}"` : '') + '. Re-run with --yes to apply.'));
+                    return;
+                }
+                const result = db
+                    .prepare(`DELETE FROM memory_items WHERE ${where}`)
+                    .run(...params);
+                console.log(ok(`Pruned ${result.changes} entries older than ${days}d` + (opts.namespace ? ` from "${opts.namespace}"` : '')));
+            } catch (err) {
+                console.log(bad(`Prune failed: ${(err as Error).message}`));
+            } finally {
+                db.close();
+            }
+        });
 }
 
 /**
