@@ -15,6 +15,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 
 const DEFAULT_HEADLESS = process.env.BROWSER_HEADLESS === 'true';
+const BROWSER_EXECUTABLE_PATH = process.env.BROWSER_EXECUTABLE_PATH?.trim() || undefined;
 const MAX_SESSIONS = parseInt(process.env.BROWSER_MAX_SESSIONS || '5', 10);
 const MAX_PAGES_PER_SESSION = parseInt(process.env.BROWSER_MAX_PAGES || '10', 10);
 const MAX_MARKERS = parseInt(process.env.BROWSER_MAX_MARKERS || '100', 10);
@@ -428,6 +429,9 @@ class BrowserManager {
             headless,
             args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
             timeout: DEFAULT_TIMEOUT,
+            ...(BROWSER_EXECUTABLE_PATH && browserType === 'chromium'
+                ? { executablePath: BROWSER_EXECUTABLE_PATH }
+                : {}),
         });
 
         const harPath = recordHar
