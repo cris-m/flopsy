@@ -1,7 +1,9 @@
 ---
 name: proactive
-compatibility: Designed for FlopsyBot agent
-description: Being proactive — taking initiative with scheduled jobs and heartbeats, anticipating needs, and acting before being asked. Use when deciding how to be helpful on your own.
+description: Being proactive — taking initiative with `manage_schedule` (cron + heartbeats), anticipating needs, and acting before being asked. Use when deciding how to be helpful on your own.
+metadata:
+  flopsy:
+    agent-affinity: [gandalf]
 ---
 
 # Being Proactive
@@ -16,23 +18,27 @@ You're not a passive assistant that waits to be asked. You have two systems — 
 - A conversation reveals a recurring need
 - You want to take initiative without being asked
 
-## The Two Systems
+## The Two Schedule Shapes
 
-### Scheduled Jobs (you create and manage)
+Both run through the single `manage_schedule` tool. The difference is `scheduleType`:
 
-Jobs are time-based automations. They can deliver a static message (reminders) or wake you up to process a prompt at execution time (smart recurring tasks).
+### Cron schedules — wall-clock fires
 
-**You can:** create, list, enable, disable, delete.
+`scheduleType: "cron"` fires at a specific time, on a periodic interval, or on a cron expression.
 
-See `/skills/scheduler/SKILL.md` for tool usage and schedule formats.
+- "remind me at 3pm" → `cronKind: "at"`, `oneshot: true`
+- "every 90s" → `cronKind: "every"`, `everyMs: 90000`
+- "every Monday 9am" → `cronKind: "cron"`, `cronExpr: "0 9 * * 1"`
 
-### Heartbeats (you manage, don't create)
+You can **create, list, update, delete, disable, enable** cron schedules.
 
-Heartbeats are autonomous check-ins that already exist. They run on intervals during active hours, gather context, and decide whether something is worth telling the user.
+### Heartbeat schedules — interval-based check-ins
 
-**You can:** list, enable, disable, trigger immediately. You **cannot** create or delete them.
+`scheduleType: "heartbeat"` repeats on a simple interval string (`30m`, `1h`, `2d`), often with active-hours bounds.
 
-See `/skills/heartbeat/SKILL.md` for how heartbeat prompts work.
+Heartbeats are typically operator-provisioned (e.g. the `morning-briefing`, `smart-pulse`) rather than created mid-conversation. You can still **create, list, update, delete, disable, enable** them at runtime via `manage_schedule` — but the operator-shipped ones cover most needs; check first before adding.
+
+See `scheduler` skill for the full `manage_schedule` schema.
 
 ## Taking Initiative
 
@@ -79,21 +85,25 @@ You're not limited to reacting to the user. Think of yourself as having your own
 - **Plan ahead.** A task would be better done at a specific time? Don't just note it — schedule it. "This API has rate limits during business hours, I'll run the full analysis at 2am."
 - **Spot patterns worth monitoring.** You notice something the user would benefit from tracking (a price, a competitor, a project metric)? Create a recurring prompt-mode job to watch it. Suggest: "Want me to keep an eye on this weekly?"
 - **Morning snapshot pattern.** After a morning briefing, create precise scheduled jobs for the day's events (meeting reminders, prep, post-meeting follow-up). This replaces constant polling with targeted reactions. Delta-check midday to catch changes.
-- **Leverage existing heartbeats.** Before creating a new job, always check `list_heartbeats()`. The monitoring you want might already be covered by a heartbeat that just needs enabling or triggering. Don't duplicate what's already there.
+- **Leverage existing schedules.** Before creating a new one, run `manage_schedule({ operation: "list" })`. The monitoring you want might already be covered by an existing heartbeat or cron job — enable or update it rather than duplicating.
 - **Upgrade one-offs to recurring.** You just did something useful once — could it be valuable on a schedule? "I just checked your inbox — want me to do this every morning?"
 - **Use quiet hours wisely.** Research and data gathering — schedule with `conditional` so results get **queued** for when the user returns. Use `silent` for self-improvement: reflect on recent interactions, organize your memory, learn from mistakes, revisit failed tasks and research solutions. The user doesn't need to see you thinking — just get better. Be selective — only for things that genuinely matter to the user, not every minor hiccup.
 
 ### Create Smart Recurring Tasks
 
-Don't just set dumb reminders. Use **prompt mode** to create jobs where you actually think at execution time:
+Don't just set dumb reminders. Use prompt-mode schedules where you actually think at execution time:
 
 ```
-schedule_bot_message(
-  name: "Weekly project check-in",
-  when: "every friday at 4pm",
+manage_schedule({
+  operation: "create",
+  scheduleType: "cron",
+  name: "weekly project check-in",
+  cronKind: "cron",
+  cronExpr: "0 16 * * 5",
+  cronTz: "Africa/Nairobi",
   prompt: "Check the status of the user's active projects. Look at recent commits, open PRs, task completion. Give a brief weekly status: what shipped, what's in progress, what's blocked.",
-  delivery_mode: "conditional"
-)
+  deliveryMode: "conditional"
+})
 ```
 
 This is far more useful than a static "don't forget to review your projects" message.
@@ -102,14 +112,13 @@ This is far more useful than a static "don't forget to review your projects" mes
 
 | Situation | Use |
 |---|---|
-| Simple reminder at a specific time | **Job** — message mode |
-| Smart recurring task (check something, analyze, report) | **Job** — prompt mode with `conditional` |
-| User mentions a heartbeat by name | **Heartbeat** — manage it |
-| User says "run X now" and X is a heartbeat | `trigger_heartbeat` |
-| User says "stop/pause X" | Check both systems, manage whichever matches |
-| User says "what's running?" | Show both: `list_heartbeats()` + `list_bot_scheduled_jobs()` |
+| Simple reminder at a specific time | `manage_schedule({ scheduleType: "cron", cronKind: "at", oneshot: true, ... })` |
+| Smart recurring task (check something, analyze, report) | `manage_schedule({ scheduleType: "cron" or "heartbeat", ..., deliveryMode: "conditional" })` |
+| User mentions a schedule by name | `manage_schedule({ operation: "list" })` to find the id, then act |
+| User says "stop/pause X" | `manage_schedule({ operation: "disable", id: "..." })` |
+| User says "what's running?" | `manage_schedule({ operation: "list" })` — covers both cron + heartbeat |
 
-**Ambiguous cases:** When the user mentions something by name ("pause the morning briefing"), check both systems — it could be either a heartbeat or a scheduled job.
+**Ambiguous cases:** When the user mentions something by name ("pause the morning briefing"), list first, then disable/delete by id.
 
 ## Being Proactive Without Being Annoying
 
@@ -140,24 +149,23 @@ Taking initiative is good. Spamming the user is not. Strike the balance:
 Jobs and heartbeats work together:
 
 **"I want a morning routine":**
-1. Check `list_heartbeats()` — a morning briefing heartbeat might already exist
+1. `manage_schedule({ operation: "list" })` — a morning briefing might already exist
 2. If yes, it's handled. Tell the user what it does
-3. If no, create a daily prompt-mode job
+3. If no, create a daily prompt-mode cron schedule
 
 **"Notify me when X happens":**
-1. Create a recurring prompt-mode job that checks for X
-2. Use `conditional` delivery — only notify when detected
+1. Create a recurring prompt-mode schedule that checks for X
+2. Use `deliveryMode: "conditional"` — only notify when detected
 3. Pick appropriate frequency
 
 **"Stop everything":**
-1. Disable all heartbeats + all jobs
+1. List, then disable each id
 2. Confirm what was paused (so they can re-enable selectively)
 
 ## Guidelines
 
 - **Take initiative** — suggest automations when you spot opportunities
-- **Check before creating** — don't duplicate existing heartbeats or jobs
+- **Check before creating** — `manage_schedule({ operation: "list" })` first
 - **Confirm what you did** — "Set up a daily email check at 8am" not just "done"
 - **Prefer conditional** — silence is often the right answer for recurring tasks
 - **Prefer disable over delete** — the user might want it back
-- **Always use real channel/peerId** — from the current conversation context, never guess

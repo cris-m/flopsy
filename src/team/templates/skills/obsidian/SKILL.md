@@ -13,25 +13,25 @@ Read and write notes inside the user's Obsidian vault via the obsidian MCP serve
 **CRITICAL: Follow this order on ANY failure. Do NOT stop at step 1.**
 
 1. **MCP tool** (e.g., `obsidian_search`) — try the native tool first
-2. **Direct file access via `execute()`** — Obsidian vaults are just folders of Markdown files:
+2. **Direct file access via `execute_code({ code: )`** — Obsidian vaults are just folders of Markdown files:
    ```
-   execute("find ~ -name '.obsidian' -type d -maxdepth 4 2>/dev/null")  # find vault path
-   execute("ls '/path/to/vault/'")                                       # list notes
-   execute("cat '/path/to/vault/note.md'")                               # read a note
-   execute("grep -rl 'keyword' '/path/to/vault/' --include='*.md'")      # search
+   execute_code({ code: "find ~ -name '.obsidian' -type d -maxdepth 4 2>/dev/null"})  # find vault path
+   execute_code({ code: "ls '/path/to/vault/'"})                                       # list notes
+   execute_code({ code: "cat '/path/to/vault/note.md'"})                               # read a note
+   execute_code({ code: "grep -rl 'keyword' '/path/to/vault/' --include='*.md'"})      # search
    ```
 3. **`read_file` / `write_file`** — use agent file tools if `execute` is restricted
 4. **Report failure** — ONLY after steps 1-3 fail. State which steps were tried
 
 **Vault path resolution**: If you don't know the vault path:
 1. Check the MCP config: the vault path is set in `OBSIDIAN_VAULT_PATH` env var
-2. If unknown: `execute("find ~ -name '.obsidian' -type d -maxdepth 4 2>/dev/null")` to locate vaults
+2. If unknown: `execute_code({ code: "find ~ -name '.obsidian' -type d -maxdepth 4 2>/dev/null"})` to locate vaults
 3. Common locations: `~/Documents/Obsidian Vault`, `~/Obsidian`, `~/vaults`
 
 **"Note not found"**: Don't give up after one search. Try:
 - Different keywords (shorter, broader)
 - `obsidian_list` to browse all notes, then `obsidian_get` by path
-- Direct search: `execute("grep -rl 'keyword' '/vault/path/' --include='*.md'")`
+- Direct search: `execute_code({ code: "grep -rl 'keyword' '/vault/path/' --include='*.md'"})`
 - Check for spaces/special chars in note titles
 
 ## Vault Location
@@ -81,21 +81,21 @@ tags: [topic/ai]
 2. Compose with title, optional frontmatter (tags, dates), and body in Markdown
 3. Use internal links `[[...]]` to reference related notes — search first to get correct titles
 4. `obsidian_create` with path and content
-5. If MCP fails → `execute("cat > '/vault/path/Note Title.md' << 'EOF'\n---\ntags: [topic]\n---\n# Title\nContent\nEOF")`
+5. If MCP fails → `execute_code({ code: "cat > '/vault/path/Note Title.md' << 'EOF'\n---\ntags: [topic]\n---\n# Title\nContent\nEOF"})`
 
 ### Searching the Vault
 1. `obsidian_search` with relevant keywords
 2. If no results → try shorter keywords, different terms
 3. If still nothing → `obsidian_list` to browse all notes
-4. If MCP fails → `execute("grep -rl 'keyword' '/vault/path/' --include='*.md'")`
-5. Retrieve full content with `obsidian_get` (or `execute("cat '/vault/path/note.md'")`)
+4. If MCP fails → `execute_code({ code: "grep -rl 'keyword' '/vault/path/' --include='*.md'"})`
+5. Retrieve full content with `obsidian_get` (or `execute_code({ code: "cat '/vault/path/note.md'"})`)
 
 ### Updating a Note
 1. Find the note (search or list)
 2. `obsidian_get` to read current content
 3. Apply changes preserving frontmatter and internal links
 4. `obsidian_update` with path and new content
-5. If MCP fails → read with `execute("cat")`, modify, write back with `execute("cat > ...")`
+5. If MCP fails → read with `execute_code({ code: "cat")`, modify, write back with `execute_code({ code: "cat > ..."})`
 
 ## Direct File Access Reference
 

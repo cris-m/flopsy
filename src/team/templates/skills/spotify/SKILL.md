@@ -14,8 +14,8 @@ Control Spotify playback, search music, manage playlists, and browse the library
 
 1. **MCP tool** (e.g., `spotify_play`) — try the native tool first
 2. **Re-auth + retry** — if 401/expired/auth error, the MCP server auto-reimports cookies from browsers (safari, chrome, brave, firefox, edge). If the tool still fails after re-auth, continue to step 3
-3. **`execute("spogo <command> --json")`** — CLI fallback using the same underlying engine
-4. **`execute("spotify_player <command>")`** — alternative CLI with a different auth bucket (survives rate limits that hit spogo)
+3. **`execute_code({ code: "spogo <command> --json"})`** — CLI fallback using the same underlying engine
+4. **`execute_code({ code: "spotify_player <command>"})`** — alternative CLI with a different auth bucket (survives rate limits that hit spogo)
 5. **`web_search`** — for info lookups (artist bio, album details) when all playback tools are down
 6. **Report failure** — ONLY after exhausting steps 1-5. State exactly which steps were tried
 
@@ -33,12 +33,12 @@ Auth is handled automatically by the MCP server on startup and on 401 errors. Th
 
 **If a tool returns an auth error despite auto-recovery:**
 ```
-execute("spogo auth import --browser safari")   # try each browser
-execute("spogo auth import --browser chrome")
-execute("spogo auth import --browser brave")
-execute("spogo auth import --browser firefox")
-execute("spogo auth import --browser edge")
-execute("spogo auth status")                     # verify
+execute_code({ code: "spogo auth import --browser safari"})   # try each browser
+execute_code({ code: "spogo auth import --browser chrome"})
+execute_code({ code: "spogo auth import --browser brave"})
+execute_code({ code: "spogo auth import --browser firefox"})
+execute_code({ code: "spogo auth import --browser edge"})
+execute_code({ code: "spogo auth status"})                     # verify
 ```
 
 Only tell the user "please log in to Spotify in your browser" after ALL 5 browsers fail.
@@ -149,7 +149,7 @@ Only tell the user "please log in to Spotify in your browser" after ALL 5 browse
 
 ## CLI Fallback Reference
 
-When MCP tools are down, use `execute()` with these commands:
+When MCP tools are down, use `execute_code({ code: )` with these commands:
 
 ### spogo (primary CLI)
 | Command | Example |

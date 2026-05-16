@@ -37,11 +37,10 @@ description: Send and receive Discord messages with extended Markdown formatting
 ### Images, audio, video, and files
 **Discord does NOT render markdown images.** `![alt](url)` shows as raw text.
 
-Use `send_message`'s `media` parameter to attach files:
+Use `send_message`'s `media` parameter to attach files. Channel + peer come from the runtime context; you only pass `text` / `buttons` / `media`:
 ```
 send_message({
-  channel: "discord", peer_id, peer_type,
-  message: "Here's the chart",
+  text: "Here's the chart",
   media: [{ type: "image", url: "/scratch/chart.png" }]
 })
 ```
@@ -86,83 +85,33 @@ Verify the file exists before sending. Never use `![alt](url)` syntax on Discord
 
 ## Interactive Components (Buttons & Select Menus)
 
-Discord supports interactive buttons and native select menus via the `components` parameter on `send_message`. When a user clicks a button or selects an option, you receive their action as a regular text message — no special handling needed.
+Discord supports interactive buttons via the top-level `buttons` array on `send_message`. When a user clicks a button, you receive its `value` as a regular text message — no special handling needed.
 
 ### Buttons
 
+Each button needs a `label` (shown to the user), a `value` (what comes back when tapped — required), and optionally a `style`. Discord renders style colours; other channels ignore the field.
+
 ```
 send_message({
-  channel: "discord", peer_id, peer_type,
-  message: "Deploy to production?",
-  components: [{
-    components: [
-      { type: "button", label: "Deploy", style: "success" },
-      { type: "button", label: "Cancel", style: "danger" }
-    ]
-  }]
-})
-```
-
-When the user clicks "Deploy", you receive: `Clicked "Deploy".`
-
-**Button styles:** `primary` (blurple, default), `secondary` (grey), `success` (green), `danger` (red), `link` (grey, opens URL — no interaction event)
-
-**Mixed rows example** — callback buttons on row 1, link button on row 2:
-```
-send_message({
-  channel: "discord", peer_id, peer_type,
-  message: "Review the deployment request:",
-  components: [
-    {
-      components: [
-        { type: "button", label: "Approve", style: "success" },
-        { type: "button", label: "Reject",  style: "danger"  },
-        { type: "button", label: "Deploy",  style: "primary" }
-      ]
-    },
-    {
-      components: [
-        { type: "button", label: "Documentation", style: "link", url: "https://example.com/docs" }
-      ]
-    }
+  text: "Deploy to production?",
+  buttons: [
+    { label: "Deploy", value: "deploy", style: "success" },
+    { label: "Cancel", value: "cancel", style: "danger" }
   ]
 })
 ```
 
-**Link button** (opens a URL, no click event):
-```
-{ type: "button", label: "View Docs", style: "link", url: "https://example.com" }
-```
+When the user clicks "Deploy", you receive a message with content `deploy`.
 
-### Select Menus
+**Button styles:** `primary` (blurple, default), `secondary` (grey), `success` (green), `danger` (red). Discord-only — Telegram ignores the style field.
 
-```
-send_message({
-  channel: "discord", peer_id, peer_type,
-  message: "Choose priority:",
-  components: [{
-    components: [{
-      type: "select_menu",
-      placeholder: "Select priority",
-      options: [
-        { label: "High", value: "high", description: "Urgent issues" },
-        { label: "Medium", value: "medium" },
-        { label: "Low", value: "low" }
-      ]
-    }]
-  }]
-})
-```
+**Limit:** max 9 buttons per message. For more options or aggregated voting use `send_poll`.
 
-When the user selects "High", you receive: `Selected "High" from "Select priority".`
-
-### Component rules
-- Each action row holds **up to 5 buttons** OR **1 select menu** (not both)
-- A message can have **up to 5 action rows**
-- Components expire after 30 minutes — expired clicks show "This button has expired."
-- Components work on **Discord and Telegram** — other channels silently ignore them
-- Components can be combined with text and media in the same message
-- Link buttons open URLs directly (no interaction event back to you)
+### Button rules
+- Each button needs both `label` (display) and `value` (what comes back on click — required)
+- Buttons work on **Discord and Telegram**; other channels silently drop them
+- Buttons can be combined with `text` and `media` in the same message
+- Discord renders the `style` colour; Telegram ignores it
 
 ## Polls
 
@@ -172,28 +121,17 @@ Discord supports **native polls** via the `send_poll` tool. These render as inte
 
 ```
 send_poll({
-  channel: "discord", peer_id, peer_type,
   question: "What should we work on next?",
-  options: [
-    { text: "Bug fixes" },
-    { text: "New features" },
-    { text: "Documentation" }
-  ]
+  options: ["Bug fixes", "New features", "Documentation"]
 })
 ```
 
-### With emoji
+The `options` array takes plain strings. Inline emoji in the option text renders naturally on Discord:
 
-Discord poll options can include emoji:
 ```
 send_poll({
-  channel: "discord", peer_id, peer_type,
   question: "Pick a stack",
-  options: [
-    { text: "TypeScript", emoji: "🟦" },
-    { text: "Python", emoji: "🐍" },
-    { text: "Rust", emoji: "🦀" }
-  ]
+  options: ["🟦 TypeScript", "🐍 Python", "🦀 Rust"]
 })
 ```
 
@@ -201,8 +139,9 @@ send_poll({
 
 | Parameter | Default | Notes |
 |-----------|---------|-------|
-| `allow_multiple` | `false` | Allow selecting multiple options |
-| `duration_hours` | `24` | Auto-close timer (1–768 hours) |
+| `anonymous` | `false` | Set true to hide voter identities (you lose per-user signal) |
+| `allowMultiple` | `false` | Allow selecting multiple options |
+| `durationHours` | `24` | Auto-close timer (Discord: 1–768h. Telegram caps at ~10 min). |
 
 ### Vote tracking
 When a user votes on a Discord poll, you receive a message: `Voted "Option text" in a poll.`

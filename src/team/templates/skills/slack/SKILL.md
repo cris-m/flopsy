@@ -75,44 +75,23 @@ Slack supports **any emoji** for reactions — no restrictions unlike Telegram.
 - Multiple reactions per message allowed
 - Reactions are a key part of Slack culture — use them for acknowledgment (:eyes:, :thumbsup:), status (:white_check_mark:, :hourglass:), and expression
 
-## Interactive Components
+## Interactive Buttons
 
-Slack supports Block Kit components (buttons, select menus) if the gateway tool exposes them:
+Slack supports inline buttons via the top-level `buttons` array on `send_message`. Each button needs a `label` (shown to the user) and a `value` (returned on click — required).
 
-### Buttons
 ```
 send_message({
-  channel: "slack", peer_id, peer_type,
-  message: "Deploy to production?",
-  components: [{
-    components: [
-      { type: "button", label: "Deploy", style: "success" },
-      { type: "button", label: "Cancel", style: "danger" }
-    ]
-  }]
+  text: "Deploy to production?",
+  buttons: [
+    { label: "Deploy", value: "deploy", style: "success" },
+    { label: "Cancel", value: "cancel", style: "danger" }
+  ]
 })
 ```
 
-When the user clicks "Deploy", you receive: `Clicked "Deploy".`
+When the user clicks "Deploy", you receive a message with content `deploy`.
 
-### Select Menus
-```
-send_message({
-  channel: "slack", peer_id, peer_type,
-  message: "Choose environment:",
-  components: [{
-    components: [{
-      type: "select_menu",
-      placeholder: "Select environment",
-      options: [
-        { label: "Production", value: "prod" },
-        { label: "Staging", value: "staging" },
-        { label: "Development", value: "dev" }
-      ]
-    }]
-  }]
-})
-```
+For aggregated multi-choice voting, use `send_poll` — buttons cap at 9 per message and don't aggregate vote counts.
 
 ## Guidelines
 

@@ -15,8 +15,8 @@ Interact with the user's Notion workspace to read, create, and update pages and 
 1. **MCP tool** (e.g., `notion_pages_search`) — try the native tool first
 2. **Token check** — if auth error, verify the token is set (NEVER print the value):
    ```
-   execute("[ -n \"$NOTION_API_KEY\" ] && echo 'set' || echo 'NOT SET'")
-   execute("[ -f ~/.config/notion/api_key ] && echo 'file exists' || echo 'NOT FOUND'")
+   execute_code({ code: "[ -n \"$NOTION_API_KEY\" ] && echo 'set' || echo 'NOT SET'"})
+   execute_code({ code: "[ -f ~/.config/notion/api_key ] && echo 'file exists' || echo 'NOT FOUND'"})
    ```
 3. **Direct API fallback via `http_request`** — if MCP server is down but token exists:
    ```

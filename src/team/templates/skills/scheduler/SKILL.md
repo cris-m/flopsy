@@ -1,149 +1,126 @@
 ---
 name: scheduler
-compatibility: Designed for FlopsyBot agent
-description: Creating and managing scheduled jobs — reminders, recurring prompts, and time-based automations. Use when the user wants something to happen at a specific time or on a recurring schedule.
+description: Create, list, edit, or remove scheduled fires (heartbeats + cron) via the single `manage_schedule` tool. Use when the user wants something to happen at a specific time, on a recurring interval, or "in N minutes".
+metadata:
+  flopsy:
+    agent-affinity: [gandalf]
 ---
 
 # Scheduler
 
-The scheduler runs time-based automations. Jobs can deliver static messages (reminders) or process prompts at execution time (smart recurring tasks). Some jobs are pre-configured by the admin, and you can create additional ones on demand. All jobs persist across gateway restarts.
+One tool: `manage_schedule`. Six operations: `create | list | update | delete | disable | enable`. Two schedule types: `heartbeat` (interval-based) and `cron` (wall-clock).
 
-## When to Use This Skill
+## Pick the schedule type
 
-- User wants a reminder ("remind me to call the dentist at 2pm")
-- User wants something recurring ("check my email every morning at 8")
-- User wants a one-time delayed message ("send me a summary in 30 minutes")
-- User asks about their scheduled tasks ("what's scheduled?", "cancel my reminders")
-- User wants to pause, resume, or delete a scheduled job
-
-## Two Modes
-
-### Message Mode — Static Text
-
-For simple reminders and notifications. The message is delivered exactly as written.
-
-```
-schedule_bot_message(
-  name: "Dentist reminder",
-  when: "tomorrow 2pm",
-  message: "Call the dentist to reschedule your appointment",
-  channel: "telegram",
-  peerId: "123456789"
-)
-```
-
-**When to use:** "remind me to...", "send me a message at...", "tell me to..."
-
-The message is prefixed with `[REMINDER]` automatically.
-
-### Prompt Mode — Agent Processes at Execution Time
-
-For smart, dynamic tasks. At execution time, the agent wakes up, processes the prompt with fresh context, and generates a response.
-
-```
-schedule_bot_message(
-  name: "Morning email check",
-  when: "every weekday at 8am",
-  prompt: "Check email inbox. Summarize anything urgent or time-sensitive. Ignore newsletters and marketing. If nothing important, say so briefly.",
-  delivery_mode: "conditional",
-  channel: "telegram",
-  peerId: "123456789"
-)
-```
-
-**When to use:** "check my email every morning", "give me a weather update daily", "summarize my calendar every evening"
-
-The prompt is saved to a file at `/scheduler/prompts/` and read fresh each execution, so you can write detailed instructions. Agent-created prompt files are prefixed with `agent_` to distinguish them from admin-configured ones.
-
-## Delivery Modes
-
-Control what happens with the response:
-
-| Mode | Behavior | Best for |
+| User asks | Type | Example |
 |---|---|---|
-| `always` | Response always delivered to user | Reminders, briefings the user always wants |
-| `conditional` | Agent decides: promote (deliver), suppress (skip), or queue (save for later) | Recurring checks where "nothing to report" is common |
-| `silent` | Run in background, response not delivered to user | Self-improvement: reflect on interactions, organize memory, learn from mistakes, revisit failed tasks and research solutions during quiet hours |
+| "remind me in 2 hours to call mom" | `cron`, `cronKind: "at"`, `oneshot: true` | One-shot fire at an absolute time |
+| "check my inbox every 30 minutes" | `heartbeat`, `interval: "30m"` | Repeats forever on a simple interval |
+| "every Monday at 9am give me a briefing" | `cron`, `cronKind: "cron"`, `cronExpr: "0 9 * * 1"` | Standard 5-field cron |
+| "fire once at 8pm tonight" | `cron`, `cronKind: "at"`, `oneshot: true`, `atMs: <epoch ms>` | One-shot |
+| "every 90 seconds, do X" | `cron`, `cronKind: "every"`, `everyMs: 90000` | Fixed interval below cron's 1-min granularity |
 
-**Defaults:**
-- Message mode → `always` (reminders should always arrive)
-- Prompt mode → `conditional` (agent decides if it's worth interrupting)
+## Create — heartbeat
 
-## Schedule Formats
-
-| Format | Example | Type |
-|---|---|---|
-| Relative | `"in 30 minutes"`, `"in 2 hours"`, `"in 3 days"` | One-shot |
-| Tomorrow | `"tomorrow 9am"`, `"tomorrow at 3:30pm"` | One-shot |
-| At time | `"at 9am"`, `"at 15:00"` | One-shot (rolls to tomorrow if past) |
-| Daily | `"every day at 9am"`, `"daily at 9am"` | Recurring |
-| Weekly | `"every monday at 9am"`, `"every friday at 5pm"` | Recurring |
-| Weekday | `"every weekday at 9am"`, `"weekdays at 8am"` | Recurring |
-| Weekend | `"every weekend at 10am"` | Recurring |
-| Interval | `"every 30 minutes"`, `"every 2 hours"` | Recurring |
-| Cron | `"0 9 * * *"`, `"0 9 * * 1-5"` | Recurring |
-
-## Managing Jobs
+A heartbeat fires repeatedly on a simple interval string.
 
 ```
-list_bot_scheduled_jobs()                -- see all jobs
-disable_bot_scheduled_job(taskId: "id")  -- pause without deleting
-enable_bot_scheduled_job(taskId: "id")   -- resume a paused job
-delete_bot_scheduled_job(taskId: "id")   -- permanently remove
+manage_schedule({
+  operation: "create",
+  scheduleType: "heartbeat",
+  name: "morning inbox check",
+  interval: "30m",
+  prompt: "Read my inbox. If anything urgent, send a one-line summary.",
+  deliveryMode: "conditional",
+  activeHoursStart: 8,
+  activeHoursEnd: 22
+})
 ```
 
-Always list jobs first to get the ID before disabling/enabling/deleting.
+- `interval` string format: `<N>s` `<N>m` `<N>h` `<N>d` (e.g. `30s`, `15m`, `2h`, `1d`)
+- `activeHoursStart` / `activeHoursEnd`: 0-23, optional. Outside this window the heartbeat sleeps.
 
-## Advanced Features
+## Create — cron
 
-Some pre-configured jobs use advanced features that aren't available through `schedule_bot_message`:
+A cron job fires on a wall-clock schedule. Three flavours via `cronKind`:
 
-- **Prerequisites** — a job can require another job to complete first (e.g., a briefing job runs a data-gathering job before composing the report)
-- **Output injection** — one job's output can be injected into another's prompt, enabling pipelines
-- **Context injection** — proactive context (recent deliveries, user presence, queue state) so the agent avoids repeating itself
-- **Timezone support** — cron jobs can run in a specific timezone
+```
+// "fire once tomorrow at 9am Africa/Nairobi"
+manage_schedule({
+  operation: "create",
+  scheduleType: "cron",
+  name: "tomorrow 9am reminder",
+  cronKind: "at",
+  atMs: 1779062400000,
+  oneshot: true,
+  prompt: "Tell the user it's 9am."
+})
 
-## Prompt File Locations
+// "every Monday 9am, weekly review"
+manage_schedule({
+  operation: "create",
+  scheduleType: "cron",
+  name: "weekly review",
+  cronKind: "cron",
+  cronExpr: "0 9 * * 1",
+  cronTz: "Africa/Nairobi",
+  prompt: "Generate a weekly review covering last week's commitments + open threads."
+})
 
-| System | Path | Content |
-|---|---|---|
-| Scheduler jobs | `/scheduler/prompts/` | Job prompts — admin and agent-created (`agent_*`) |
-| Heartbeats | `/heartbeat/prompts/` | Heartbeat prompts (admin-configured) |
+// "every 90 seconds (faster than cron's 1-min granularity)"
+manage_schedule({
+  operation: "create",
+  scheduleType: "cron",
+  name: "fast pulse",
+  cronKind: "every",
+  everyMs: 90000,
+  prompt: "ping the health check"
+})
+```
 
-You can **read** these files to see what a job or heartbeat does, and **edit** agent-created prompt files (`agent_*`) to update instructions for a recurring job. Don't modify admin-configured prompts unless the user explicitly asks.
+## Delivery modes
 
-## Writing Good Prompts
-
-When using prompt mode, the prompt runs without conversation context — the agent starts fresh. Write prompts that are self-contained:
-
-**Good:**
-> Check the email inbox for messages received in the last 2 hours. Summarize anything that looks urgent or needs a response today. If nothing important, respond with just "All clear." Be concise — 3 sentences max.
-
-**Bad:**
-> Check my email.
-
-The more specific the prompt, the better the result. Include:
-- What to check or do
-- How to evaluate the results (what counts as "important"?)
-- What to do if there's nothing to report
-- Length/format guidance
-
-## Examples
-
-| User says | Tool call |
+| Mode | Behaviour |
 |---|---|
-| "Remind me to buy milk tomorrow morning" | `schedule_bot_message(name: "Buy milk", when: "tomorrow 9am", message: "Buy milk!")` |
-| "Check my calendar every morning" | `schedule_bot_message(name: "Calendar check", when: "every day at 8am", prompt: "List today's calendar events...", delivery_mode: "always")` |
-| "Remind me in 30 minutes to take a break" | `schedule_bot_message(name: "Break", when: "in 30 minutes", message: "Time for a break!")` |
-| "What reminders do I have?" | `list_bot_scheduled_jobs()` |
-| "Cancel the morning email check" | `list_bot_scheduled_jobs()` → find ID → `delete_bot_scheduled_job(taskId: id)` |
-| "Pause all my reminders" | `list_bot_scheduled_jobs()` → `disable_bot_scheduled_job` for each |
-| Morning briefing creates day's reminders | Multiple `schedule_bot_message` calls: one per meeting (reminder), one per important meeting (prep), one per meeting end (action items) |
+| `always` (default) | The agent's reply is delivered to the user every fire |
+| `conditional` | The agent returns structured JSON; only `shouldDeliver: true` gets sent |
+| `silent` | Agent runs for side-effects only; nothing reaches the user |
 
-## Guidelines
+Pick `conditional` for "only ping me when interesting" patterns. Pick `silent` for state-keeping that shouldn't bother the user.
 
-- Always use `channel` and `peerId` from the current conversation context — never guess these
-- Use message mode for simple reminders, prompt mode for anything that needs the agent to think
-- Prefer `conditional` delivery for recurring prompts to avoid notification fatigue
-- One-shot jobs auto-disable after firing — no cleanup needed
-- All agent-created jobs persist across restarts
+## List, update, delete
+
+```
+manage_schedule({ operation: "list" })
+
+manage_schedule({ operation: "delete", id: "cron:weekly-review" })
+manage_schedule({ operation: "disable", id: "hb:morning-inbox-check" })
+manage_schedule({ operation: "enable",  id: "hb:morning-inbox-check" })
+
+manage_schedule({
+  operation: "update",
+  id: "cron:weekly-review",
+  cronExpr: "0 9 * * 5",      // change Mon → Fri
+  prompt: "Friday recap instead of weekly review."
+})
+```
+
+Schedule IDs come back from `create` and `list` — they're `cron:<slug>` or `hb:<slug>`. The literal id `tick` is reserved.
+
+## Anti-repetition is built in
+
+You don't have to tell the agent "don't repeat last fire's message" — the proactive engine tracks topic + reported-item IDs + embedding similarity across fires automatically. Just write a clear prompt; the engine handles dedup.
+
+## When to use this vs the alternatives
+
+- **Use `manage_schedule`** for anything that fires later, recurring or one-shot.
+- **Use `spawn_background_task`** for "do this now, but it takes a while — deliver the result whenever it's ready." That's not a schedule; it's an async task.
+- **Use `delegate_task`** for "do this and tell me the answer before I reply." Synchronous, no scheduling.
+
+## Common mistakes
+
+- Inventing tool names like `schedule_bot_message` or `list_bot_scheduled_jobs`. There is **one** tool: `manage_schedule`.
+- Passing `peer_id` / `channel` — those come from the calling context, not the tool args.
+- Forgetting `cronKind` on a cron schedule. Required when `scheduleType: "cron"`.
+- Using `everyMs` below 60_000 (1 minute). The schema rejects it.
+- Setting `cronTz` on `cronKind: "at"` or `cronKind: "every"`. Timezone applies only to `cronKind: "cron"` expressions.

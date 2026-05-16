@@ -19,9 +19,9 @@ These rules are NON-NEGOTIABLE. Every test failure traces back to breaking one o
 ### 1. NEVER tell the user to run commands — YOU run them
 If a package is missing, create a venv and install it yourself:
 ```
-execute("python3 -m venv /scratch/.venv")
-execute("/scratch/.venv/bin/pip install matplotlib")
-execute("/scratch/.venv/bin/python3 /scratch/chart.py")
+execute_code({ code: "python3 -m venv /scratch/.venv"})
+execute_code({ code: "/scratch/.venv/bin/pip install matplotlib"})
+execute_code({ code: "/scratch/.venv/bin/python3 /scratch/chart.py"})
 ```
 WRONG: "You can install matplotlib by running `pip install matplotlib`"
 RIGHT: Create venv → install → run script → report result → clean up venv when done.
@@ -34,7 +34,7 @@ RIGHT: `resp = urllib.request.urlopen("https://api.coingecko.com/api/v3/...")` (
 ### 3. ALWAYS verify output files have content
 After writing or generating a file, CHECK IT:
 ```
-execute("wc -c /scratch/output.csv")
+execute_code({ code: "wc -c /scratch/output.csv"})
 ```
 If the file is 0 bytes → the script failed silently. Debug and retry. Do NOT tell the user "successfully converted" when the file is empty.
 
@@ -67,13 +67,13 @@ Use subdirectories within scratch/ to organize (scratch/finance/, scratch/charts
 ### 7. Auto-open HTML files in the browser
 When a script produces an HTML file, always open it so the user gets immediate visual feedback:
 ```
-execute("open /scratch/report.html")  # macOS
+execute_code({ code: "open /scratch/report.html"})  # macOS
 ```
 Don't just report the file path — SHOW the result.
 
 ## Think Before You Say "Can't"
 
-**You can write code. You have API keys. You have execute(). COMBINE THEM.**
+**You can write code. You have API keys. You have execute_code({ code: ). COMBINE THEM.**
 
 Before telling the user you can't do something, run this decision tree:
 
@@ -81,7 +81,7 @@ Before telling the user you can't do something, run this decision tree:
 User asks for X
   → Do I have a tool that does X directly? → USE IT
   → No direct tool, but do I have an API key for a service that does X?
-    → YES → Write a script that calls that API. You have execute().
+    → YES → Write a script that calls that API. You have execute_code({ code: ).
   → No API key, but can I chain tools together to get X?
     → YES → Plan the chain, write it, run it.
   → None of the above?
@@ -103,7 +103,7 @@ User asks for X
 1. Write the poem (you're good at this)
 2. Check: does `ELEVENLABS_API_KEY` or `OPENAI_API_KEY` exist?
 3. Write a Python script: `POST` to the TTS endpoint, save `.mp3` to `/scratch/poem.mp3`
-4. `execute("python3 /scratch/tts-poem.py")`
+4. `execute_code({ code: "python3 /scratch/tts-poem.py"})`
 5. Send the audio file to the user
 
 **Never stop at step 1 and say "here's the text, use a TTS tool yourself."**
@@ -117,7 +117,7 @@ User asks for X
 - **Prototyping**: Quick proof-of-concept before delegating to coder for a full implementation
 - **Environment checks**: Verify env vars, system state, installed packages, configs
 - **Test data**: Generate fixtures, mock data, or sample payloads
-- **Capability gap**: You don't have a direct tool, but you have an API key + execute() — write code to bridge the gap
+- **Capability gap**: You don't have a direct tool, but you have an API key + execute_code({ code: ) — write code to bridge the gap
 - **Chaining**: Combine multiple tools/APIs to deliver something none of them can do alone
 
 ## When NOT to Write Code (Delegate to Coder Instead)
@@ -137,7 +137,7 @@ Use: `task("coder", "description of the project-level task")`
 
 | Type | Location | Lifecycle |
 |------|----------|-----------|
-| One-liner | Inline: `execute("python3 -c '...'")` | Ephemeral |
+| One-liner | Inline: `execute_code({ code: "python3 -c '...'"})` | Ephemeral |
 | Quick script | `/scratch/{descriptive-name}.py` | Cleaned up periodically |
 | Node script | `/scratch/{descriptive-name}.mjs` | Cleaned up periodically |
 | Bash script | `/scratch/{descriptive-name}.sh` | Cleaned up periodically |
@@ -165,7 +165,7 @@ Use: `task("coder", "description of the project-level task")`
 
 ### Before You Execute — Safety Checklist
 
-Run this mentally before EVERY `execute()` call:
+Run this mentally before EVERY `execute_code({ code: )` call:
 
 1. **File paths**: Does the script only touch `/workspaces/` or explicitly user-approved paths? If it touches `~/`, `/tmp/`, or system dirs — stop and ask.
 2. **Destructive ops**: Does it delete, overwrite, or truncate files? If yes — confirm with user first, or use safe patterns (write to new file, then rename).
@@ -223,9 +223,9 @@ with urllib.request.urlopen(url, timeout=10) as resp:
 import os
 from dotenv import load_dotenv
 load_dotenv(os.path.expanduser("~/.flopsy/.env"))
-api_key = os.environ.get("OPENAI_API_KEY")
+api_key = os.environ.get("OPENAI_API_KEY"})
 if not api_key:
-    raise SystemExit("OPENAI_API_KEY not set in ~/.flopsy/.env")
+    raise SystemExit("OPENAI_API_KEY not set in ~/.flopsy/.env"})
 ```
 
 ```javascript
@@ -262,27 +262,27 @@ if (!apiKey) { console.error('OPENAI_API_KEY not set'); process.exit(1); }
 3. **Pick the right language** for the task (see Language Guidance above).
 4. **Ensure directory exists** — BEFORE writing any file:
    ```
-   execute("mkdir -p /workspaces/scratch")
+   execute_code({ code: "mkdir -p /workspaces/scratch"})
    ```
    This prevents "No such file or directory" failures. Do this every time — it's a no-op if it already exists.
 5. **Write the script** to `/scratch/{descriptive-name}.{ext}` using `write_file()`.
 6. **Verify the file was written** — read it back or check size:
    ```
-   execute("wc -l /scratch/name.py")
+   execute_code({ code: "wc -l /scratch/name.py"})
    ```
    If it's empty or missing, something went wrong — fix before executing.
 7. **Run it**:
-   - Python: `execute("python3 /scratch/name.py")`
-   - Node: `execute("node /scratch/name.mjs")`
-   - Bash: `execute("bash /scratch/name.sh")`
+   - Python: `execute_code({ code: "python3 /scratch/name.py"})`
+   - Node: `execute_code({ code: "node /scratch/name.mjs"})`
+   - Bash: `execute_code({ code: "bash /scratch/name.sh"})`
 8. **Verify output** — if the script produces a file, check it has content:
    ```
-   execute("wc -l /scratch/output.csv")
+   execute_code({ code: "wc -l /scratch/output.csv"})
    ```
    An empty output file means the script didn't work. Debug and retry (up to 3 attempts).
-9. **Auto-open HTML** — if the script produced an HTML file, open it: `execute("open /scratch/output.html")`
+9. **Auto-open HTML** — if the script produced an HTML file, open it: `execute_code({ code: "open /scratch/output.html"})`
 10. **Report results** to the user using the Output Format below.
-11. **Clean up** if the script was one-off: `execute("rm /scratch/name.py")`
+11. **Clean up** if the script was one-off: `execute_code({ code: "rm /scratch/name.py"})`
 
 ## Output Format
 
@@ -374,13 +374,13 @@ try:
     req = urllib.request.Request(url, headers={"User-Agent": "FlopsyBot/1.0"})
     with urllib.request.urlopen(req, timeout=10) as resp:
         data = json.loads(resp.read())
-        print(f"Status: {resp.status}")
-        print(f"Response: {json.dumps(data, indent=2)}")
+        print(f"Status: {resp.status}"})
+        print(f"Response: {json.dumps(data, indent=2)}"})
 except Exception as e:
-    print(f"Failed: {e}")
+    print(f"Failed: {e}"})
 ```
 
-Run: `execute("python3 /scratch/api-test.py")`
+Run: `execute_code({ code: "python3 /scratch/api-test.py"})`
 
 ### 2. Data Transformation — JSON to CSV (Python)
 
@@ -399,7 +399,7 @@ with open(input_file) as f:
     data = json.load(f)
 
 if not data:
-    sys.exit("Empty JSON")
+    sys.exit("Empty JSON"})
 
 # Use first item's keys as headers
 keys = list(data[0].keys())
@@ -408,7 +408,7 @@ with open(output_file, "w", newline="") as f:
     writer.writeheader()
     writer.writerows(data)
 
-print(f"Converted {len(data)} rows -> {output_file}")
+print(f"Converted {len(data)} rows -> {output_file}"})
 ```
 
 ### 3. Environment Check (Bash)
@@ -453,7 +453,7 @@ while (current <= end) {
 console.log(`Business days from ${start.toISOString().slice(0,10)} to ${end.toISOString().slice(0,10)}: ${count}`);
 ```
 
-Run: `execute("node /scratch/business-days.mjs 2025-03-01 2025-03-31")`
+Run: `execute_code({ code: "node /scratch/business-days.mjs 2025-03-01 2025-03-31"})`
 
 ### 5. Web Scraping Snippet (Python)
 
@@ -471,13 +471,13 @@ with urllib.request.urlopen(req, timeout=15) as resp:
 
 # Extract title
 title = re.search(r"<title>(.*?)</title>", html)
-print(f"Title: {title.group(1) if title else 'not found'}")
+print(f"Title: {title.group(1) if title else 'not found'}"})
 
 # Extract all links
 links = re.findall(r'href="(https?://[^"]+)"', html)
-print(f"\nFound {len(links)} links:")
+print(f"\nFound {len(links)} links:"})
 for link in links[:10]:
-    print(f"  {link}")
+    print(f"  {link}"})
 ```
 
 **Important**: Fact-check any factual claims from scraped content before sharing.
@@ -505,10 +505,10 @@ for filename in os.listdir(directory):
             os.path.join(directory, filename),
             os.path.join(directory, new_name)
         )
-        print(f"  {filename} -> {new_name}")
+        print(f"  {filename} -> {new_name}"})
         renamed += 1
 
-print(f"\nRenamed {renamed} files")
+print(f"\nRenamed {renamed} files"})
 ```
 
 ## Common Pitfalls
@@ -558,22 +558,22 @@ Create a venv in `/scratch/.venv/`, install into it, run with its Python. Delete
 
 ```
 # Setup (once per session or when .venv doesn't exist)
-execute("python3 -m venv /scratch/.venv")
-execute("/scratch/.venv/bin/pip install matplotlib requests")
+execute_code({ code: "python3 -m venv /scratch/.venv"})
+execute_code({ code: "/scratch/.venv/bin/pip install matplotlib requests"})
 
 # Run scripts with the venv Python
-execute("/scratch/.venv/bin/python3 /scratch/chart.py")
+execute_code({ code: "/scratch/.venv/bin/python3 /scratch/chart.py"})
 
 # Cleanup when done (optional — or leave for reuse)
-execute("rm -rf /scratch/.venv")
+execute_code({ code: "rm -rf /scratch/.venv"})
 ```
 
 **Pattern for scripts that need packages:**
 ```
-Step 1: execute("python3 -m venv /scratch/.venv")          ← create env
-Step 2: execute("/scratch/.venv/bin/pip install pandas")    ← install deps
-Step 3: execute("/scratch/.venv/bin/python3 script.py")     ← run script
-Step 4: execute("rm -rf /scratch/.venv")                    ← cleanup
+Step 1: execute_code({ code: "python3 -m venv /scratch/.venv"})          ← create env
+Step 2: execute_code({ code: "/scratch/.venv/bin/pip install pandas"})    ← install deps
+Step 3: execute_code({ code: "/scratch/.venv/bin/python3 script.py"})     ← run script
+Step 4: execute_code({ code: "rm -rf /scratch/.venv"})                    ← cleanup
 ```
 
 If the venv already exists, skip step 1 — just install and run.
@@ -584,13 +584,13 @@ Install packages locally in `/scratch/`. Delete `node_modules` when done.
 
 ```
 # Setup
-execute("cd /workspaces/scratch && npm init -y && npm install axios cheerio")
+execute_code({ code: "cd /workspaces/scratch && npm init -y && npm install axios cheerio"})
 
 # Run
-execute("node /scratch/fetch-data.mjs")
+execute_code({ code: "node /scratch/fetch-data.mjs"})
 
 # Cleanup
-execute("rm -rf /scratch/node_modules /scratch/package.json /scratch/package-lock.json")
+execute_code({ code: "rm -rf /scratch/node_modules /scratch/package.json /scratch/package-lock.json"})
 ```
 
 ### Common Packages
@@ -692,12 +692,12 @@ with open(html_path, 'w') as f:
     f.write(html)
 print(f'HTML saved: {html_path}')
 print(f'BTC: ${btc:,} | ETH: ${eth:,.2f} | EUR: {eur} | GBP: {gbp} | JPY: {jpy}')
-""")
+"""})
 
-Step 2: execute("python3 -m venv /scratch/.venv")
-Step 3: execute("/scratch/.venv/bin/pip install matplotlib")
-Step 4: execute("/scratch/.venv/bin/python3 /scratch/finance-snapshot.py")
-Step 5: execute("wc -c /scratch/finance/chart.png /scratch/finance/report.html")
+Step 2: execute_code({ code: "python3 -m venv /scratch/.venv"})
+Step 3: execute_code({ code: "/scratch/.venv/bin/pip install matplotlib"})
+Step 4: execute_code({ code: "/scratch/.venv/bin/python3 /scratch/finance-snapshot.py"})
+Step 5: execute_code({ code: "wc -c /scratch/finance/chart.png /scratch/finance/report.html"})
 Step 6: Report results to user with file paths
 ```
 

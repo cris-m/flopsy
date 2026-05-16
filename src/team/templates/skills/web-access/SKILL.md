@@ -1,106 +1,92 @@
 ---
 name: web-access
-compatibility: Designed for FlopsyBot agent
-description: Access web content through multiple strategies and route URLs to appropriate tools.
+description: Pick the right tool for getting content off the web. `web_search` for "find me X", `web_extract` for "read this URL", `http_request` for JSON APIs, `web_crawl` for a whole site, `browser` for JS-heavy SPAs. Delegate to `legolas` for short hops, `spawn_background_task("saruman", ...)` for deep multi-source briefs.
+metadata:
+  flopsy:
+    agent-affinity: [gandalf, legolas, saruman]
 ---
 
-# Web Access Skill
+# Web access
 
-## Overview
-Access web content through multiple strategies and route URLs to appropriate tools.
+Four tools for direct web work, plus delegation patterns when the work is bigger than one tool.
 
-## URL Routing Rules
-Route by domain using these patterns:
+## Pick by shape
 
-### Social Media (API Access)
-- **x.com/*, twitter.com/*, youtube.com/*, reddit.com/***
-- Tool: `task("social-media", url)`
-- Fallback: `web_extract(url)` → `task("swarm", "researcher-agent: [keywords]")`
+| You need | Use |
+|---|---|
+| Top results for a query | `web_search({ query, maxResults })` |
+| Read one specific URL as clean markdown | `web_extract({ url })` |
+| Hit a JSON / REST endpoint | `http_request({ url, method, headers?, body? })` |
+| Crawl multiple pages from one domain | `web_crawl({ startUrl, maxPages? })` |
+| Read a SPA / login-walled / JS-heavy page | `browser` MCP (`browser_navigate`, `browser_get_text`, etc.) |
 
-### Complex Sites (Browser Agent)
-- **google.com/maps/*, maps.google.com/*, *.amazon.***, shopping/JS-heavy sites**
-- Tool: `task("swarm", "browser-agent: navigate to [url] and extract content")`
-- Fallback: `web_extract(url)` → `http_request(url)`
+Real schemas (verified against `flopsygraph/src/prebuilt/tools/web-search.ts`, `web-extract.ts`, `http-request.ts`, `web-crawl.ts`):
 
-### General Sites
-- **All other URLs**
-- Strategy: `web_extract(url)` → `task("swarm", "browser-agent: [url]")` → `http_request(url)`
+```
+web_search({ query: "anthropic claude opus 4.7 release", maxResults: 10 })
 
-## Web Access Strategy
-Try these approaches in order:
+web_extract({ url: "https://www.anthropic.com/news/some-post" })
 
-1. **Direct fetch**: `web_extract(url)`
-2. **Browser agent**: `task("swarm", "browser-agent: navigate to [url] and extract content")`
-3. **Raw HTTP**: `http_request(url)`
+http_request({
+  url: "https://api.example.com/v1/things",
+  method: "GET",
+  headers: { "Authorization": "Bearer ..." }
+})
 
-## Security Considerations
-**Proactive threat detection** - delegate to security agent for:
-- Suspicious URLs (unfamiliar domains, URL shorteners, phishing patterns)
-- IP addresses in security context
-- File hashes (MD5, SHA-1, SHA-256)
-- CVE mentions
-- Domains with typosquatting or unusual TLDs
-
-## Content Verification
-For important claims:
-- Pull **2+ independent sources**
-- Note disagreements between sources
-- Include source URLs in responses
-- Use inline format: "Claim ([Source](url))"
-
-## Error Handling
-If web access fails:
-1. Try different search engines (DuckDuckGo, Bing vs Google)
-2. Try direct URL navigation with browser agent
-3. Try different tool combinations
-4. Report what was attempted and specific errors
-
-**Never say**: "I can't access URLs", "I'm unable to view that content", "Could you share the content?"
-
-## Source Attribution (MANDATORY)
-Every factual claim from web research MUST include source URL:
-- Inline: "GPT-5 was released ([OpenAI Blog](https://openai.com/blog/gpt5))"
-- List format: Sources section with clickable links
-- If URL unavailable: "(source unavailable)"
-- News: include source name + time (e.g., "— Reuters, 2h ago")
-
-## Output Format
-
-When presenting web-access results, structure the response so the user can see which strategy worked, what was found, and where it came from:
-
-```markdown
-## Web Access Result
-
-**URL:** <the URL you fetched>
-**Strategy used:** web_extract | browser-agent | http_request | social-media API
-**Status:** success | partial | failed (with reason)
-
-### Summary
-[2-4 sentences capturing the main content — what the page is about and the key
-facts relevant to the user's question.]
-
-### Key Findings
-- **[Finding 1]:** [Detail] ([Source](url))
-- **[Finding 2]:** [Detail] ([Source](url))
-- **[Finding 3]:** [Detail] ([Source](url))
-
-### Sources
-- [Primary source name](url) — fetched via [strategy], [date/time]
-- [Secondary source name](url) — cross-reference, [date/time]
+web_crawl({ startUrl: "https://docs.example.com", maxPages: 20 })
 ```
 
-If a fallback strategy was used (e.g., `web_extract` failed and a browser agent
-succeeded), note that in the Status line so the user can see which path worked.
-When multiple sources were combined, list each one separately and attribute each
-claim to its specific source rather than lumping them together.
+## Backend priority (transparent to you)
 
-## Guidelines
+- `web_search`: Firecrawl → Tavily → DuckDuckGo (auto-fallback)
+- `web_extract`: Firecrawl → Tavily
+- `web_crawl`: Firecrawl-only (lazy-loaded from research bundle)
 
-- **Retry with a different strategy, not the same one** — if `web_extract` fails,
-  escalate to the browser agent or raw HTTP; do not loop on the same tool.
-- **Cap retries** — try each strategy at most once per URL; after all three
-  strategies fail, report exactly which ones were attempted and the errors.
-- **Respect rate limits and timeouts** — on 429 or repeated timeouts, back off
-  instead of hammering the source; swap to a different tool or search engine.
-- **Never fabricate content** — if every strategy fails, say so plainly; do not
-  invent summaries or attribute claims to URLs you could not actually read.
+You don't pick the backend. If one is unavailable, the tool falls back automatically.
+
+## When to use the `browser` MCP
+
+The `browser` MCP runs a real Playwright session — slower, but reads pages `web_extract` can't:
+
+- Single-page apps where the content is rendered via JS
+- Login-walled or paywalled pages where you have a session
+- Pages that detect scrapers and serve a stub to `web_extract`
+
+Common verbs: `browser_navigate`, `browser_get_text`, `browser_click`, `browser_screenshot`. Load them via `__load_tool__({"query":"browser"})` if not already attached.
+
+The `browser` MCP is `assignTo: ["gandalf", "legolas", "saruman"]`. `gimli`, `aragorn`, `sam` cannot use it directly.
+
+## When to delegate instead of doing it yourself
+
+If you are gandalf and you're about to fire `web_search` or `web_extract` for the user, ask: would `legolas` do this better?
+
+- Short one-shot lookups → just do it yourself or `delegate_task("legolas", ...)`. Either works.
+- Multi-source brief with citations → `spawn_background_task("saruman", "...")`. Don't block the user for ten minutes waiting for saruman.
+- Three or more parallel searches → fan out via three `delegate_task("legolas", ...)` calls in one turn.
+
+```
+// "Compare Anthropic / OpenAI / Google's stance on AI safety, with sources."
+spawn_background_task({
+  worker: "saruman",
+  task: "Brief comparing AI safety positions of Anthropic, OpenAI, and Google in 2026. Include official policy docs, recent blog posts, and any public commitments. 1.5 pages with citations."
+})
+```
+
+## URL routing cheatsheet
+
+| URL pattern | Best tool |
+|---|---|
+| `x.com` / `twitter.com` | `twitter_extract` (load via `__load_tool__({"query":"twitter"})`) — DON'T `web_extract` X/Twitter, the scrape is unreliable |
+| `youtube.com` / `youtu.be` | `youtube` MCP tools (load via `__load_tool__({"query":"youtube"})`) for transcripts and video metadata. Assigned to `legolas`. |
+| GitHub PR / issue / file | `github` MCP tools |
+| Plain JSON API endpoint | `http_request` |
+| Docs / blog / news article | `web_extract` |
+| Heavily-rendered SPA | `browser` |
+| News query without a specific URL | `web_search` (or `news` tool if attached) |
+
+## Common mistakes
+
+- **Using `web_search` when you have the URL.** If you already have the link, go straight to `web_extract`.
+- **Using `web_extract` on X/Twitter or a SPA.** It scrapes the rendered-HTML stub; you'll miss the actual content. Use `twitter_extract` or `browser`.
+- **Forgetting the dynamic catalog.** `twitter_extract`, `youtube_*`, `gmail_*`, `calendar_*`, `drive_*` aren't pre-attached. Load with `__load_tool__({"query":"twitter"})` etc.
+- **Doing five sequential `web_search` calls in five turns.** Fan out in one turn — five `delegate_task("legolas", ...)` calls run in parallel.

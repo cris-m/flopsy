@@ -15,10 +15,10 @@ Interact with X (formerly Twitter) to post, read, search, and engage via MCP too
 1. **MCP tool** (e.g., `twitter_search`) — try the native tool first
 2. **Re-auth** — if auth/cookie error, the MCP server auto-opens the browser for login and polls for 2 minutes. If it times out, try manual cookie refresh:
    ```
-   execute("npx --yes @steipete/bird check")  # verify auth state
+   execute_code({ code: "npx --yes @steipete/bird check"})  # verify auth state
    ```
-3. **`execute("npx --yes @steipete/bird <command> --json")`** — CLI fallback
-4. **`web_search`** — for reading tweets/profiles when API tools are down (search "site:x.com username" or "site:twitter.com topic")
+3. **`execute_code({ code: "npx --yes @steipete/bird <command> --json"})`** — CLI fallback
+4. **`web_search`** — for reading tweets/profiles when API tools are down (search "site:x.com username" or "site:twitter.com topic"})
 5. **Report failure** — ONLY after exhausting steps 1-4. State exactly which steps were tried
 
 **Rate limit (429)**: Do NOT retry in a loop. Wait 2-3 minutes, then retry once. If still rate-limited, use `web_search` as read-only fallback.
@@ -29,12 +29,12 @@ Interact with X (formerly Twitter) to post, read, search, and engage via MCP too
 
 The MCP server handles auth automatically on startup:
 1. Checks if `bird` CLI is installed (`npx @steipete/bird --version`)
-2. Verifies authentication (`bird check` — looks for "Ready to tweet")
+2. Verifies authentication (`bird check` — looks for "Ready to tweet"})
 3. If not authenticated, opens `x.com/login` in the browser and polls every 5s for up to 2 minutes
 
 **If auth fails during a session:**
 ```
-execute("npx --yes @steipete/bird check")     # check current state
+execute_code({ code: "npx --yes @steipete/bird check"})     # check current state
 ```
 If it reports not authenticated, tell the user: "Please log in to X/Twitter in your browser. I'll detect it automatically." The `bird` CLI extracts cookies from Chrome, Arc, Firefox, and Safari.
 
@@ -111,7 +111,7 @@ If it reports not authenticated, tell the user: "Please log in to X/Twitter in y
 
 ## CLI Fallback Reference
 
-When MCP tools are down, use `execute()`:
+When MCP tools are down, use `execute_code({ code: )`:
 
 | Command | Example |
 |---------|---------|

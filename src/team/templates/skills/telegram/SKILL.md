@@ -94,15 +94,12 @@ Telegram supports **native polls** via the `send_poll` tool. These render as int
 
 ### Basic poll
 
+`send_poll` takes a flat schema — channel + peer come from the runtime context, not the args:
+
 ```
 send_poll({
-  channel: "telegram", peer_id, peer_type,
   question: "What should we work on next?",
-  options: [
-    { text: "Bug fixes" },
-    { text: "New features" },
-    { text: "Documentation" }
-  ]
+  options: ["Bug fixes", "New features", "Documentation"]
 })
 ```
 
@@ -115,119 +112,35 @@ Polls are **non-anonymous by default** (`anonymous: false`). When a user votes, 
 
 Set `anonymous: true` to disable vote tracking (you won't receive vote messages).
 
-### Quiz mode
-
-Telegram supports quiz polls — one correct answer, wrong answers show an X:
-```
-send_poll({
-  channel: "telegram", peer_id, peer_type,
-  question: "What is the capital of France?",
-  options: [
-    { text: "London" },
-    { text: "Paris" },
-    { text: "Berlin" }
-  ],
-  anonymous: false,
-  is_quiz: true,
-  correct_option_index: 1
-})
-```
-`correct_option_index` is 0-based (Paris = index 1).
-
 ### Options
 
 | Parameter | Default | Notes |
 |-----------|---------|-------|
-| `allow_multiple` | `false` | Allow selecting multiple options |
-| `duration_hours` | none | Auto-close timer. Telegram max is ~0.17h (600 seconds) |
 | `anonymous` | `false` | Set `true` to hide voter identity (disables vote tracking) |
+| `allowMultiple` | `false` | Allow selecting multiple options |
+| `durationHours` | none | Auto-close timer. Telegram max is ~0.17h (600 seconds) |
 
 ### Limits
 - Question: max 300 characters
 - Options: 2–10 choices, each max 100 characters
-- `duration_hours` is converted to seconds and capped at 600s by Telegram
 
-## Interactive Components (Buttons & Select Menus)
+## Interactive Buttons
 
-Telegram supports inline keyboard buttons and select menus via the `components` parameter on `send_message`. Select menus are rendered as rows of buttons (Telegram has no native dropdown widget).
-
-### Buttons
+Telegram supports inline keyboard buttons via the top-level `buttons` array on `send_message`. When the user taps a button you receive its `value` as a synthetic user message — no special handling needed.
 
 ```
 send_message({
-  channel: "telegram", peer_id, peer_type,
-  message: "Deploy to production?",
-  components: [{
-    components: [
-      { type: "button", label: "Deploy", style: "success" },
-      { type: "button", label: "Cancel", style: "danger" }
-    ]
-  }]
-})
-```
-
-When the user taps "Deploy", you receive: `Clicked "Deploy".`
-
-**Button styles:** `primary` (blue), `secondary` (grey), `success` (green), `danger` (red), `link` (URL — no interaction event)
-
-**Mixed rows example** — callback buttons on row 1, link button on row 2:
-```
-send_message({
-  channel: "telegram", peer_id, peer_type,
-  message: "Review the deployment request:",
-  components: [
-    {
-      components: [
-        { type: "button", label: "Approve", style: "success" },
-        { type: "button", label: "Reject",  style: "danger"  },
-        { type: "button", label: "Deploy",  style: "primary" }
-      ]
-    },
-    {
-      components: [
-        { type: "button", label: "Documentation", style: "link", url: "https://example.com/docs" }
-      ]
-    }
+  text: "Deploy to production?",
+  buttons: [
+    { label: "Deploy", value: "deploy" },
+    { label: "Cancel", value: "cancel" }
   ]
 })
 ```
 
-**Link button** (opens a URL, no click event):
-```
-{ type: "button", label: "View Docs", style: "link", url: "https://example.com" }
-```
+Each button needs a `label` (shown to the user) and a `value` (returned on tap — required). The optional `style` field (`primary` / `secondary` / `success` / `danger`) is Discord-only; Telegram renders all inline buttons in its single neutral style.
 
-### Select Menus
-
-Select menus are flattened into button rows on Telegram (no native dropdown):
-```
-send_message({
-  channel: "telegram", peer_id, peer_type,
-  message: "Choose priority:",
-  components: [{
-    components: [{
-      type: "select_menu",
-      placeholder: "Select priority",
-      options: [
-        { label: "High", value: "high" },
-        { label: "Medium", value: "medium" },
-        { label: "Low", value: "low" }
-      ]
-    }]
-  }]
-})
-```
-
-When the user selects "High", you receive: `Selected "High" from "Select priority".`
-
-### Component rules
-- Each action row can hold **multiple buttons** (Telegram renders up to ~8 per row)
-- A message can have **multiple action rows**
-- Select menus are flattened into button rows — Telegram has no native dropdown
-- Components expire after 30 minutes — expired taps show "This button has expired."
-- Components work on **Telegram and Discord** — other channels silently ignore them
-- Components can be combined with text in the same message
-- Link buttons open URLs directly (no interaction event back to you)
+**Limit:** max 9 buttons per message. For aggregated multi-choice voting use `send_poll`.
 
 ## Guidelines
 

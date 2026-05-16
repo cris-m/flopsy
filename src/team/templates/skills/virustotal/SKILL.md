@@ -36,7 +36,7 @@ Security intelligence via the VirusTotal API. Look up file hashes, scan URLs, ch
 2. Call `vt_file_report` with the hash
 3. Check the `stats` field: if `malicious > 0`, the file is flagged
 4. Review `detections` to see which engines flagged it and why
-5. Report the detection ratio (e.g., "12/72 engines detected this as malicious")
+5. Report the detection ratio (e.g., "12/72 engines detected this as malicious"})
 
 ### URL Check
 
@@ -59,7 +59,7 @@ Whenever you download a file from the internet or receive one from a user, **sca
 **When to scan:**
 - You used `http_request` or `web_extract` to download a file
 - User sent you a file attachment via a channel (document, APK, executable, archive)
-- You're about to run `execute()` on a downloaded script
+- You're about to run `execute_code({ code: )` on a downloaded script
 - You're about to forward a file to another user or channel
 
 **Workflow:**
@@ -69,12 +69,12 @@ Whenever you download a file from the internet or receive one from a user, **sca
 import hashlib
 with open("/scratch/downloaded_file.exe", "rb") as f:
     sha256 = hashlib.sha256(f.read()).hexdigest()
-print(f"SHA-256: {sha256}")
+print(f"SHA-256: {sha256}"})
 ```
 
 Via shell:
 ```
-execute("sha256sum /scratch/downloaded_file.exe")
+execute_code({ code: "sha256sum /scratch/downloaded_file.exe"})
 ```
 
 2. **Look it up on VirusTotal:**
@@ -136,7 +136,7 @@ Note: Most search queries require a VT Premium API key.
 ### Key Fields
 
 - **reputation**: Community score (negative = bad reputation)
-- **tags**: VT-assigned tags (e.g., "peexe", "signed", "exploit")
+- **tags**: VT-assigned tags (e.g., "peexe", "signed", "exploit"})
 - **detections**: Top engines that flagged it with their verdict
 - **names**: Known filenames (for file reports)
 
