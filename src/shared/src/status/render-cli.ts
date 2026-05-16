@@ -163,7 +163,8 @@ export function renderCliCompact(s: StatusSnapshot, t: CliTheme = plainTheme, wi
         } else if (v.serverRunning) {
             parts.push(t.ok(`${GLYPH.dot} server running`));
             if (v.mgmtPort !== undefined && v.proxyPort !== undefined) {
-                parts.push(t.dim(`mgmt :${v.mgmtPort}  proxy :${v.proxyPort}`));
+                parts.push(t.dim(`mgmt http://127.0.0.1:${v.mgmtPort}`));
+                parts.push(t.dim(`proxy http://127.0.0.1:${v.proxyPort}`));
             }
             const stats: string[] = [];
             if (v.secrets !== undefined) stats.push(`${v.secrets} secrets`);

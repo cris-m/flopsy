@@ -9,6 +9,7 @@ import {
     closeVaultDb,
     changeMasterPassword,
     deleteSecret,
+    getRootCertPem,
     getSecret,
     initVault,
     isVaultInitialised,
@@ -16,6 +17,7 @@ import {
     listRules,
     listSecrets,
     listTokens,
+    loadOrCreateRootCA,
     mintToken,
     openVaultDb,
     putSecret,
@@ -702,6 +704,47 @@ export function registerVaultCommands(root: Command): void {
             } catch {
                 console.log(bad(`stale pidfile (pid ${pid} not alive) — removing`));
                 try { unlinkSync(pidFile); } catch { /* */ }
+            }
+        });
+
+    const ca = v.command('ca').description('Manage the vault root CA (for agents that need to trust MITM certs)');
+
+    ca.command('export')
+        .description('Export the root CA cert in PEM (write to file with --out, else stdout)')
+        .option('--out <path>', 'Write to this file instead of stdout')
+        .action(async (opts: { out?: string }) => {
+            const path = workspace.vaultDb();
+            if (!existsSync(path)) {
+                console.log(bad('vault not initialised — run `flopsy vault init` first'));
+                process.exit(1);
+            }
+            const pw = await readMasterPassword('Master password:');
+            const db = openVaultDb({ path });
+            let dek: Buffer | undefined;
+            try {
+                dek = unsealVault(db, pw);
+                let certPem = getRootCertPem(db, dek);
+                if (!certPem) {
+                    const created = loadOrCreateRootCA(db, dek);
+                    certPem = created.certPem;
+                }
+                if (opts.out) {
+                    const outPath = resolvePath(opts.out);
+                    writeFileSync(outPath, certPem, { mode: 0o644 });
+                    console.log(ok(`wrote root CA to ${outPath}`));
+                    console.log(info('agents set NODE_EXTRA_CA_CERTS=' + outPath));
+                } else {
+                    process.stdout.write(certPem);
+                }
+            } catch (err) {
+                if (err instanceof VaultSealError) {
+                    console.log(bad(err.message));
+                    process.exit(1);
+                }
+                throw err;
+            } finally {
+                if (dek) wipe(dek);
+                closeVaultDb(db);
             }
         });
 

@@ -62,3 +62,5 @@ export {
     type MgmtServerHandle,
     type ProxyServerHandle,
 } from './server';
+export { generateRootCA, mintLeafCert, type CertPair } from './crypto/ca';
+export { loadOrCreateRootCA, getRootCertPem, type RootCA } from './store/ca-store';
