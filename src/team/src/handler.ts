@@ -187,8 +187,6 @@ export class TeamHandler implements AgentHandler {
     readonly modelRouters?: ReadonlyMap<string, ModelRouter>;
     readonly personalities?: PersonalityRegistry;
     private readonly pendingRecapPromises = new Map<string, Promise<string | null>>();
-    private readonly lastMidExtractAt = new Map<string, number>();
-    private readonly midExtractInFlight = new Set<string>();
 
     constructor(config: TeamHandlerConfig) {
         this.config = config;
@@ -753,8 +751,6 @@ export class TeamHandler implements AgentHandler {
                             );
                         });
                 }
-
-                this.maybeMidSessionExtract(threadId, peerId);
 
                 if (this.goalManager && this.goalContinuationCallback && reply) {
                     const cb = this.goalContinuationCallback;
@@ -1701,31 +1697,6 @@ export class TeamHandler implements AgentHandler {
                 this.threads.delete(k);
             }
         }
-    }
-
-    private maybeMidSessionExtract(threadId: string, peerId: string): void {
-        if (!this.sessionExtractor) return;
-        if (this.midExtractInFlight.has(threadId)) return;
-        const TURN_INTERVAL = 20;
-        const TIME_INTERVAL_MS = 4 * 60 * 60 * 1000;
-        const active = this.store.getActiveSession(peerId);
-        if (!active) return;
-        if (active.turnCount < TURN_INTERVAL) return;
-        if (active.turnCount % TURN_INTERVAL !== 0) return;
-        const lastAt = this.lastMidExtractAt.get(threadId) ?? 0;
-        if (Date.now() - lastAt < TIME_INTERVAL_MS) return;
-        this.midExtractInFlight.add(threadId);
-        this.lastMidExtractAt.set(threadId, Date.now());
-        void this.runSessionExtraction(threadId, active.sessionId, peerId)
-            .catch((err) => {
-                log.warn(
-                    { threadId, peerId, err: redactSecrets(err) },
-                    'mid-session extraction threw (non-fatal, ignored)',
-                );
-            })
-            .finally(() => {
-                this.midExtractInFlight.delete(threadId);
-            });
     }
 
     private async runSessionExtraction(

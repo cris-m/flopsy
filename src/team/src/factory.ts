@@ -83,38 +83,14 @@ export const COMPACTION_SUMMARY_PROMPT = [
     'Format: one paragraph or short bullet list. Be concise.',
 ].join(' ');
 
-function loadUserPinnedTopics(): string {
-    try {
-        const userMd = resolveWorkspacePath('content', 'USER.md');
-        if (!existsSync(userMd)) return '';
-        const text = readFileSync(userMd, 'utf-8');
-        const sections: string[] = [];
-        for (const heading of ['Active projects', 'What to surface proactively', 'Interests']) {
-            const re = new RegExp(`##\\s*${heading}\\s*\\n([\\s\\S]*?)(?=\\n##\\s|$)`, 'i');
-            const m = text.match(re);
-            if (!m) continue;
-            const body = m[1]!.replace(/^\s*>.*$/gm, '').trim();
-            if (body.length === 0) continue;
-            sections.push(`### ${heading}\n${body}`);
-        }
-        return sections.join('\n\n');
-    } catch {
-        return '';
-    }
-}
-
 export async function summarizeForCompaction(
     model: _BaseChatModel,
     messages: _ChatMessage[],
     timeoutMs = 60_000,
 ): Promise<string> {
-    const pinned = loadUserPinnedTopics();
-    const system = pinned
-        ? `${COMPACTION_SUMMARY_PROMPT}\n\nGive EXTRA WEIGHT to anything that touches the user's pinned topics below — preserve specific names, deadlines, blockers, and numbers tied to these areas even at the cost of brevity elsewhere:\n\n${pinned}`
-        : COMPACTION_SUMMARY_PROMPT;
     const signal = AbortSignal.timeout(timeoutMs);
     const res = await model.invoke(
-        [{ role: 'system', content: system }, ...messages],
+        [{ role: 'system', content: COMPACTION_SUMMARY_PROMPT }, ...messages],
         { signal },
     );
     if (typeof res.content === 'string') return res.content.trim();
