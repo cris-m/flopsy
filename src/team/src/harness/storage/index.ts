@@ -19,5 +19,7 @@ export type {
     ToolFailureRow,
     ProactiveDecisionRow,
     ProactiveCommitmentRow,
+    SessionGoalRow,
+    GoalStatus,
 } from './learning-store';
 export type { PairingPending, PairingApproved, RequestCodeResult } from './pairing-store';

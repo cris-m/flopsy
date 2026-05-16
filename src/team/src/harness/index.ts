@@ -28,4 +28,14 @@ export type {
     ToolFailureRow,
     ProactiveDecisionRow,
     ProactiveCommitmentRow,
+    SessionGoalRow,
+    GoalStatus,
 } from './storage';
+export { GoalManager, DEFAULT_MAX_TURNS } from './goals/goal-manager';
+export type {
+    GoalManagerConfig,
+    SetGoalArgs,
+    MaybeContinueArgs,
+    MaybeContinueResult,
+    GoalJudgeVerdict,
+} from './goals/goal-manager';

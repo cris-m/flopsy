@@ -22,5 +22,19 @@ export {
     PAIRING_CODE_LENGTH,
     PAIRING_PENDING_TTL_MS,
     PAIRING_MAX_PENDING_PER_CHANNEL,
+    GoalManager,
+    DEFAULT_MAX_TURNS,
 } from './harness';
-export type { PairingPending, PairingApproved, ProactiveDecisionRow, ProactiveCommitmentRow } from './harness';
+export type {
+    PairingPending,
+    PairingApproved,
+    ProactiveDecisionRow,
+    ProactiveCommitmentRow,
+    SessionGoalRow,
+    GoalStatus,
+    GoalManagerConfig,
+    SetGoalArgs,
+    MaybeContinueArgs,
+    MaybeContinueResult,
+    GoalJudgeVerdict,
+} from './harness';

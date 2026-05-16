@@ -222,6 +222,11 @@ export interface AgentHandler {
     /** Drop any active plan across all cached threads for this peer. */
     cancelPlan?(rawKey: string): boolean;
 
+    getGoalManager?(): unknown;
+    setGoalContinuationCallback?(
+        cb: (args: { threadId: string; channelName: string; peerId: string; prompt: string }) => void,
+    ): void;
+
     /** Read-only `/plan` diagnostic. Returns null when no plan exists. */
     getPlanState?(rawKey: string): { mode: 'idle' | 'drafting' | 'approved'; hasPlan: boolean; objective?: string } | null;
 

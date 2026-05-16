@@ -31,6 +31,7 @@ import { setPairingFacade, setPersonalityFacade, setInsightsFacade, setBranchFac
 import type { ExtractionResult, SkillProposal } from './harness/review';
 import { SessionExtractor } from './harness/review';
 import { CommitmentsExtractor } from './harness/review/commitments-extractor';
+import { GoalManager } from './harness/goals/goal-manager';
 import {
     scanExistingSkills,
     writeSkillFile,
@@ -180,6 +181,8 @@ export class TeamHandler implements AgentHandler {
     private readonly mcpToolCounts = new Map<string, number>();
     private sessionExtractor?: SessionExtractor;
     private commitmentsExtractor?: CommitmentsExtractor;
+    private goalManager?: GoalManager;
+    private goalContinuationCallback?: (args: { threadId: string; channelName: string; peerId: string; prompt: string }) => void;
     readonly modelRouter?: ModelRouter;
     readonly modelRouters?: ReadonlyMap<string, ModelRouter>;
     readonly personalities?: PersonalityRegistry;
@@ -350,7 +353,13 @@ export class TeamHandler implements AgentHandler {
             });
         }
 
-        // Inferred-commitments extractor — opt-in; requires extractor model.
+        if (config.extractorModel) {
+            this.goalManager = new GoalManager({
+                model: config.extractorModel,
+                store: this.store,
+            });
+        }
+
         if (config.commitments?.enabled && config.extractorModel) {
             this.commitmentsExtractor = new CommitmentsExtractor({
                 model: config.extractorModel,
@@ -472,6 +481,16 @@ export class TeamHandler implements AgentHandler {
             },
             'TeamHandler ready',
         );
+    }
+
+    getGoalManager(): GoalManager | undefined {
+        return this.goalManager;
+    }
+
+    setGoalContinuationCallback(
+        cb: (args: { threadId: string; channelName: string; peerId: string; prompt: string }) => void,
+    ): void {
+        this.goalContinuationCallback = cb;
     }
 
     async invoke(
@@ -729,6 +748,27 @@ export class TeamHandler implements AgentHandler {
                             log.warn(
                                 { threadId, peerId, err: redactSecrets(err) },
                                 'commitments extractor threw (non-fatal, ignored)',
+                            );
+                        });
+                }
+
+                if (this.goalManager && this.goalContinuationCallback && reply) {
+                    const cb = this.goalContinuationCallback;
+                    void this.goalManager
+                        .maybeContinue({ threadId, agentReply: reply })
+                        .then((result) => {
+                            if (!result || !result.shouldContinue || !result.continuationPrompt) return;
+                            cb({
+                                threadId,
+                                channelName: callbacks.channelName,
+                                peerId,
+                                prompt: result.continuationPrompt,
+                            });
+                        })
+                        .catch((err) => {
+                            log.warn(
+                                { threadId, peerId, err: redactSecrets(err) },
+                                'goal manager threw (non-fatal, ignored)',
                             );
                         });
                 }

@@ -7,7 +7,7 @@ const log = createLogger('learning-store');
 
 /** Current schema version. Bump when adding new tables or columns,
  *  AND add a corresponding entry to MIGRATIONS for the upgrade path. */
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 /**
  * One ordered migration step. `fromVersion` is the schema version applied AGAINST.
@@ -28,6 +28,30 @@ const MIGRATIONS: ReadonlyArray<Migration> = [
             db.exec(`ALTER TABLE background_tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'spawn'`);
             db.exec(`CREATE INDEX IF NOT EXISTS idx_bgtasks_kind_created
                      ON background_tasks(kind, created_at)`);
+        },
+    },
+    {
+        fromVersion: 3,
+        description: 'add session_goals for /goal Ralph-loop persistence',
+        up: (db) => {
+            db.exec(`
+              CREATE TABLE IF NOT EXISTS session_goals (
+                thread_id      TEXT    PRIMARY KEY,
+                goal           TEXT    NOT NULL,
+                status         TEXT    NOT NULL CHECK (status IN ('active','paused','done','cleared')),
+                turns_used     INTEGER NOT NULL DEFAULT 0,
+                max_turns      INTEGER NOT NULL DEFAULT 20,
+                parse_failures INTEGER NOT NULL DEFAULT 0,
+                created_at     INTEGER NOT NULL,
+                last_turn_at   INTEGER NOT NULL,
+                last_verdict   TEXT,
+                last_reason    TEXT,
+                channel_name   TEXT    NOT NULL,
+                peer_id        TEXT    NOT NULL
+              );
+              CREATE INDEX IF NOT EXISTS idx_session_goals_active
+                ON session_goals(status, last_turn_at);
+            `);
         },
     },
 ];
@@ -124,6 +148,38 @@ export interface BackgroundTaskRow {
     error: string | null;
     description: string | null;
     kind: WorkerRunKind;
+}
+
+export type GoalStatus = 'active' | 'paused' | 'done' | 'cleared';
+
+export interface SessionGoalRow {
+    threadId: string;
+    goal: string;
+    status: GoalStatus;
+    turnsUsed: number;
+    maxTurns: number;
+    parseFailures: number;
+    createdAt: number;
+    lastTurnAt: number;
+    lastVerdict: 'done' | 'continue' | 'skipped' | null;
+    lastReason: string | null;
+    channelName: string;
+    peerId: string;
+}
+
+interface DbSessionGoalRow {
+    thread_id: string;
+    goal: string;
+    status: GoalStatus;
+    turns_used: number;
+    max_turns: number;
+    parse_failures: number;
+    created_at: number;
+    last_turn_at: number;
+    last_verdict: 'done' | 'continue' | 'skipped' | null;
+    last_reason: string | null;
+    channel_name: string;
+    peer_id: string;
 }
 
 /** Rolled-up activity for `flopsy team activity`. */
@@ -1059,6 +1115,78 @@ export class LearningStore {
         });
     }
 
+    getSessionGoal(threadId: string): SessionGoalRow | null {
+        const row = this.db
+            .prepare(`SELECT * FROM session_goals WHERE thread_id = ?`)
+            .get(threadId) as DbSessionGoalRow | undefined;
+        return row ? rowToSessionGoal(row) : null;
+    }
+
+    upsertSessionGoal(row: SessionGoalRow): void {
+        this.runWrite(() => {
+            this.db
+                .prepare(
+                    `INSERT INTO session_goals
+                       (thread_id, goal, status, turns_used, max_turns,
+                        parse_failures, created_at, last_turn_at,
+                        last_verdict, last_reason, channel_name, peer_id)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(thread_id) DO UPDATE SET
+                       goal           = excluded.goal,
+                       status         = excluded.status,
+                       turns_used     = excluded.turns_used,
+                       max_turns      = excluded.max_turns,
+                       parse_failures = excluded.parse_failures,
+                       last_turn_at   = excluded.last_turn_at,
+                       last_verdict   = excluded.last_verdict,
+                       last_reason    = excluded.last_reason,
+                       channel_name   = excluded.channel_name,
+                       peer_id        = excluded.peer_id`,
+                )
+                .run(
+                    row.threadId,
+                    row.goal,
+                    row.status,
+                    row.turnsUsed,
+                    row.maxTurns,
+                    row.parseFailures,
+                    row.createdAt,
+                    row.lastTurnAt,
+                    row.lastVerdict,
+                    row.lastReason,
+                    row.channelName,
+                    row.peerId,
+                );
+        });
+    }
+
+    patchSessionGoal(
+        threadId: string,
+        patch: Partial<Pick<SessionGoalRow,
+            'status' | 'turnsUsed' | 'parseFailures' | 'lastTurnAt' | 'lastVerdict' | 'lastReason'>>,
+    ): void {
+        const sets: string[] = [];
+        const values: (string | number | null)[] = [];
+        if (patch.status !== undefined) { sets.push('status = ?'); values.push(patch.status); }
+        if (patch.turnsUsed !== undefined) { sets.push('turns_used = ?'); values.push(patch.turnsUsed); }
+        if (patch.parseFailures !== undefined) { sets.push('parse_failures = ?'); values.push(patch.parseFailures); }
+        if (patch.lastTurnAt !== undefined) { sets.push('last_turn_at = ?'); values.push(patch.lastTurnAt); }
+        if (patch.lastVerdict !== undefined) { sets.push('last_verdict = ?'); values.push(patch.lastVerdict); }
+        if (patch.lastReason !== undefined) { sets.push('last_reason = ?'); values.push(patch.lastReason); }
+        if (sets.length === 0) return;
+        this.runWrite(() => {
+            this.db
+                .prepare(`UPDATE session_goals SET ${sets.join(', ')} WHERE thread_id = ?`)
+                .run(...values, threadId);
+        });
+    }
+
+    deleteSessionGoal(threadId: string): void {
+        this.runWrite(() => {
+            this.db.prepare(`DELETE FROM session_goals WHERE thread_id = ?`).run(threadId);
+        });
+    }
+
     /** Transition `running → completed | failed | killed`; partial patch. */
     updateBackgroundTaskStatus(
         taskId: string,
@@ -1483,6 +1611,23 @@ export class LearningStore {
         ON background_tasks(thread_id, status);
       CREATE INDEX IF NOT EXISTS idx_bgtasks_kind_created
         ON background_tasks(kind, created_at);
+
+      CREATE TABLE IF NOT EXISTS session_goals (
+        thread_id      TEXT    PRIMARY KEY,
+        goal           TEXT    NOT NULL,
+        status         TEXT    NOT NULL CHECK (status IN ('active','paused','done','cleared')),
+        turns_used     INTEGER NOT NULL DEFAULT 0,
+        max_turns      INTEGER NOT NULL DEFAULT 20,
+        parse_failures INTEGER NOT NULL DEFAULT 0,
+        created_at     INTEGER NOT NULL,
+        last_turn_at   INTEGER NOT NULL,
+        last_verdict   TEXT,
+        last_reason    TEXT,
+        channel_name   TEXT    NOT NULL,
+        peer_id        TEXT    NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_session_goals_active
+        ON session_goals(status, last_turn_at);
     `);
 
         log.info('initial schema applied');
@@ -1568,6 +1713,23 @@ function rowToBackgroundTask(r: DbBackgroundTaskRow): BackgroundTaskRow {
         error: r.error,
         description: r.description,
         kind: r.kind,
+    };
+}
+
+function rowToSessionGoal(r: DbSessionGoalRow): SessionGoalRow {
+    return {
+        threadId: r.thread_id,
+        goal: r.goal,
+        status: r.status,
+        turnsUsed: r.turns_used,
+        maxTurns: r.max_turns,
+        parseFailures: r.parse_failures,
+        createdAt: r.created_at,
+        lastTurnAt: r.last_turn_at,
+        lastVerdict: r.last_verdict,
+        lastReason: r.last_reason,
+        channelName: r.channel_name,
+        peerId: r.peer_id,
     };
 }
 

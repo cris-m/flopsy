@@ -10,6 +10,7 @@ import { insightsCommand } from './handlers/insights';
 import { branchCommand } from './handlers/branch';
 import { newCommand } from './handlers/new';
 import { compactCommand } from './handlers/compact';
+import { goalCommand } from './handlers/goal';
 import { personalityCommand } from './handlers/personality';
 import { planCommand } from './handlers/plan';
 import { mcpCommand } from './handlers/mcp';
@@ -21,6 +22,7 @@ import { buildSkillCommands } from './skill-commands';
 const BUILTIN_COMMANDS: readonly CommandDef[] = [
     newCommand,
     compactCommand,
+    goalCommand,
     branchCommand,
     planCommand,
     mcpCommand,

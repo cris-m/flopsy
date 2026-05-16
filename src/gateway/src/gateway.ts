@@ -16,6 +16,7 @@ import { setMcpFacade } from './commands/mcp-facade';
 import { setPlanFacade } from './commands/plan-facade';
 import { setSessionFacade } from './commands/session-facade';
 import { setCompactFacade } from './commands/compact-facade';
+import { setGoalFacade } from './commands/goal-facade';
 import { runCleanup } from '@flopsy/shared';
 import type { Channel, Message, WebhookChannel } from '@gateway/types';
 import { isWebhookChannel } from '@gateway/types';
@@ -177,6 +178,34 @@ export class FlopsyGateway extends BaseGateway {
                 listServers: () => handler.listMcpServers!(),
                 reload: (opts) => handler.reloadMcp!(opts),
             });
+        }
+
+        if (handler.setGoalContinuationCallback) {
+            handler.setGoalContinuationCallback(({ threadId, channelName, peerId, prompt }) => {
+                const channel = this.getChannel(channelName);
+                if (!channel || !this.router) {
+                    this.log.warn(
+                        { threadId, channelName, peerId, hasChannel: !!channel, hasRouter: !!this.router },
+                        'goal continuation dropped — channel or router unavailable',
+                    );
+                    return;
+                }
+                const message: Message = {
+                    id: `goal-cont-${Date.now()}`,
+                    channelName,
+                    peer: { id: peerId, type: 'user', name: peerId },
+                    sender: { id: 'goal-loop', name: 'goal-loop' },
+                    body: prompt,
+                    synthetic: true,
+                    timestamp: new Date().toISOString(),
+                };
+                this.router.route(message, channel);
+            });
+        }
+
+        if (handler.getGoalManager) {
+            const gm = handler.getGoalManager();
+            if (gm) setGoalFacade(gm as Parameters<typeof setGoalFacade>[0]);
         }
 
         this.router = new MessageRouter({
