@@ -1437,6 +1437,16 @@ export class LearningStore {
         }));
     }
 
+    clearToolFailuresFor(peerId: string, toolName: string): number {
+        let changes = 0;
+        this.runWrite(() => {
+            changes = this.db
+                .prepare('DELETE FROM tool_failures WHERE peer_id = ? AND tool_name = ?')
+                .run(peerId, toolName).changes;
+        });
+        return changes;
+    }
+
     listRecentDismissedFollowUps(
         peerId: string,
         options: { limit?: number; windowMs?: number } = {},

@@ -157,7 +157,23 @@ export class HarnessInterceptor extends BaseInterceptor {
         output: string,
         isError: boolean,
     ): Promise<void> {
-        if (!isError) return;
+        if (!isError) {
+            try {
+                const cleared = this.store.clearToolFailuresFor(this.userId, ctx.toolName);
+                if (cleared > 0) {
+                    log.info(
+                        { toolName: ctx.toolName, cleared },
+                        'tool_failures cleared after successful call',
+                    );
+                }
+            } catch (err) {
+                log.warn(
+                    { err, toolName: ctx.toolName },
+                    'clearToolFailuresFor failed (continuing)',
+                );
+            }
+            return;
+        }
         const pattern = normalizeErrorPattern(output);
         if (!pattern) return;
         try {
