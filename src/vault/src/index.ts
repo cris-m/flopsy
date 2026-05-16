@@ -53,3 +53,12 @@ export {
     type AddRuleInput,
     type InjectInto,
 } from './store/rules';
+export {
+    startVaultServer,
+    startMgmtServer,
+    startProxyServer,
+    type VaultServerOptions,
+    type VaultServerHandle,
+    type MgmtServerHandle,
+    type ProxyServerHandle,
+} from './server';

@@ -20,6 +20,7 @@ import {
     putSecret,
     removeRule,
     revokeToken,
+    startVaultServer,
     unsealVault,
     VaultSealError,
     wipe,
@@ -42,7 +43,7 @@ async function readMasterPassword(reason: string, confirm = false): Promise<stri
     return pw;
 }
 
-const SECRET_KEY_PATTERN = /KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL|PASSPHRASE/i;
+const SECRET_KEY_PATTERN = /KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL|PASSPHRASE|CLIENT_ID|PAT|BEARER|JWT/i;
 
 function placeholderFor(name: string): string {
     return `__${name.toLowerCase()}__`;
@@ -558,6 +559,48 @@ export function registerVaultCommands(root: Command): void {
                 closeVaultDb(db);
             }
             console.log(ok(`removed rule ${id}`));
+        });
+
+    v.command('server')
+        .description('Run the vault proxy server (CONNECT auth + host ACL; MITM substitution lands in a follow-up)')
+        .option('--host <addr>', 'Bind address', '127.0.0.1')
+        .option('--mgmt-port <n>', 'Mgmt HTTP port', (s) => parseInt(s, 10), 18791)
+        .option('--proxy-port <n>', 'MITM proxy port', (s) => parseInt(s, 10), 18792)
+        .action(async (opts: { host: string; mgmtPort: number; proxyPort: number }) => {
+            const path = workspace.vaultDb();
+            if (!existsSync(path)) {
+                console.log(bad('vault not initialised — run `flopsy vault init` first'));
+                process.exit(1);
+            }
+            const pw = await readMasterPassword('Master password:');
+            let handle;
+            try {
+                handle = await startVaultServer({
+                    vaultDbPath: path,
+                    masterPassword: pw,
+                    host: opts.host,
+                    mgmtPort: opts.mgmtPort,
+                    proxyPort: opts.proxyPort,
+                });
+            } catch (err) {
+                if (err instanceof VaultSealError) {
+                    console.log(bad(err.message));
+                    process.exit(1);
+                }
+                throw err;
+            }
+            console.log(section('flopsy vault server'));
+            console.log(ok(`mgmt   http://${handle.mgmt.address()}`));
+            console.log(ok(`proxy  http://${handle.proxy.address()}  (HTTPS_PROXY target)`));
+            console.log(info('CTRL+C to stop'));
+            const shutdown = async (signal: string) => {
+                console.log(info(`\n[${signal}] shutting down`));
+                await handle.stop();
+                process.exit(0);
+            };
+            process.on('SIGINT', () => void shutdown('SIGINT'));
+            process.on('SIGTERM', () => void shutdown('SIGTERM'));
+            await new Promise(() => { /* hold open until signal */ });
         });
 
     v.command('change-password')
