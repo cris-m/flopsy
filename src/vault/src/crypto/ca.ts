@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import forge from 'node-forge';
 
 export interface CertPair {
@@ -14,7 +15,7 @@ export function generateRootCA(): CertPair {
     const keys = forge.pki.rsa.generateKeyPair(2048);
     const cert = forge.pki.createCertificate();
     cert.publicKey = keys.publicKey;
-    cert.serialNumber = '01' + Date.now().toString(16);
+    cert.serialNumber = randomBytes(16).toString('hex');
     cert.validity.notBefore = new Date();
     cert.validity.notAfter = new Date();
     cert.validity.notAfter.setFullYear(cert.validity.notBefore.getFullYear() + 10);
@@ -38,7 +39,7 @@ export function mintLeafCert(rootCertPem: string, rootKeyPem: string, hostname: 
     const keys = forge.pki.rsa.generateKeyPair(2048);
     const cert = forge.pki.createCertificate();
     cert.publicKey = keys.publicKey;
-    cert.serialNumber = Date.now().toString(16) + Math.floor(Math.random() * 1e9).toString(16);
+    cert.serialNumber = randomBytes(16).toString('hex');
     cert.validity.notBefore = new Date(Date.now() - 60 * 1000);
     cert.validity.notAfter = new Date(Date.now() + 24 * 60 * 60 * 1000);
     cert.setSubject([{ name: 'commonName', value: hostname }]);
