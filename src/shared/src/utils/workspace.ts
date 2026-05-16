@@ -108,6 +108,7 @@ export function createWorkspace(env: NodeJS.ProcessEnv = process.env) {
         memoryDb:      () => sub('state', 'memory.db'),
         checkpointsDb: () => sub('state', 'checkpoints.db'),
         learningDb:    () => sub('state', 'learning.db'),
+        vaultDb:       () => sub('state', 'vault.db'),
 
         // Cache (safe to nuke).
         cache:         (...parts: string[]) => sub('cache', ...parts),

@@ -15,6 +15,7 @@
     "@flopsy/gateway": "*",
     "@flopsy/shared": "*",
     "@flopsy/team": "*",
+    "@flopsy/vault": "*",
     "@opentelemetry/api": "^1.9.0",
     "@opentelemetry/exporter-trace-otlp-http": "^0.213.0",
     "@opentelemetry/resources": "^2.6.0",

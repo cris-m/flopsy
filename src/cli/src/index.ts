@@ -42,6 +42,7 @@ import { registerSkillCommands } from './ops/skill-command';
 import { registerStatusCommand } from './ops/status-command';
 import { registerTasksCommand } from './ops/tasks-command';
 import { registerTeamCommands } from './ops/team-command';
+import { registerVaultCommands } from './ops/vault-command';
 import { registerWebhookCommands } from './ops/webhook-command';
 import { formatBannerLine, printBanner } from './ui/banner';
 import { attachHelpFormatter } from './ui/help-format';
@@ -87,6 +88,7 @@ registerCommitmentsCommands(program);
 registerGoalCommands(program);
 registerFaqCommand(program);
 registerChatCommand(program);
+registerVaultCommands(program);
 
 // Colorize help output for every command + subcommand. Must run AFTER
 // all register*() calls so the formatter sees the fully-built tree.

@@ -22,6 +22,7 @@ import {
     workspace,
 } from '@flopsy/shared';
 import { teamTemplatesDir } from '@flopsy/team';
+import { bootstrapVault } from '@flopsy/vault';
 
 // Node 18+'s global `fetch` is powered by undici. Defaults are:
 //   bodyTimeout:    5 min (between chunks — OK to tighten for SSE stalls)
@@ -45,6 +46,18 @@ dotenv({ path: resolve(projectRoot, '.env') });
 // Anchor relative FLOPSY_HOME to projectRoot. Single source of truth;
 // CLI's config-reader calls the same helper with its own configDir.
 primeFlopsyHome(projectRoot);
+
+const _masterPw = process.env.FLOPSY_VAULT_MASTER_PASSWORD;
+if (_masterPw) delete process.env.FLOPSY_VAULT_MASTER_PASSWORD;
+const _vault = bootstrapVault({
+    vaultDbPath: resolveWorkspacePath('state', 'vault.db'),
+    masterPassword: _masterPw,
+});
+if (_vault.kind === 'unsealed') {
+    process.stderr.write(`[vault] unsealed; hydrated ${_vault.hydrated.length} credential${_vault.hydrated.length === 1 ? '' : 's'} into process.env\n`);
+} else {
+    process.stderr.write(`[vault] skipped: ${_vault.reason}\n`);
+}
 
 // MCP_ROOT is referenced as ${MCP_ROOT} in flopsy.json5 for MCP server
 // paths. If relative, anchor to projectRoot — otherwise it resolves

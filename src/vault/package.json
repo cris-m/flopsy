@@ -1,0 +1,29 @@
+{
+  "name": "@flopsy/vault",
+  "version": "1.0.0",
+  "description": "Encrypted credential broker for FlopsyBot — AES-256-GCM, Argon2id KEK, KEK/DEK key wrapping",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "dependencies": {
+    "@flopsy/shared": "*",
+    "@noble/hashes": "^1.5.0",
+    "better-sqlite3": "^11.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^25.3.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  },
+  "scripts": {
+    "test": "vitest run"
+  }
+}
