@@ -24,4 +24,32 @@ export {
     type InitBrokerOptions,
 } from './broker';
 export { bootstrapVault, type VaultBootstrap, type BootstrapResult, type SkippedResult, type BootstrapOptions } from './bootstrap';
-export { appendAudit, type AuditEntry } from './store/audit';
+export { appendAudit, listAudit, type AuditEntry, type AuditRow, type ListAuditOptions } from './store/audit';
+export {
+    mintToken,
+    verifyToken,
+    listTokens,
+    revokeToken,
+    deleteToken,
+    decodeScope,
+    hostMatchesScope,
+    secretMatchesScope,
+    TOKEN_PREFIX,
+    TokenVerifyError,
+    type TokenRow,
+    type MintTokenInput,
+    type MintTokenResult,
+    type VerifiedToken,
+    type DecodedScope,
+} from './store/tokens';
+export {
+    addRule,
+    listRules,
+    removeRule,
+    matchRule,
+    hostMatches,
+    parseInjectInto,
+    type RuleRow,
+    type AddRuleInput,
+    type InjectInto,
+} from './store/rules';

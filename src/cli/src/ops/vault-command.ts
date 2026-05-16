@@ -4,15 +4,22 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve as resolvePath } from 'node:path';
 import { workspace } from '@flopsy/shared';
 import {
+    addRule,
     closeVaultDb,
     changeMasterPassword,
     deleteSecret,
     getSecret,
     initVault,
     isVaultInitialised,
+    listAudit,
+    listRules,
     listSecrets,
+    listTokens,
+    mintToken,
     openVaultDb,
     putSecret,
+    removeRule,
+    revokeToken,
     unsealVault,
     VaultSealError,
     wipe,
@@ -69,6 +76,19 @@ function findDotEnv(): string | undefined {
         if (existsSync(c)) return c;
     }
     return undefined;
+}
+
+function parseDuration(s: string): number | undefined {
+    const m = s.match(/^(\d+)\s*(s|m|h|d)$/);
+    if (!m) return undefined;
+    const value = parseInt(m[1]!, 10);
+    switch (m[2]) {
+        case 's': return value * 1_000;
+        case 'm': return value * 60_000;
+        case 'h': return value * 3_600_000;
+        case 'd': return value * 86_400_000;
+        default:  return undefined;
+    }
 }
 
 function readStdin(): Promise<string> {
@@ -298,6 +318,202 @@ export function registerVaultCommands(root: Command): void {
             }
             console.log(ok(`imported ${added}, skipped ${skipped} (already present — use --overwrite to replace)`));
             console.log(info('source .env was NOT modified; remove keys from .env once you wire the daemon to read from the vault'));
+        });
+
+    v.command('audit')
+        .description('Show the tamper-evident audit log of credential access')
+        .option('--since <duration>', 'Limit to events since N (e.g. 24h, 7d, 30m); default = all')
+        .option('--limit <n>', 'Max rows', (s) => parseInt(s, 10), 50)
+        .option('--actor <token>', 'Filter by actor (who)')
+        .option('--action <name>', 'Filter by action (e.g. credential.read)')
+        .action((opts: { since?: string; limit?: number; actor?: string; action?: string }) => {
+            const path = workspace.vaultDb();
+            if (!existsSync(path)) {
+                console.log(bad('vault not initialised — run `flopsy vault init` first'));
+                process.exit(1);
+            }
+            const sinceMs = opts.since ? parseDuration(opts.since) : undefined;
+            const db = openVaultDb({ path, readOnly: true });
+            try {
+                const rows = listAudit(db, {
+                    sinceMs: sinceMs ? Date.now() - sinceMs : undefined,
+                    limit: opts.limit ?? 50,
+                    actorToken: opts.actor,
+                    action: opts.action,
+                });
+                if (rows.length === 0) {
+                    console.log(info('no audit events match'));
+                    return;
+                }
+                console.log(section(`flopsy vault audit — ${rows.length} event${rows.length === 1 ? '' : 's'}`));
+                for (const r of rows) {
+                    const ts = new Date(r.tsMs).toISOString().replace('T', ' ').slice(0, 19);
+                    const out = r.outcome === 'success' ? ok(r.outcome) : bad(r.outcome);
+                    const res = r.resource ?? '';
+                    console.log(`  ${ts}  ${r.action.padEnd(18)}  ${res.padEnd(28)}  ${out}  ${r.actorToken}`);
+                }
+            } finally {
+                closeVaultDb(db);
+            }
+        });
+
+    const tok = v.command('token').description('Manage scoped tokens for external agents');
+
+    tok.command('mint')
+        .description('Mint a new scoped token for an external agent')
+        .requiredOption('--label <name>', 'Token label (e.g. claude-code)')
+        .option('--ttl <duration>', 'TTL (e.g. 30d, 24h); default = no expiry')
+        .option('--allow-hosts <list>', 'Comma-separated host patterns (e.g. api.anthropic.com,*.github.com)')
+        .option('--allow-secrets <list>', 'Comma-separated secret name patterns (e.g. ANTHROPIC_API_KEY)')
+        .action((opts: { label: string; ttl?: string; allowHosts?: string; allowSecrets?: string }) => {
+            const path = workspace.vaultDb();
+            if (!existsSync(path)) {
+                console.log(bad('vault not initialised — run `flopsy vault init` first'));
+                process.exit(1);
+            }
+            const ttlMs = opts.ttl ? parseDuration(opts.ttl) : undefined;
+            if (opts.ttl && ttlMs === undefined) {
+                console.log(bad(`invalid TTL: ${opts.ttl}`));
+                process.exit(1);
+            }
+            const db = openVaultDb({ path });
+            try {
+                const result = mintToken(db, {
+                    label: opts.label,
+                    ttlMs,
+                    allowHosts: opts.allowHosts?.split(',').map((s) => s.trim()).filter(Boolean) ?? [],
+                    allowSecrets: opts.allowSecrets?.split(',').map((s) => s.trim()).filter(Boolean) ?? [],
+                });
+                console.log(section('flopsy vault token'));
+                console.log(ok(`minted ${result.label}${result.expiresAt ? ` (expires ${new Date(result.expiresAt).toISOString()})` : ''}`));
+                console.log('');
+                console.log(`  ${result.rawToken}`);
+                console.log('');
+                console.log(info('this token is shown ONCE. Store it somewhere safe — it cannot be recovered.'));
+            } finally {
+                closeVaultDb(db);
+            }
+        });
+
+    tok.command('list')
+        .description('List all tokens (raw token values are never stored)')
+        .action(() => {
+            const path = workspace.vaultDb();
+            if (!existsSync(path)) {
+                console.log(bad('vault not initialised — run `flopsy vault init` first'));
+                process.exit(1);
+            }
+            const db = openVaultDb({ path, readOnly: true });
+            try {
+                const rows = listTokens(db);
+                if (rows.length === 0) {
+                    console.log(info('no tokens minted — `flopsy vault token mint --label <name>` to create one'));
+                    return;
+                }
+                console.log(section(`flopsy vault tokens — ${rows.length}`));
+                for (const r of rows) {
+                    const status = r.revoked ? bad('revoked') : r.expiresAt && r.expiresAt < Date.now() ? bad('expired') : ok('active');
+                    const exp = r.expiresAt ? new Date(r.expiresAt).toISOString().slice(0, 19).replace('T', ' ') : 'no expiry';
+                    console.log(`  ${r.label.padEnd(24)}  ${status.padEnd(20)}  ${exp}`);
+                }
+            } finally {
+                closeVaultDb(db);
+            }
+        });
+
+    tok.command('revoke <label>')
+        .description('Revoke a token by label (becomes unusable; remains in audit trail)')
+        .action((label: string) => {
+            const path = workspace.vaultDb();
+            if (!existsSync(path)) {
+                console.log(bad('vault not initialised — run `flopsy vault init` first'));
+                process.exit(1);
+            }
+            const db = openVaultDb({ path });
+            try {
+                if (!revokeToken(db, label)) {
+                    console.log(bad(`no such active token: ${label}`));
+                    process.exit(1);
+                }
+            } finally {
+                closeVaultDb(db);
+            }
+            console.log(ok(`revoked ${label}`));
+        });
+
+    const rule = v.command('rule').description('Manage service rules (host → credential substitution)');
+
+    rule.command('add')
+        .description('Add a service rule for the MITM proxy')
+        .requiredOption('--host <pattern>', 'Host pattern (e.g. api.anthropic.com, *.openai.com)')
+        .requiredOption('--placeholder <text>', 'Placeholder string the agent will use (e.g. __anthropic_api_key__)')
+        .requiredOption('--secret <name>', 'Vault secret name to substitute (e.g. ANTHROPIC_API_KEY)')
+        .requiredOption('--into <target>', 'Where to inject: header:<name> | body | query:<name>')
+        .action((opts: { host: string; placeholder: string; secret: string; into: string }) => {
+            const path = workspace.vaultDb();
+            if (!existsSync(path)) {
+                console.log(bad('vault not initialised — run `flopsy vault init` first'));
+                process.exit(1);
+            }
+            const db = openVaultDb({ path });
+            try {
+                const id = addRule(db, {
+                    hostPattern: opts.host,
+                    placeholder: opts.placeholder,
+                    secretName: opts.secret,
+                    injectInto: opts.into,
+                });
+                console.log(ok(`rule added: ${id} (${opts.host} -> ${opts.secret} via ${opts.into})`));
+            } catch (err) {
+                console.log(bad(err instanceof Error ? err.message : String(err)));
+                process.exit(1);
+            } finally {
+                closeVaultDb(db);
+            }
+        });
+
+    rule.command('list')
+        .description('List all service rules')
+        .action(() => {
+            const path = workspace.vaultDb();
+            if (!existsSync(path)) {
+                console.log(bad('vault not initialised — run `flopsy vault init` first'));
+                process.exit(1);
+            }
+            const db = openVaultDb({ path, readOnly: true });
+            try {
+                const rows = listRules(db);
+                if (rows.length === 0) {
+                    console.log(info('no rules — `flopsy vault rule add` to create one'));
+                    return;
+                }
+                console.log(section(`flopsy vault rules — ${rows.length}`));
+                for (const r of rows) {
+                    console.log(`  ${r.id}  ${r.hostPattern.padEnd(28)}  ${r.placeholder.padEnd(28)}  ${r.secretName.padEnd(24)}  ${r.injectInto}`);
+                }
+            } finally {
+                closeVaultDb(db);
+            }
+        });
+
+    rule.command('rm <id>')
+        .description('Remove a service rule by id (shown in `vault rule list`)')
+        .action((id: string) => {
+            const path = workspace.vaultDb();
+            if (!existsSync(path)) {
+                console.log(bad('vault not initialised — run `flopsy vault init` first'));
+                process.exit(1);
+            }
+            const db = openVaultDb({ path });
+            try {
+                if (!removeRule(db, id)) {
+                    console.log(bad(`no such rule: ${id}`));
+                    process.exit(1);
+                }
+            } finally {
+                closeVaultDb(db);
+            }
+            console.log(ok(`removed rule ${id}`));
         });
 
     v.command('change-password')
