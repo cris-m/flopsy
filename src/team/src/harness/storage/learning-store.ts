@@ -7,7 +7,7 @@ const log = createLogger('learning-store');
 
 /** Current schema version. Bump when adding new tables or columns,
  *  AND add a corresponding entry to MIGRATIONS for the upgrade path. */
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 /**
  * One ordered migration step. `fromVersion` is the schema version applied AGAINST.
@@ -20,8 +20,17 @@ interface Migration {
     up: (db: Database.Database) => void;
 }
 
-/** Empty today — schema at SCHEMA_VERSION=2 created in full by applyInitialSchema(). */
-const MIGRATIONS: ReadonlyArray<Migration> = [];
+const MIGRATIONS: ReadonlyArray<Migration> = [
+    {
+        fromVersion: 2,
+        description: 'add background_tasks.kind to unify delegate/spawn telemetry',
+        up: (db) => {
+            db.exec(`ALTER TABLE background_tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'spawn'`);
+            db.exec(`CREATE INDEX IF NOT EXISTS idx_bgtasks_kind_created
+                     ON background_tasks(kind, created_at)`);
+        },
+    },
+];
 
 /** Multi-process SQLite under WAL. */
 const BUSY_TIMEOUT_MS = 1_000;
@@ -96,6 +105,9 @@ export type BackgroundTaskStatus =
     | 'failed'
     | 'killed';
 
+/** Discriminates synchronous delegate_task runs from async spawn_background_task runs. */
+export type WorkerRunKind = 'spawn' | 'delegate';
+
 /** Persisted background task — durable mirror of in-memory TaskRegistry state. */
 export interface BackgroundTaskRow {
     taskId: string;
@@ -111,6 +123,22 @@ export interface BackgroundTaskRow {
     result: string | null;
     error: string | null;
     description: string | null;
+    kind: WorkerRunKind;
+}
+
+/** Rolled-up activity for `flopsy team activity`. */
+export interface WorkerActivityRow {
+    workerName: string;
+    totalCalls: number;
+    delegateCalls: number;
+    spawnCalls: number;
+    completed: number;
+    failed: number;
+    killed: number;
+    running: number;
+    successRate: number;
+    avgDurationMs: number;
+    lastSeenMs: number;
 }
 
 interface DbBackgroundTaskRow {
@@ -127,6 +155,7 @@ interface DbBackgroundTaskRow {
     result: string | null;
     error: string | null;
     description: string | null;
+    kind: WorkerRunKind;
 }
 
 /**
@@ -916,8 +945,8 @@ export class LearningStore {
                 `INSERT INTO background_tasks
                    (task_id, thread_id, worker_name, task_prompt, tool_allowlist,
                     timeout_ms, delivery_mode, status, created_at, ended_at,
-                    result, error, description)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    result, error, description, kind)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             )
             .run(
                 row.taskId,
@@ -933,7 +962,101 @@ export class LearningStore {
                 row.result,
                 row.error,
                 row.description,
+                row.kind,
             );
+    }
+
+    /** Record a delegate_task run (synchronous; terminal state on entry). */
+    recordDelegateRun(args: {
+        taskId: string;
+        threadId: string;
+        workerName: string;
+        taskPrompt: string;
+        toolAllowlist: readonly string[] | null;
+        startedAtMs: number;
+        endedAtMs: number;
+        status: Exclude<BackgroundTaskStatus, 'running' | 'delivered'>;
+        result: string | null;
+        error: string | null;
+    }): void {
+        this.runWrite(() => {
+            this.recordBackgroundTask({
+                taskId: args.taskId,
+                threadId: args.threadId,
+                workerName: args.workerName,
+                taskPrompt: args.taskPrompt,
+                toolAllowlist: args.toolAllowlist,
+                timeoutMs: null,
+                deliveryMode: null,
+                status: args.status,
+                createdAt: args.startedAtMs,
+                endedAt: args.endedAtMs,
+                result: args.result,
+                error: args.error,
+                description: null,
+                kind: 'delegate',
+            });
+        });
+    }
+
+    /** Roll up per-worker stats since `sinceMs`. Excludes ‘running’ from successRate
+     *  denominator (in-flight rows have no outcome yet). */
+    listWorkerActivity(args: {
+        sinceMs: number;
+        workerName?: string;
+    }): readonly WorkerActivityRow[] {
+        const params: (string | number)[] = [args.sinceMs];
+        let where = `created_at >= ?`;
+        if (args.workerName) {
+            where += ` AND worker_name = ?`;
+            params.push(args.workerName);
+        }
+        const rows = this.db
+            .prepare(
+                `SELECT
+                   worker_name,
+                   COUNT(*)                                                AS total,
+                   SUM(CASE WHEN kind = 'delegate' THEN 1 ELSE 0 END)      AS delegate_calls,
+                   SUM(CASE WHEN kind = 'spawn'    THEN 1 ELSE 0 END)      AS spawn_calls,
+                   SUM(CASE WHEN status IN ('completed','delivered') THEN 1 ELSE 0 END) AS completed,
+                   SUM(CASE WHEN status = 'failed'  THEN 1 ELSE 0 END)     AS failed,
+                   SUM(CASE WHEN status = 'killed'  THEN 1 ELSE 0 END)     AS killed,
+                   SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END)     AS running,
+                   AVG(CASE WHEN ended_at IS NOT NULL THEN ended_at - created_at END) AS avg_duration,
+                   MAX(created_at)                                         AS last_seen
+                 FROM background_tasks
+                 WHERE ${where}
+                 GROUP BY worker_name
+                 ORDER BY total DESC, worker_name ASC`,
+            )
+            .all(...params) as Array<{
+                worker_name: string;
+                total: number;
+                delegate_calls: number;
+                spawn_calls: number;
+                completed: number;
+                failed: number;
+                killed: number;
+                running: number;
+                avg_duration: number | null;
+                last_seen: number;
+            }>;
+        return rows.map((r) => {
+            const terminal = r.completed + r.failed + r.killed;
+            return {
+                workerName: r.worker_name,
+                totalCalls: r.total,
+                delegateCalls: r.delegate_calls,
+                spawnCalls: r.spawn_calls,
+                completed: r.completed,
+                failed: r.failed,
+                killed: r.killed,
+                running: r.running,
+                successRate: terminal === 0 ? 0 : r.completed / terminal,
+                avgDurationMs: Math.round(r.avg_duration ?? 0),
+                lastSeenMs: r.last_seen,
+            };
+        });
     }
 
     /** Transition `running → completed | failed | killed`; partial patch. */
@@ -989,7 +1112,7 @@ export class LearningStore {
             .prepare(
                 `SELECT task_id, thread_id, worker_name, task_prompt, tool_allowlist,
                         timeout_ms, delivery_mode, status, created_at, ended_at,
-                        result, error, description
+                        result, error, description, kind
                    FROM background_tasks
                   WHERE thread_id = ? AND status IN (${placeholders})
                   ORDER BY created_at ASC`,
@@ -1334,6 +1457,10 @@ export class LearningStore {
 
       -- background_tasks: durable TaskRegistry mirror for spawn_background_task.
       -- States: running → completed | delivered | failed | killed.
+      -- background_tasks: unified worker-run ledger for delegate_task (sync, kind='delegate')
+      -- and spawn_background_task (async, kind='spawn'). States:
+      --   delegate: completed | failed | killed (no 'running' window persisted)
+      --   spawn:    running → completed | delivered | failed | killed
       CREATE TABLE IF NOT EXISTS background_tasks (
         task_id        TEXT    PRIMARY KEY,
         thread_id      TEXT    NOT NULL,
@@ -1347,12 +1474,15 @@ export class LearningStore {
         ended_at       INTEGER,
         result         TEXT,
         error          TEXT,
-        description    TEXT
+        description    TEXT,
+        kind           TEXT    NOT NULL DEFAULT 'spawn' CHECK (kind IN ('spawn','delegate'))
       );
       CREATE INDEX IF NOT EXISTS idx_bgtasks_status
         ON background_tasks(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_bgtasks_thread
         ON background_tasks(thread_id, status);
+      CREATE INDEX IF NOT EXISTS idx_bgtasks_kind_created
+        ON background_tasks(kind, created_at);
     `);
 
         log.info('initial schema applied');
@@ -1437,6 +1567,7 @@ function rowToBackgroundTask(r: DbBackgroundTaskRow): BackgroundTaskRow {
         result: r.result,
         error: r.error,
         description: r.description,
+        kind: r.kind,
     };
 }
 

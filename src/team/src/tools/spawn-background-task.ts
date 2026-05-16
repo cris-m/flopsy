@@ -35,6 +35,7 @@ export interface BackgroundTaskStore {
         result: null;
         error: null;
         description: string | null;
+        kind: 'spawn';
     }): void;
     updateBackgroundTaskStatus(
         taskId: string,
@@ -286,13 +287,14 @@ function launch(
                 taskPrompt: args.task,
                 toolAllowlist: args.tools ?? null,
                 timeoutMs,
-                deliveryMode: null, // determined by the receiving channel-worker
+                deliveryMode: null,
                 status: 'running',
                 createdAt: Date.now(),
                 endedAt: null,
                 result: null,
                 error: null,
                 description: descriptionLabel,
+                kind: 'spawn',
             });
         } catch (err) {
             logger?.warn?.(

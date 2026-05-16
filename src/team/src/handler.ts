@@ -536,6 +536,7 @@ export class TeamHandler implements AgentHandler {
                 personality: callbacks.personality,
                 runtimeHints: callbacks.runtimeHints,
                 taskStore: this.store,
+                runStore: this.store,
                 skillUsageStore: entry.entry.skillUsageStore,
                 onAuthSuccess: (provider: string) => {
                     // Fire-and-forget; awaiting would block the user's turn for 5-30s on slow MCP restart.
@@ -1955,6 +1956,7 @@ export class TeamHandler implements AgentHandler {
                                 spawnChain: spawnChain ?? [],
                                 registry,
                                 agentName: def.name,
+                                runStore: this.store,
                                 ...(parentBrief ? { parentBrief } : {}),
                             },
                         },

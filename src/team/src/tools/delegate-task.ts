@@ -13,17 +13,34 @@ import type {
 } from './spawn-background-task';
 import { MAX_DELEGATION_DEPTH } from './spawn-background-task';
 
-// Cap below the gateway's 600s envelope so a delegate timeout surfaces as a tool error.
-export const DEFAULT_DELEGATE_TIMEOUT_MS = 180_000; // 3 min — typical focused sub-task
-export const MAX_DELEGATE_TIMEOUT_MS = 480_000;     // 8 min — headroom under the 600s envelope
+export const DEFAULT_DELEGATE_TIMEOUT_MS = 180_000;
+export const MAX_DELEGATE_TIMEOUT_MS = 480_000;
 
-/** Delegate reuses spawn's configurable shape — same wiring, same factory. */
+/** Subset of LearningStore that delegate_task uses to persist a run. */
+export interface DelegateRunStore {
+    recordDelegateRun(args: {
+        taskId: string;
+        threadId: string;
+        workerName: string;
+        taskPrompt: string;
+        toolAllowlist: readonly string[] | null;
+        startedAtMs: number;
+        endedAtMs: number;
+        status: 'completed' | 'failed' | 'killed';
+        result: string | null;
+        error: string | null;
+    }): void;
+}
+
 export type DelegateTaskConfigurable = Pick<
     SpawnBackgroundTaskConfigurable,
     'registry' | 'buildSubAgent' | 'depth' | 'logger'
 > & {
-    /** Chain of worker names that led to this invocation. */
     spawnChain?: string[];
+    /** Optional — when set, delegate runs land in the worker_activity ledger. */
+    runStore?: DelegateRunStore;
+    /** Parent thread for the run (gateway routing key). Required with runStore. */
+    threadId?: string;
 };
 
 const schema = z.object({
@@ -141,9 +158,17 @@ export const delegateTaskTool = defineTool({
             return `delegate_task: unknown worker "${args.worker}". Ensure it exists in the team and is enabled.`;
         }
 
-        // Cast to the post-transform shape (TS still types as the input union).
         const coerced = args as unknown as DelegateArgs;
-        return await runInline(coerced, { registry, runner, depth, chain, logger, parentSignal: ctx.signal });
+        return await runInline(coerced, {
+            registry,
+            runner,
+            depth,
+            chain,
+            logger,
+            parentSignal: ctx.signal,
+            runStore: cfg.runStore,
+            threadId: cfg.threadId,
+        });
     },
 });
 
@@ -171,6 +196,34 @@ function validateWiring(cfg: Partial<DelegateTaskConfigurable>): Wiring | string
     };
 }
 
+/** Deterministic detector for "I couldn't access X" / empty body / dropout. */
+const DROPOUT_PATTERNS: readonly RegExp[] = [
+    /\bi (?:can(?:not|'t)|could ?not|am unable to|don'?t have access)/i,
+    /\bno (?:results?|data|response|access) (?:found|available|returned)/i,
+    /\bunable to (?:access|reach|fetch|retrieve)/i,
+    /\b(?:returned|got) (?:nothing|no results?|empty)/i,
+];
+
+function detectDropout(result: string): string | null {
+    const body = result.trim();
+    if (body.length === 0) return 'empty body';
+    if (body.length < 40) {
+        for (const re of DROPOUT_PATTERNS) {
+            if (re.test(body)) return 'short dropout response';
+        }
+    } else {
+        const head = body.slice(0, 400);
+        for (const re of DROPOUT_PATTERNS) {
+            if (re.test(head)) return 'worker reported it could not complete';
+        }
+    }
+    return null;
+}
+
+function appendGapMarker(result: string, gap: string, worker: string): string {
+    return `${result}\n\n[delegate_task:gap worker=${worker} reason="${gap}"]\nThe worker did not deliver actionable output. Either retry with a tighter prompt, route to a different worker, or flag this gap in your user-facing reply.`;
+}
+
 function buildTaskPrompt(args: DelegateArgs): string {
     const parts: string[] = [args.task];
     if (args.context && Object.keys(args.context).length > 0) {
@@ -194,9 +247,11 @@ async function runInline(
         chain: string[];
         logger: DelegateTaskConfigurable['logger'];
         parentSignal: AbortSignal | undefined;
+        runStore: DelegateRunStore | undefined;
+        threadId: string | undefined;
     },
 ): Promise<string> {
-    const { registry, runner, depth, chain, logger, parentSignal } = deps;
+    const { registry, runner, depth, chain, logger, parentSignal, runStore, threadId } = deps;
     const timeoutMs = args.timeoutMs ?? DEFAULT_DELEGATE_TIMEOUT_MS;
 
     const task = createTeammateTask({
@@ -219,6 +274,26 @@ async function runInline(
 
     const timer: NodeJS.Timeout = setTimeout(() => whole.abort(), timeoutMs);
 
+    const persist = (status: 'completed' | 'failed' | 'killed', result: string | null, error: string | null): void => {
+        if (!runStore || !threadId) return;
+        try {
+            runStore.recordDelegateRun({
+                taskId: task.id,
+                threadId,
+                workerName: args.worker,
+                taskPrompt: args.task,
+                toolAllowlist: args.tools ?? null,
+                startedAtMs: startedAt,
+                endedAtMs: Date.now(),
+                status,
+                result,
+                error,
+            });
+        } catch (err) {
+            logger?.warn?.({ err, taskId: task.id }, 'delegate_task: telemetry write failed (non-fatal)');
+        }
+    };
+
     try {
         const result = await runner({
             workerName: args.worker,
@@ -235,6 +310,19 @@ async function runInline(
             { taskId: task.id, durationMs: Date.now() - startedAt },
             'delegate_task: completed',
         );
+
+        const gap = detectDropout(result);
+        if (gap) {
+            logger?.warn?.(
+                { taskId: task.id, worker: args.worker, gap },
+                'delegate_task: worker dropout detected — annotating reply for leader',
+            );
+            const augmented = appendGapMarker(result, gap, args.worker);
+            persist('completed', augmented, null);
+            return augmented;
+        }
+
+        persist('completed', result, null);
         return result;
     } catch (err) {
         const aborted = whole.signal.aborted;
@@ -258,6 +346,8 @@ async function runInline(
             },
             'delegate_task: aborted or failed',
         );
+
+        persist(aborted ? 'killed' : 'failed', null, message);
 
         if (timedOut) {
             return `delegate_task: timed out after ${timeoutMs}ms (worker=${args.worker}). The teammate was aborted.`;

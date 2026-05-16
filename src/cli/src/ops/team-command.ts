@@ -8,11 +8,54 @@
 import { Command } from 'commander';
 import { renameSync, writeFileSync } from 'node:fs';
 import chalk from 'chalk';
+import { LearningStore } from '@flopsy/team';
 import { loadMgmtToken, truncate } from '@flopsy/shared';
 import { bad, detail, dim, info, ok, row, section } from '../ui/pretty';
 import { readFlopsyConfig, type ModelRef, type RawAgent } from './config-reader';
 import { managementUrl } from './schedule-client';
 import { tint } from '../ui/theme';
+
+const SINCE_PRESETS: Readonly<Record<string, number>> = {
+    '1h':  60 * 60_000,
+    '6h':  6 * 60 * 60_000,
+    '24h': 24 * 60 * 60_000,
+    '7d':  7 * 24 * 60 * 60_000,
+    '30d': 30 * 24 * 60 * 60_000,
+};
+
+function parseSinceMs(input: string): number {
+    const lower = input.toLowerCase();
+    if (lower in SINCE_PRESETS) return SINCE_PRESETS[lower]!;
+    const m = lower.match(/^(\d+)([hd])$/);
+    if (m) {
+        const n = Number(m[1]);
+        const unit = m[2] === 'h' ? 60 * 60_000 : 24 * 60 * 60_000;
+        if (Number.isFinite(n) && n > 0 && n <= 365) return n * unit;
+    }
+    throw new Error(`unrecognized --since value "${input}" (use 1h | 6h | 24h | 7d | 30d | <N>h | <N>d)`);
+}
+
+function fmtRelative(ms: number, now = Date.now()): string {
+    const delta = Math.max(0, now - ms);
+    const m = Math.floor(delta / 60_000);
+    if (m < 1) return 'just now';
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    return `${Math.floor(h / 24)}d ago`;
+}
+
+function fmtDurationMs(ms: number): string {
+    if (ms < 1000) return `${ms}ms`;
+    const s = ms / 1000;
+    if (s < 60) return `${s.toFixed(1)}s`;
+    const m = Math.floor(s / 60);
+    return `${m}m${Math.round(s - m * 60)}s`;
+}
+
+function fmtPct(rate: number): string {
+    return `${Math.round(rate * 100)}%`;
+}
 
 /** Format a ModelRef back into a "provider:name" string for display. */
 function fmtModel(m: ModelRef | undefined): string | undefined {
@@ -65,8 +108,57 @@ export function registerTeamCommands(root: Command): void {
             writeAgentField(name, field, parsed);
         });
 
-    // Default: `flopsy team` with no subcommand → show help.
+    team.command('activity')
+        .description('Per-worker delegation activity: counts, success rate, last seen')
+        .option('--since <window>', 'Time window: 1h | 6h | 24h | 7d | 30d | <N>h | <N>d', '24h')
+        .option('--worker <name>', 'Filter to a single worker')
+        .action((opts: { since: string; worker?: string }) => renderActivity(opts));
+
     team.action((_opts: unknown, cmd: { outputHelp(): void }) => cmd.outputHelp());
+}
+
+function renderActivity(opts: { since: string; worker?: string }): void {
+    let windowMs: number;
+    try {
+        windowMs = parseSinceMs(opts.since);
+    } catch (err) {
+        console.log(bad(err instanceof Error ? err.message : String(err)));
+        process.exit(2);
+    }
+    const sinceMs = Date.now() - windowMs;
+    const store = new LearningStore();
+    try {
+        const rows = store.listWorkerActivity({
+            sinceMs,
+            ...(opts.worker ? { workerName: opts.worker } : {}),
+        });
+        const header = opts.worker
+            ? `Worker activity — ${opts.worker} — since ${opts.since}`
+            : `Worker activity — since ${opts.since}`;
+        console.log(section(header, 'team'));
+        if (rows.length === 0) {
+            console.log(info('No delegate_task or spawn_background_task runs in this window.'));
+            console.log(dim('  The team is configured but no delegations have fired. See `flopsy team list`.'));
+            return;
+        }
+        for (const r of rows) {
+            console.log(row('worker', r.workerName));
+            console.log(detail('total', String(r.totalCalls)));
+            console.log(detail('mix', `delegate ${r.delegateCalls} / spawn ${r.spawnCalls}`));
+            console.log(detail('outcome', `${r.completed} ok · ${r.failed} failed · ${r.killed} killed${r.running ? ` · ${r.running} running` : ''}`));
+            console.log(detail('success', fmtPct(r.successRate)));
+            console.log(detail('avg duration', fmtDurationMs(r.avgDurationMs)));
+            console.log(detail('last seen', fmtRelative(r.lastSeenMs)));
+            console.log('');
+        }
+        const totalCalls = rows.reduce((acc, r) => acc + r.totalCalls, 0);
+        const okCalls = rows.reduce((acc, r) => acc + r.completed, 0);
+        const denom = rows.reduce((acc, r) => acc + r.completed + r.failed + r.killed, 0);
+        const overall = denom === 0 ? 0 : okCalls / denom;
+        console.log(ok(`${totalCalls} runs across ${rows.length} worker${rows.length === 1 ? '' : 's'} · overall ${fmtPct(overall)} success`));
+    } finally {
+        store.close();
+    }
 }
 
 type LiveAgentMap = Map<string, { state: 'idle' | 'busy'; currentTask?: string }>;
