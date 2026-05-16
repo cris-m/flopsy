@@ -4,9 +4,9 @@
  * in when they want them.
  */
 
-/** ms → "3s" / "5m 20s" / "2h 15m" / "3d 4h" */
+/** ms → "<1s" / "3s" / "5m 20s" / "2h 15m" / "3d 4h" */
 export function humanDuration(ms: number): string {
-    if (ms < 1000) return `${ms}ms`;
+    if (ms < 1000) return '<1s';
     const s = Math.floor(ms / 1000);
     if (s < 60) return `${s}s`;
     const m = Math.floor(s / 60);

@@ -28,6 +28,11 @@ const paintOption = chalk.hex(palette.auth);
 const paintHeading = chalk.bold.hex(palette.brand);
 const paintDim = chalk.dim;
 
+const ANSI_PATTERN = /\x1b\[[0-9;]*m/g;
+function visibleLength(s: string): number {
+    return s.replace(ANSI_PATTERN, '').length;
+}
+
 export function createHelpConfig(): Partial<Help> {
     return {
         // Command term (e.g. "status [options]" or "run|gateway")
@@ -55,14 +60,21 @@ export function createHelpConfig(): Partial<Help> {
         // so we can colorize section labels ("Usage:" etc.) — these
         // aren't exposed through narrow hooks.
         formatHelp(cmd: Command, helper: Help): string {
-            const termWidth = helper.padWidth(cmd, helper);
             const helpWidth = helper.helpWidth || 80;
             const itemIndentWidth = 2;
             const itemSeparatorWidth = 2;
 
+            const termWidth = Math.max(
+                0,
+                ...helper.visibleOptions(cmd).map((o) => visibleLength(helper.optionTerm(o))),
+                ...helper.visibleCommands(cmd).map((c) => visibleLength(helper.subcommandTerm(c))),
+                ...helper.visibleArguments(cmd).map((a) => visibleLength(a.name())),
+            );
+
             const formatItem = (term: string, description: string): string => {
                 if (description) {
-                    const fullText = `${term.padEnd(termWidth + itemSeparatorWidth)}${description}`;
+                    const pad = Math.max(itemSeparatorWidth, termWidth + itemSeparatorWidth - visibleLength(term));
+                    const fullText = `${term}${' '.repeat(pad)}${description}`;
                     return helper.wrap(fullText, helpWidth - itemIndentWidth, termWidth + itemSeparatorWidth);
                 }
                 return term;
