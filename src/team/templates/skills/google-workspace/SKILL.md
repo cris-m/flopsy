@@ -59,33 +59,12 @@ All Google Workspace tools use OAuth 2.0. Tokens are stored at `.flopsy/sessions
 | `drive_rename` | Rename a file or folder |
 | `drive_storage` | Check storage quota |
 
-### Tasks
-| Tool | Purpose |
-|------|---------|
-| `tasks_lists` | Get all task lists |
-| `tasks_list` | List tasks in a list |
-| `tasks_get` | Get a specific task |
-| `tasks_create` | Create a new task |
-| `tasks_update` | Update a task |
-| `tasks_complete` | Mark a task as done |
-| `tasks_delete` | Delete a task |
-| `tasks_move` | Reorder or nest a task |
-
-### Contacts
-| Tool | Purpose |
-|------|---------|
-| `contacts_list` | List contacts |
-| `contacts_search` | Search by name, email, or phone |
-| `contacts_get` | Get full contact details |
-| `contacts_create` | Create a new contact |
-| `contacts_update` | Update an existing contact |
-| `contacts_delete` | Delete a contact |
-| `contacts_groups` | List contact groups/labels |
+> **Note**: Google Tasks and Google Contacts MCP servers are not currently wired into FlopsyBot. The `tasks_*` and `contacts_*` tool families do not exist. For tasks use Todoist (`todoist` MCP) or Apple Reminders (`apple-reminders` MCP). For contacts, ask the user for the recipient's email or look them up in their last email thread via `gmail_search`.
 
 ## Common Workflows
 
 ### Send an Email
-1. Look up the recipient with `contacts_search` if only a name is known
+1. If only the recipient's name is known, search a recent thread via `gmail_search` to find their address
 2. Compose the message (plain text; no HTML or attachments supported)
 3. If the user wants to review first, use `gmail_draft`; otherwise use `gmail_send`
 

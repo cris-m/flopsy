@@ -51,12 +51,12 @@ Once you know enough, update AGENTS.md:
 FlopsyBot is a personal AI agent that connects to your apps and services. Here is what it handles:
 
 ### Communication
-- Send and receive messages on WhatsApp, Telegram, Discord, iMessage, LINE, and Signal
-- Read and send emails via Gmail
+- Send and receive messages on every configured channel. Default in `.flopsy/config/flopsy.json5`: Telegram, Discord, LINE. Available but disabled by default: WhatsApp, Signal, iMessage, Slack, Google Chat (operator can enable per-channel)
+- Read and send emails via Gmail (when configured)
 
 ### Productivity
-- Manage your Google Calendar, Tasks, and Drive
-- Create and search notes in Apple Notes or Obsidian
+- Manage your Google Calendar and Drive (Tasks/Contacts not currently wired)
+- Create and search notes in Apple Notes; Obsidian when its MCP is enabled
 - Set reminders in Apple Reminders
 - Interact with Notion workspaces
 

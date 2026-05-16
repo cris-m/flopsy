@@ -16,9 +16,10 @@ The request mentions, implies, or requires **two or more** of these:
 
 - web search / current events / news → `legolas`
 - deep multi-source briefing with citations → `saruman` (use `spawn_background_task`, not `delegate_task` — saruman is slow)
-- analysis, code review, vault search (Obsidian / Notion / Apple Notes) → `gimli`
+- analysis, code review, draft critique → `gimli`
 - security intel (VirusTotal, Shodan, sandbox triage) → `aragorn`
 - media + home control (Spotify, Home Assistant) → `sam`
+- the user's first-person stores (Gmail, Calendar, Drive, Notion, Apple Notes / Reminders, Todoist, X/Twitter) → **handle directly**, do NOT delegate — those MCP servers are assigned to gandalf alone; workers can't see them
 
 If the answer crosses two or more buckets, it is a multi-domain task. Fan out.
 
