@@ -231,7 +231,14 @@ function renderContextBlock(snapshot: HarnessSnapshot): string | null {
         sections.push('</last_session>');
     }
 
-    // <tool_quirks> intentionally not injected; LearningStore records failures for /audit + /doctor.
+    if (snapshot.toolQuirks.length > 0) {
+        sections.push('<tool_quirks description="Tools that have been failing recently for this user. Before calling one of these tools, consider whether a different approach will work — if you call it anyway and it fails the same way, do not retry blindly; pivot or surface the obstacle.">');
+        for (const q of snapshot.toolQuirks) {
+            const ageH = Math.max(1, Math.round((Date.now() - q.lastSeen) / 3_600_000));
+            sections.push(`  ${q.toolName}: "${escape(q.errorPattern)}" (×${q.count}, last ${ageH}h ago)`);
+        }
+        sections.push('</tool_quirks>');
+    }
 
     if (snapshot.selfState) {
         sections.push(snapshot.selfState);

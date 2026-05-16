@@ -645,6 +645,78 @@ export function registerSkillCommands(root: Command): void {
             console.log(readFileSync(found, 'utf-8'));
         });
 
-    // Default — show help if no subcommand provided.
+    const proposed = skill
+        .command('proposed')
+        .description('Inspect / accept / reject agent-proposed skills awaiting review');
+
+    proposed
+        .command('list', { isDefault: true })
+        .description('List skills in proposed/ (agent-authored, not yet active)')
+        .action(() => {
+            const dir = join(workspace.skills(), 'proposed');
+            const items = listSkillsIn(dir);
+            if (items.length === 0) {
+                console.log(section('Proposed skills'));
+                console.log(dim('  (none — the agent has not authored any new skills yet)'));
+                return;
+            }
+            renderList(items, 'Proposed skills');
+            console.log();
+            console.log(dim(`  ${items.length} awaiting review.  flopsy skill proposed show <name>  /  accept <name>  /  reject <name>`));
+        });
+
+    proposed
+        .command('show <name>')
+        .description('Print a proposed skill\'s SKILL.md')
+        .action((name: string) => {
+            const file = join(workspace.skills(), 'proposed', name, 'SKILL.md');
+            if (!existsSync(file)) {
+                console.log(bad(`No proposed skill "${name}"`));
+                process.exit(1);
+            }
+            console.log(readFileSync(file, 'utf-8'));
+        });
+
+    proposed
+        .command('accept <name>')
+        .description('Promote a proposed skill to active (moves proposed/<name> → skills/<name>)')
+        .action((name: string) => {
+            const src = join(workspace.skills(), 'proposed', name);
+            const dest = join(workspace.skills(), name);
+            if (!existsSync(src)) {
+                console.log(bad(`No proposed skill "${name}"`));
+                process.exit(1);
+            }
+            if (existsSync(dest)) {
+                console.log(bad(`Active skill "${name}" already exists — rename the proposed one or remove the active first.`));
+                process.exit(1);
+            }
+            try {
+                renameSync(src, dest);
+            } catch (err) {
+                console.log(bad(`Promotion failed: ${(err as Error).message}`));
+                process.exit(1);
+            }
+            console.log(ok(`Promoted "${name}" to active. Restart the gateway for the agent to pick it up.`));
+        });
+
+    proposed
+        .command('reject <name>')
+        .description('Delete a proposed skill (removes proposed/<name>)')
+        .action((name: string) => {
+            const src = join(workspace.skills(), 'proposed', name);
+            if (!existsSync(src)) {
+                console.log(bad(`No proposed skill "${name}"`));
+                process.exit(1);
+            }
+            try {
+                rmSync(src, { recursive: true, force: true });
+            } catch (err) {
+                console.log(bad(`Reject failed: ${(err as Error).message}`));
+                process.exit(1);
+            }
+            console.log(ok(`Rejected "${name}".`));
+        });
+
     skill.action((_opts: unknown, cmd: { outputHelp(): void }) => cmd.outputHelp());
 }

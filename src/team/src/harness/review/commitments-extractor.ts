@@ -135,7 +135,18 @@ export class CommitmentsExtractor {
         const nowIsoLocal = new Date(now).toISOString();
         const horizonDays = 14;
 
-        const system = buildExtractorSystem(nowIsoLocal, horizonDays);
+        const dismissed = this.config.store.listRecentDismissedFollowUps(ctx.peerId, { limit: 10 });
+        const dismissedBlock =
+            dismissed.length === 0
+                ? ''
+                : [
+                      '',
+                      'RECENTLY DISMISSED FOLLOW-UPS (user marked these as not useful — DO NOT extract similar ones):',
+                      ...dismissed.map((d) => `  - ${d.followUp}`),
+                      'If the new exchange would produce a follow-up semantically close to any of the above, return an empty array.',
+                  ].join('\n');
+
+        const system = buildExtractorSystem(nowIsoLocal, horizonDays) + dismissedBlock;
         const exchange = [
             `User: ${ctx.userText.slice(0, 4000)}`,
             `Assistant: ${ctx.agentReply.slice(0, 4000)}`,

@@ -1437,6 +1437,27 @@ export class LearningStore {
         }));
     }
 
+    listRecentDismissedFollowUps(
+        peerId: string,
+        options: { limit?: number; windowMs?: number } = {},
+    ): ReadonlyArray<{ followUp: string; resolvedAt: number | null }> {
+        const limit = Math.max(1, Math.min(options.limit ?? 10, 50));
+        const windowMs = options.windowMs ?? 30 * 24 * 60 * 60 * 1000;
+        const since = Date.now() - windowMs;
+        const rows = this.db
+            .prepare(
+                `SELECT follow_up, resolved_at
+                   FROM proactive_commitments
+                  WHERE peer_id = ?
+                    AND status = 'dismissed'
+                    AND coalesce(resolved_at, created_at) >= ?
+                  ORDER BY coalesce(resolved_at, created_at) DESC
+                  LIMIT ?`,
+            )
+            .all(peerId, since, limit) as Array<{ follow_up: string; resolved_at: number | null }>;
+        return rows.map((r) => ({ followUp: r.follow_up, resolvedAt: r.resolved_at }));
+    }
+
     /** Insert one row per fire. Best-effort — callers should swallow errors. */
     recordProactiveDecision(row: ProactiveDecisionRow): void {
         this.db
