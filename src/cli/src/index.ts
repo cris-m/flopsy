@@ -29,6 +29,7 @@ import { registerMemoryCommands } from './ops/memory-command';
 import { registerChatCommand } from './ops/chat-command';
 import { registerCommitmentsCommands } from './ops/commitments-command';
 import { registerGoalCommands } from './ops/goal-command';
+import { registerFaqCommand } from './ops/faq-command';
 import { registerHeartbeatCommands } from './ops/heartbeat-command';
 import { registerHooksCommands } from './ops/hooks-command';
 import { registerManagementCommands } from './ops/management-command';
@@ -84,6 +85,7 @@ registerEnvCommands(program);
 registerMemoryCommands(program);
 registerCommitmentsCommands(program);
 registerGoalCommands(program);
+registerFaqCommand(program);
 registerChatCommand(program);
 
 // Colorize help output for every command + subcommand. Must run AFTER
