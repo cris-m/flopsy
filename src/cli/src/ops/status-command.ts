@@ -275,39 +275,40 @@ async function probeVault(): Promise<{ vault?: StatusSnapshot['integrations']['v
     if (!initialised) {
         return { vault: { initialised: false, serverRunning: false, hydratedIntoEnv: false } };
     }
-    const pidFile = workspace.vaultPidFile();
+    const stateFile = workspace.vaultStateFile();
     let serverRunning = false;
-    if (existsSync(pidFile)) {
-        const pid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10);
-        if (Number.isInteger(pid) && pid > 0) {
-            try {
-                process.kill(pid, 0);
-                serverRunning = true;
-            } catch { /* */ }
-        }
-    }
     let mgmtPort: number | undefined;
     let proxyPort: number | undefined;
     let secrets: number | undefined;
     let tokens: number | undefined;
     let rules: number | undefined;
-    if (serverRunning) {
-        for (const candidate of [18800, 18791]) {
-            try {
-                const res = await fetch(`http://127.0.0.1:${candidate}/v1/status`, {
-                    signal: AbortSignal.timeout(700),
-                });
-                if (res.ok) {
-                    const body = await res.json() as { secrets?: number; tokens?: number; rules?: number };
-                    mgmtPort = candidate;
-                    proxyPort = candidate === 18800 ? 18801 : 18792;
-                    secrets = body.secrets;
-                    tokens = body.tokens;
-                    rules = body.rules;
-                    break;
-                }
-            } catch { /* try next */ }
-        }
+    if (existsSync(stateFile)) {
+        try {
+            const state = JSON.parse(readFileSync(stateFile, 'utf-8')) as {
+                pid?: number; host?: string; mgmtPort?: number; proxyPort?: number;
+            };
+            if (state.pid !== undefined) {
+                try {
+                    process.kill(state.pid, 0);
+                    serverRunning = true;
+                    mgmtPort = state.mgmtPort;
+                    proxyPort = state.proxyPort;
+                } catch { /* */ }
+            }
+        } catch { /* */ }
+    }
+    if (serverRunning && mgmtPort !== undefined) {
+        try {
+            const res = await fetch(`http://127.0.0.1:${mgmtPort}/v1/status`, {
+                signal: AbortSignal.timeout(700),
+            });
+            if (res.ok) {
+                const body = await res.json() as { secrets?: number; tokens?: number; rules?: number };
+                secrets = body.secrets;
+                tokens = body.tokens;
+                rules = body.rules;
+            }
+        } catch { /* */ }
     }
     const hydratedIntoEnv = !!process.env['FLOPSY_VAULT_MASTER_PASSWORD'] === false
         && !!process.env['FLOPSY_VAULT_DAEMON_CHILD'];

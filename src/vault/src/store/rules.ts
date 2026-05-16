@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto';
 
 export type InjectInto =
     | { kind: 'header'; name: string }
+    | { kind: 'any-header' }
     | { kind: 'body' }
     | { kind: 'query'; name: string };
 
@@ -72,6 +73,7 @@ export function hostMatches(host: string, pattern: string): boolean {
 
 export function parseInjectInto(s: string): InjectInto | undefined {
     if (s === 'body') return { kind: 'body' };
+    if (s === 'any' || s === 'any-header' || s === 'header:*') return { kind: 'any-header' };
     const headerMatch = s.match(/^header:(.+)$/);
     if (headerMatch) return { kind: 'header', name: headerMatch[1]!.trim() };
     const queryMatch = s.match(/^query:(.+)$/);

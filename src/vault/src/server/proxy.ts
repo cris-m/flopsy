@@ -63,19 +63,39 @@ function getDek(broker: CredentialBroker): Buffer {
 function applyRule(headers: Record<string, string | string[] | undefined>, rule: RuleRow, broker: CredentialBroker, who: string): boolean {
     const injection = parseInjectInto(rule.injectInto);
     if (!injection) return false;
-    if (injection.kind !== 'header') return false;
-    const targetHeader = injection.name.toLowerCase();
-    const currentVal = headers[targetHeader];
-    if (typeof currentVal !== 'string') return false;
-    if (!currentVal.includes(rule.placeholder)) return false;
-    let real: string;
-    try {
-        real = broker.get(rule.secretName, { who });
-    } catch {
-        return false;
+    if (injection.kind === 'header') {
+        const targetHeader = injection.name.toLowerCase();
+        const currentVal = headers[targetHeader];
+        if (typeof currentVal !== 'string') return false;
+        if (!currentVal.includes(rule.placeholder)) return false;
+        let real: string;
+        try {
+            real = broker.get(rule.secretName, { who });
+        } catch {
+            return false;
+        }
+        headers[targetHeader] = currentVal.split(rule.placeholder).join(real);
+        return true;
     }
-    headers[targetHeader] = currentVal.split(rule.placeholder).join(real);
-    return true;
+    if (injection.kind === 'any-header') {
+        let any = false;
+        let real: string | undefined;
+        for (const [name, value] of Object.entries(headers)) {
+            if (typeof value !== 'string') continue;
+            if (!value.includes(rule.placeholder)) continue;
+            if (real === undefined) {
+                try {
+                    real = broker.get(rule.secretName, { who });
+                } catch {
+                    return false;
+                }
+            }
+            headers[name] = value.split(rule.placeholder).join(real);
+            any = true;
+        }
+        return any;
+    }
+    return false;
 }
 
 export function startProxyServer(opts: ProxyServerOptions): Promise<ProxyServerHandle> {

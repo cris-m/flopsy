@@ -362,7 +362,32 @@ export function registerVaultCommands(root: Command): void {
                 }
                 const { emitted } = emitPlaceholderEnv(envFile, outPath, replacements);
                 console.log(ok(`wrote ${emitted} placeholder${emitted === 1 ? '' : 's'} to ${outPath}`));
-                console.log(info('source .env is untouched. Point your agent at the new file when ready (e.g. `dotenv -e vault.env <cmd>`)'));
+
+                const ruleDb = openVaultDb({ path });
+                let rulesAdded = 0;
+                try {
+                    const existing = new Set(listRules(ruleDb).map((r) => `${r.hostPattern}|${r.placeholder}`));
+                    for (const [k] of candidates) {
+                        const placeholder = placeholderFor(k);
+                        const key = `*|${placeholder}`;
+                        if (existing.has(key)) continue;
+                        try {
+                            addRule(ruleDb, {
+                                hostPattern: '*',
+                                placeholder,
+                                secretName: k,
+                                injectInto: 'any',
+                            });
+                            rulesAdded++;
+                        } catch { /* invalid name etc */ }
+                    }
+                } finally {
+                    closeVaultDb(ruleDb);
+                }
+                if (rulesAdded > 0) {
+                    console.log(ok(`auto-added ${rulesAdded} substitution rule${rulesAdded === 1 ? '' : 's'} (host=*, into=any)`));
+                }
+                console.log(info('source .env is untouched. Point your agent at the new file (e.g. `dotenv -e vault.env <cmd>`)'));
             } else {
                 console.log(info('source .env was NOT modified; pass --emit to also write a vault.env placeholder file'));
             }
@@ -493,10 +518,10 @@ export function registerVaultCommands(root: Command): void {
 
     rule.command('add')
         .description('Add a service rule for the MITM proxy')
-        .requiredOption('--host <pattern>', 'Host pattern (e.g. api.anthropic.com, *.openai.com)')
+        .requiredOption('--host <pattern>', 'Host pattern (e.g. api.anthropic.com, *.openai.com, * for any)')
         .requiredOption('--placeholder <text>', 'Placeholder string the agent will use (e.g. __anthropic_api_key__)')
         .requiredOption('--secret <name>', 'Vault secret name to substitute (e.g. ANTHROPIC_API_KEY)')
-        .requiredOption('--into <target>', 'Where to inject: header:<name> | body | query:<name>')
+        .option('--into <target>', 'Where to inject: any | header:<name> | body | query:<name> (default: any)', 'any')
         .action((opts: { host: string; placeholder: string; secret: string; into: string }) => {
             const path = workspace.vaultDb();
             if (!existsSync(path)) {
@@ -613,12 +638,20 @@ export function registerVaultCommands(root: Command): void {
                     throw err;
                 }
                 writeFileSync(pidFile, String(process.pid), { mode: 0o600 });
+                writeFileSync(workspace.vaultStateFile(), JSON.stringify({
+                    pid: process.pid,
+                    host: opts.host,
+                    mgmtPort: opts.mgmtPort,
+                    proxyPort: opts.proxyPort,
+                    startedAt: Date.now(),
+                }), { mode: 0o600 });
                 console.log(section('flopsy vault server'));
                 console.log(ok(`mgmt   http://${handle.mgmt.address()}`));
                 console.log(ok(`proxy  http://${handle.proxy.address()}  (HTTPS_PROXY target)`));
                 console.log(info(opts.foreground ? 'CTRL+C to stop' : 'daemonised'));
                 const shutdown = async (signal: string) => {
                     try { unlinkSync(pidFile); } catch { /* */ }
+                    try { unlinkSync(workspace.vaultStateFile()); } catch { /* */ }
                     await handle.stop();
                     process.exit(0);
                 };
