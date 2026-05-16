@@ -30,7 +30,6 @@ import { getSharedLearningStore, getSharedPairingStore } from './harness';
 import { setPairingFacade, setPersonalityFacade, setInsightsFacade, setBranchFacade } from '@flopsy/gateway';
 import type { ExtractionResult, SkillProposal } from './harness/review';
 import { SessionExtractor } from './harness/review';
-import { CommitmentsExtractor } from './harness/review/commitments-extractor';
 import { GoalManager } from './harness/goals/goal-manager';
 import {
     scanExistingSkills,
@@ -180,7 +179,6 @@ export class TeamHandler implements AgentHandler {
     private mcpSkipReasons: Readonly<Record<string, string>> = {};
     private readonly mcpToolCounts = new Map<string, number>();
     private sessionExtractor?: SessionExtractor;
-    private commitmentsExtractor?: CommitmentsExtractor;
     private goalManager?: GoalManager;
     private goalContinuationCallback?: (args: { threadId: string; channelName: string; peerId: string; prompt: string }) => void;
     readonly modelRouter?: ModelRouter;
@@ -360,25 +358,6 @@ export class TeamHandler implements AgentHandler {
             });
         }
 
-        if (config.commitments?.enabled && config.extractorModel) {
-            this.commitmentsExtractor = new CommitmentsExtractor({
-                model: config.extractorModel,
-                store: this.store,
-                ...(config.commitments.maxPerDay !== undefined
-                    ? { maxPerDay: config.commitments.maxPerDay }
-                    : {}),
-                ...(config.commitments.minConfidence !== undefined
-                    ? { minConfidence: config.commitments.minConfidence }
-                    : {}),
-            });
-            log.info(
-                {
-                    maxPerDay: config.commitments.maxPerDay ?? 3,
-                    minConfidence: config.commitments.minConfidence ?? 0.7,
-                },
-                'commitments extractor ready (opt-in, hidden post-turn pass)',
-            );
-        }
 
         const memoryCfg = config.memory ?? {};
         const memoryEnabled = memoryCfg.enabled !== false;
@@ -727,29 +706,6 @@ export class TeamHandler implements AgentHandler {
                         { threadId, err: redactSecrets(err), op: 'session.touch' },
                         'failed to touch session — turn_count + freshness may drift',
                     );
-                }
-
-                // Inferred-commitments extraction — fire-and-forget; never awaits or propagates.
-                if (this.commitmentsExtractor && reply && text) {
-                    // Scope key is `<channel>:<peerId>` so the executor can build it from job.delivery alone.
-                    const scope = `${callbacks.channelName}:${peerId}`;
-                    const ctx = {
-                        scope,
-                        peerId,
-                        channel: callbacks.channelName,
-                        agentId: this.entryDef.name,
-                        userText: text,
-                        agentReply: reply,
-                        sourceTurnId: `${threadId}:${Date.now()}`,
-                    };
-                    void this.commitmentsExtractor
-                        .extract(ctx)
-                        .catch((err) => {
-                            log.warn(
-                                { threadId, peerId, err: redactSecrets(err) },
-                                'commitments extractor threw (non-fatal, ignored)',
-                            );
-                        });
                 }
 
                 if (this.goalManager && this.goalContinuationCallback && reply) {

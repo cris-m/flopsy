@@ -18,12 +18,9 @@ import type { ProactiveDedupStore } from '../state/dedup-store';
 import type { ProactiveEmbedder } from '../engine';
 import { getSharedLearningStore } from '@flopsy/team';
 import {
-    buildAntiRepetitionContext,
-    buildCommitmentsBlock,
     parseReportedLines,
     stripReportedLines,
 } from './context';
-import { buildPatternFindingsBlock } from './pattern-detector';
 import { runScript } from './script-runner';
 import { loadSkills } from './skill-loader';
 import { emitHook } from '../../hooks';
@@ -218,17 +215,9 @@ export class JobExecutor {
             }
 
             const threadId = job.threadId ?? `proactive:${job.id}:${Date.now()}`;
-            const contextBlock = buildAntiRepetitionContext(this.store, this.dedupStore, {
-                jobId: job.id,
-            });
             const dateContext = buildDateContext();
             const qualityBlock = buildQualityGuidance(this.store);
-
-            // Inferred commitments: pending follow-ups whose due_at_ms has elapsed.
-            // Channel-agnostic — reads by peer_id only.
             const peerId = job.delivery?.peer?.id;
-            const commitmentsBlock = buildCommitmentsBlock(peerId);
-            const patternBlock = buildPatternFindingsBlock(peerId);
 
             // Resolve job.skills → SKILL.md contents (the HOW for this task's WHAT).
             const { loaded: preloadedSkills, missing: missingSkills } = await loadSkills(
@@ -263,15 +252,10 @@ export class JobExecutor {
                       '\n</active_skills>\n\n'
                     : '';
 
-            // Order matters: commitments BEFORE anti-rep so "what's due" reads
-            // before "what I've delivered" (prevents suppression bias).
             const augmentedPrompt =
                 skillsBlock +
                 dateContext +
                 qualityBlock +
-                commitmentsBlock +
-                patternBlock +
-                contextBlock +
                 preCheckBlock +
                 job.prompt;
             let response: string;
