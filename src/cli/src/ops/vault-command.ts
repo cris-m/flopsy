@@ -393,6 +393,54 @@ export function registerVaultCommands(root: Command): void {
             }
         });
 
+    v.command('stats')
+        .description('Aggregated activity stats from the audit log (last 24h by default)')
+        .option('--since <duration>', 'Window (e.g. 24h, 7d); default 24h', '24h')
+        .action((opts: { since?: string }) => {
+            const path = workspace.vaultDb();
+            if (!existsSync(path)) {
+                console.log(bad('vault not initialised — run `flopsy vault init` first'));
+                process.exit(1);
+            }
+            const sinceMs = opts.since ? parseDuration(opts.since) : 24 * 3_600_000;
+            const cutoff = sinceMs ? Date.now() - sinceMs : 0;
+            const db = openVaultDb({ path, readOnly: true });
+            try {
+                const rows = listAudit(db, { sinceMs: cutoff, limit: 1000 });
+                if (rows.length === 0) {
+                    console.log(info(`no audit events in the last ${opts.since}`));
+                    return;
+                }
+                const byAction = new Map<string, number>();
+                const byOutcome = new Map<string, number>();
+                const byActor = new Map<string, number>();
+                const byResource = new Map<string, number>();
+                for (const r of rows) {
+                    byAction.set(r.action, (byAction.get(r.action) ?? 0) + 1);
+                    byOutcome.set(r.outcome, (byOutcome.get(r.outcome) ?? 0) + 1);
+                    byActor.set(r.actorToken, (byActor.get(r.actorToken) ?? 0) + 1);
+                    if (r.resource) byResource.set(r.resource, (byResource.get(r.resource) ?? 0) + 1);
+                }
+                const printGroup = (title: string, m: Map<string, number>, max = 10) => {
+                    if (m.size === 0) return;
+                    console.log('');
+                    console.log(`  ${title}`);
+                    const sorted = [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, max);
+                    for (const [k, v] of sorted) {
+                        const tag = k === 'success' ? ok(k) : k.startsWith('denied') || k.startsWith('error') ? bad(k) : k;
+                        console.log(`    ${String(v).padStart(5)}  ${tag}`);
+                    }
+                };
+                console.log(section(`flopsy vault stats — last ${opts.since}  (${rows.length} event${rows.length === 1 ? '' : 's'})`));
+                printGroup('by action', byAction);
+                printGroup('by outcome', byOutcome);
+                printGroup('by actor (top 10)', byActor);
+                printGroup('by resource (top 10)', byResource);
+            } finally {
+                closeVaultDb(db);
+            }
+        });
+
     v.command('audit')
         .description('Show the tamper-evident audit log of credential access')
         .option('--since <duration>', 'Limit to events since N (e.g. 24h, 7d, 30m); default = all')
