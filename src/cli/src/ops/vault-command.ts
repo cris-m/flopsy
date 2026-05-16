@@ -1,6 +1,6 @@
 import { confirm, password as promptPassword } from '@inquirer/prompts';
 import { Command } from 'commander';
-import { existsSync, readFileSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, resolve as resolvePath } from 'node:path';
 import { workspace } from '@flopsy/shared';
 import {
@@ -43,6 +43,36 @@ async function readMasterPassword(reason: string, confirm = false): Promise<stri
 }
 
 const SECRET_KEY_PATTERN = /KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL|PASSPHRASE/i;
+
+function placeholderFor(name: string): string {
+    return `__${name.toLowerCase()}__`;
+}
+
+function emitPlaceholderEnv(sourcePath: string, outPath: string, replacements: Map<string, string>): { emitted: number } {
+    const original = readFileSync(sourcePath, 'utf-8');
+    const lines = original.split('\n');
+    let emitted = 0;
+    const out = lines.map((line) => {
+        const trimmed = line.trimStart();
+        if (!trimmed || trimmed.startsWith('#')) return line;
+        const eq = line.indexOf('=');
+        if (eq < 0) return line;
+        const key = line.slice(0, eq).trim();
+        if (!replacements.has(key)) return line;
+        emitted++;
+        const prefix = line.slice(0, line.indexOf(key));
+        return `${prefix}${key}=${replacements.get(key)!}`;
+    });
+    const tmp = `${outPath}.vault-emit.tmp`;
+    writeFileSync(tmp, out.join('\n'), { mode: 0o600 });
+    try {
+        chmodSync(tmp, 0o600);
+    } catch {
+        /* */
+    }
+    renameSync(tmp, outPath);
+    return { emitted };
+}
 
 function parseDotEnv(path: string): Record<string, string> {
     const out: Record<string, string> = {};
@@ -256,8 +286,9 @@ export function registerVaultCommands(root: Command): void {
         .option('--file <path>', 'Path to .env (alternative to positional arg; defaults to FLOPSY_DOTENV / sibling of flopsy.json5 / cwd/.env)')
         .option('--all', 'Import every key, not just those matching KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL', false)
         .option('--overwrite', 'Replace existing vault entries with .env values', false)
+        .option('--emit [path]', 'After import, also write a placeholder file (default: vault.env next to source .env)')
         .option('--yes', 'Skip confirmation prompt', false)
-        .action(async (pathArg: string | undefined, opts: { file?: string; all?: boolean; overwrite?: boolean; yes?: boolean }) => {
+        .action(async (pathArg: string | undefined, opts: { file?: string; all?: boolean; overwrite?: boolean; emit?: string | boolean; yes?: boolean }) => {
             const path = workspace.vaultDb();
             if (!existsSync(path)) {
                 console.log(bad('vault not initialised — run `flopsy vault init` first'));
@@ -317,7 +348,20 @@ export function registerVaultCommands(root: Command): void {
                 closeVaultDb(db);
             }
             console.log(ok(`imported ${added}, skipped ${skipped} (already present — use --overwrite to replace)`));
-            console.log(info('source .env was NOT modified; remove keys from .env once you wire the daemon to read from the vault'));
+            if (opts.emit !== undefined) {
+                const outPath = typeof opts.emit === 'string'
+                    ? resolvePath(opts.emit)
+                    : resolvePath(dirname(envFile), 'vault.env');
+                const replacements = new Map<string, string>();
+                for (const [k] of candidates) {
+                    replacements.set(k, placeholderFor(k));
+                }
+                const { emitted } = emitPlaceholderEnv(envFile, outPath, replacements);
+                console.log(ok(`wrote ${emitted} placeholder${emitted === 1 ? '' : 's'} to ${outPath}`));
+                console.log(info('source .env is untouched. Point your agent at the new file when ready (e.g. `dotenv -e vault.env <cmd>`)'));
+            } else {
+                console.log(info('source .env was NOT modified; pass --emit to also write a vault.env placeholder file'));
+            }
         });
 
     v.command('audit')
