@@ -89,6 +89,8 @@ export function createWorkspace(env: NodeJS.ProcessEnv = process.env) {
         skills:        () => sub('content', 'skills'),
         /** Bundled-but-inactive skills; `flopsy skill install <name>` activates by copying into skills/. */
         skillsOptional: () => sub('content', 'skills-optional'),
+        /** Agent-authored skills awaiting human review; `flopsy skill proposed accept` promotes into skills/. */
+        skillsProposed: () => sub('content', 'skills-proposed'),
         roles:         () => sub('content', 'roles'),
         prompts:       (...parts: string[]) => sub('content', 'prompts', ...parts),
         hooks:         (...parts: string[]) => sub('content', 'hooks', ...parts),

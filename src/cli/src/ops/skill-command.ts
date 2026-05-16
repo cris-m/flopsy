@@ -653,7 +653,7 @@ export function registerSkillCommands(root: Command): void {
         .command('list', { isDefault: true })
         .description('List skills in proposed/ (agent-authored, not yet active)')
         .action(() => {
-            const dir = join(workspace.skills(), 'proposed');
+            const dir = workspace.skillsProposed();
             const items = listSkillsIn(dir);
             if (items.length === 0) {
                 console.log(section('Proposed skills'));
@@ -669,7 +669,7 @@ export function registerSkillCommands(root: Command): void {
         .command('show <name>')
         .description('Print a proposed skill\'s SKILL.md')
         .action((name: string) => {
-            const file = join(workspace.skills(), 'proposed', name, 'SKILL.md');
+            const file = join(workspace.skillsProposed(), name, 'SKILL.md');
             if (!existsSync(file)) {
                 console.log(bad(`No proposed skill "${name}"`));
                 process.exit(1);
@@ -681,7 +681,7 @@ export function registerSkillCommands(root: Command): void {
         .command('accept <name>')
         .description('Promote a proposed skill to active (moves proposed/<name> → skills/<name>)')
         .action((name: string) => {
-            const src = join(workspace.skills(), 'proposed', name);
+            const src = join(workspace.skillsProposed(), name);
             const dest = join(workspace.skills(), name);
             if (!existsSync(src)) {
                 console.log(bad(`No proposed skill "${name}"`));
@@ -704,7 +704,7 @@ export function registerSkillCommands(root: Command): void {
         .command('reject <name>')
         .description('Delete a proposed skill (removes proposed/<name>)')
         .action((name: string) => {
-            const src = join(workspace.skills(), 'proposed', name);
+            const src = join(workspace.skillsProposed(), name);
             if (!existsSync(src)) {
                 console.log(bad(`No proposed skill "${name}"`));
                 process.exit(1);

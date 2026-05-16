@@ -1678,11 +1678,10 @@ export class TeamHandler implements AgentHandler {
         try {
             this.store.setSessionSummary(closedSessionId, result.summary);
 
-            // Under proposed/ so the agent does NOT auto-load unreviewed skills.
             let proposedSkillName: string | null = null;
             if (result.skill_proposal) {
                 const proposed = result.skill_proposal;
-                const proposedRoot = pathJoin(skillsPath, 'proposed');
+                const proposedRoot = workspace.skillsProposed();
                 try {
                     const written = await writeSkillFile(
                         proposedRoot,

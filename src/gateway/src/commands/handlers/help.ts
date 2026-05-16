@@ -6,7 +6,7 @@ import { COMMANDS } from '../registry';
 import { panel, row, workspace } from '@flopsy/shared';
 
 function countProposedSkills(): number {
-    const dir = join(workspace.skills(), 'proposed');
+    const dir = workspace.skillsProposed();
     if (!existsSync(dir)) return 0;
     try {
         return readdirSync(dir).filter((name) => {

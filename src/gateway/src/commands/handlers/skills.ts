@@ -24,7 +24,7 @@ export const skillsCommand: CommandDef = {
         const target = ctx.args[1] ?? '';
 
         const skillsRoot = workspace.skills();
-        const proposedRoot = join(skillsRoot, 'proposed');
+        const proposedRoot = workspace.skillsProposed();
 
         switch (sub) {
             case '':
@@ -63,7 +63,7 @@ export const skillsCommand: CommandDef = {
 };
 
 function renderList(skillsRoot: string, proposedRoot: string): string {
-    const active = listSkillRefs(skillsRoot, { skipDir: 'proposed' });
+    const active = listSkillRefs(skillsRoot);
     const proposed = listSkillRefs(proposedRoot);
     const sections = [
         {

@@ -195,7 +195,7 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
     ]);
 
     const controlTools: BaseTool[] = (() => {
-        if (role !== 'main') return [delegateTaskTool, spawnBackgroundTaskTool, notifyTeammateTool];
+        if (role !== 'main') return [delegateTaskTool, spawnBackgroundTaskTool, notifyTeammateTool, skillManageTool];
 
         const mainTools = [
             sendMessageTool,
@@ -643,7 +643,9 @@ const WORKER_ORCHESTRATION_GUIDANCE = `## How you collaborate with other workers
 
 **Retry discipline on failure.** On timeout → spawn a second worker on the same task in parallel and race them. On wrong/partial → retry once with a tighter prompt. After two failures, surface your attempts and results rather than silently retrying forever.
 
-**Long outputs auto-save.** If your reply exceeds ~1.5 KB, the runtime writes it to disk and folds it to a header + 800-char preview with an absolute path. Pass that path verbatim to read_file when someone needs the full text.`;
+**Long outputs auto-save.** If your reply exceeds ~1.5 KB, the runtime writes it to disk and folds it to a header + 800-char preview with an absolute path. Pass that path verbatim to read_file when someone needs the full text.
+
+**Capture what worked.** When you finish a non-obvious multi-step procedure (3+ tool calls, a specific sequence that resolved a bug, a workflow another worker would benefit from), call \`skill_manage(create, ...)\` to save it as a SKILL.md. You're the one who did the work — only you can name the pitfalls. Skip for trivial one-offs. If you used an existing skill and found a missing step or gotcha, call \`skill_manage(append_lessons, ...)\` instead.`;
 
 // Tool-call discipline rules — runtime-owned, always added for main role.
 const OPERATIONAL_GUIDANCE = `## How you work

@@ -89,7 +89,7 @@ function getSkillNamesOnDisk(skillsPath: string): Set<string> {
     try {
         return new Set(
             readdirSync(skillsPath, { withFileTypes: true })
-                .filter((e) => e.isDirectory() && e.name !== 'proposed')
+                .filter((e) => e.isDirectory())
                 .map((e) => e.name),
         );
     } catch {
