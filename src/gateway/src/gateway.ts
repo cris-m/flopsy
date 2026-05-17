@@ -18,6 +18,7 @@ import { setSessionFacade } from './commands/session-facade';
 import { setCompactFacade } from './commands/compact-facade';
 import { setGoalFacade } from './commands/goal-facade';
 import { runCleanup } from '@flopsy/shared';
+import { randomBytes } from 'node:crypto';
 import type { Channel, Message, WebhookChannel } from '@gateway/types';
 import { isWebhookChannel } from '@gateway/types';
 import { BaseGateway } from '@gateway/core/base-gateway';
@@ -1291,7 +1292,7 @@ async function handleMgmtScheduleCreate(
         }
         const id =
             (body['id'] as string | undefined) ??
-            `runtime-cron-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            `runtime-cron-${Date.now()}-${randomBytes(4).toString('hex')}`;
         const cronIdCheck = validatePathIdentifier(id, 'id');
         if (!cronIdCheck.ok) return { ok: false, error: cronIdCheck.error };
         if (RESERVED_SCHEDULE_IDS.has(cronIdCheck.value)) {

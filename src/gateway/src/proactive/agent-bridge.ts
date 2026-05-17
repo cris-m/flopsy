@@ -2,6 +2,7 @@ import { createLogger } from '@flopsy/shared';
 import { buildProactiveRuntimeHints, resolveProactiveTimeoutSignal } from '@flopsy/team';
 import type { AgentHandler, AgentResult } from '@gateway/types/agent';
 import type { AgentCaller } from './types';
+import { randomBytes } from 'node:crypto';
 
 const log = createLogger('proactive-bridge');
 
@@ -16,7 +17,7 @@ export function buildAgentCaller(handler: AgentHandler): AgentCaller {
     ): Promise<{ response: string; structured?: T }> {
         const threadId =
             options.threadId ??
-            `proactive:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+            `proactive:${Date.now()}:${randomBytes(8).toString('hex')}`;
 
         let result: AgentResult;
         if (handler.invokeStateless) {
