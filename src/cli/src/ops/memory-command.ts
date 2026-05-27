@@ -77,7 +77,7 @@ export function registerMemoryCommands(root: Command): void {
         .action((opts: { json?: boolean }) => {
             const { config } = readFlopsyConfig();
             const dbPath = resolveWorkspacePath('state', 'memory.db');
-            const userMdPath = resolveWorkspacePath('config', 'USER.md');
+            const userMdPath = resolveWorkspacePath('state', 'memory', 'USER.md');
 
             const memCfg = (config.memory ?? {}) as {
                 enabled?: boolean;
@@ -195,7 +195,7 @@ export function registerMemoryCommands(root: Command): void {
                 }
                 const where = filters.join(' AND ');
                 const countRow = db
-                    .prepare(`SELECT COUNT(*) AS n FROM memory_items WHERE ${where}`)
+                    .prepare(`SELECT COUNT(*) AS n FROM store_items WHERE ${where}`)
                     .get(...params) as { n: number } | undefined;
                 const n = countRow?.n ?? 0;
                 if (n === 0) {
@@ -207,7 +207,7 @@ export function registerMemoryCommands(root: Command): void {
                     return;
                 }
                 const result = db
-                    .prepare(`DELETE FROM memory_items WHERE ${where}`)
+                    .prepare(`DELETE FROM store_items WHERE ${where}`)
                     .run(...params);
                 console.log(ok(`Pruned ${result.changes} entries older than ${days}d` + (opts.namespace ? ` from "${opts.namespace}"` : '')));
             } catch (err) {

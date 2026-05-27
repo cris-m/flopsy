@@ -133,11 +133,6 @@ function findUp(start: string, candidates: readonly string[]): string | null {
 
 let envLoadedFor: string | null = null;
 
-/**
- * Load `.env` from the config's directory into `process.env` (once).
- * dotenv is non-overriding by default — values already set in the shell
- * win, so users can still `FLOPSY_CONFIG=... flopsy ...` to override.
- */
 function ensureEnvLoaded(configDir: string): void {
     if (envLoadedFor === configDir) return;
     const envPath = resolve(configDir, '.env');

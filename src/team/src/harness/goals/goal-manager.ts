@@ -1,4 +1,5 @@
 import { createLogger } from '@flopsy/shared';
+import { emitHook } from '@flopsy/gateway';
 import type { BaseChatModel } from 'flopsygraph';
 import type { LearningStore, SessionGoalRow, GoalStatus } from '../storage/learning-store';
 
@@ -35,6 +36,30 @@ const CONTINUATION_TEMPLATE =
     "If you believe the goal is complete, state so explicitly and stop. " +
     "If you are blocked and need input from the user, say so clearly and stop.";
 
+const CONTINUATION_TEMPLATE_WITH_SUBGOALS =
+    "[Continuing toward your standing goal]\n" +
+    "Goal: {goal}\n\n" +
+    "Additional criteria the user added mid-loop:\n" +
+    "{subgoals_block}\n\n" +
+    "Continue working toward the goal AND all additional criteria. Take " +
+    "the next concrete step. If you believe the goal and every " +
+    "additional criterion are complete, state so explicitly and stop. " +
+    "If you are blocked and need input from the user, say so clearly and stop.";
+
+const JUDGE_USER_TEMPLATE_WITH_SUBGOALS =
+    "Goal:\n{goal}\n\n" +
+    "Additional criteria the user added mid-loop (all must also be " +
+    "satisfied for the goal to be DONE):\n{subgoals_block}\n\n" +
+    "Agent's most recent response:\n{response}\n\n" +
+    "Current time: {current_time}\n\n" +
+    "Decision: For each numbered criterion above, find concrete " +
+    "evidence in the agent's response that the criterion is satisfied. " +
+    "If ANY criterion is missing evidence, the goal is NOT done.\n\n" +
+    "Is the goal (with all additional criteria) satisfied?";
+
+const MAX_SUBGOAL_CHARS = 400;
+const MAX_SUBGOALS_PER_GOAL = 20;
+
 export interface GoalJudgeVerdict {
     readonly done: boolean;
     readonly reason: string;
@@ -62,6 +87,12 @@ export interface MaybeContinueArgs {
     readonly agentReply: string;
 }
 
+export type GoalNotificationKind =
+    | 'continuing'
+    | 'done'
+    | 'budget'
+    | 'parse_failures';
+
 export interface MaybeContinueResult {
     readonly shouldContinue: boolean;
     readonly continuationPrompt?: string;
@@ -70,6 +101,8 @@ export interface MaybeContinueResult {
     readonly turnsUsed: number;
     readonly maxTurns: number;
     readonly stopReason?: 'done' | 'budget' | 'paused' | 'cleared' | 'parse_failures';
+    readonly notificationKind?: GoalNotificationKind;
+    readonly notificationMessage?: string;
 }
 
 export class GoalManager {
@@ -102,10 +135,60 @@ export class GoalManager {
             lastReason: null,
             channelName: args.channelName,
             peerId: args.peerId,
+            subgoals: [],
         };
         this.config.store.upsertSessionGoal(row);
         log.info({ threadId: args.threadId, goal: row.goal, maxTurns: row.maxTurns }, 'goal set');
         return row;
+    }
+
+    addSubgoal(threadId: string, text: string): SessionGoalRow {
+        const row = this.get(threadId);
+        if (!row) throw new Error('no active goal in this thread');
+        if (row.status !== 'active') throw new Error(`cannot add subgoal — goal status is "${row.status}"`);
+        const cleaned = (text ?? '').trim();
+        if (!cleaned) throw new Error('subgoal text cannot be empty');
+        if (cleaned.length > MAX_SUBGOAL_CHARS) {
+            throw new Error(`subgoal too long (${cleaned.length} chars, max ${MAX_SUBGOAL_CHARS})`);
+        }
+        if (row.subgoals.length >= MAX_SUBGOALS_PER_GOAL) {
+            throw new Error(`already at maximum ${MAX_SUBGOALS_PER_GOAL} subgoals`);
+        }
+        const updated = [...row.subgoals, cleaned];
+        this.config.store.patchSessionGoal(threadId, { subgoals: updated });
+        log.info({ threadId, count: updated.length, added: cleaned }, 'subgoal added');
+        return { ...row, subgoals: updated };
+    }
+
+    removeSubgoal(threadId: string, oneBasedIndex: number): { removed: string; remaining: number } {
+        const row = this.get(threadId);
+        if (!row) throw new Error('no active goal in this thread');
+        const idx = oneBasedIndex - 1;
+        if (!Number.isInteger(oneBasedIndex) || idx < 0 || idx >= row.subgoals.length) {
+            throw new Error(`index out of range (1..${row.subgoals.length})`);
+        }
+        const removed = row.subgoals[idx]!;
+        const updated = [...row.subgoals.slice(0, idx), ...row.subgoals.slice(idx + 1)];
+        this.config.store.patchSessionGoal(threadId, { subgoals: updated });
+        log.info({ threadId, removed, remaining: updated.length }, 'subgoal removed');
+        return { removed, remaining: updated.length };
+    }
+
+    clearSubgoals(threadId: string): number {
+        const row = this.get(threadId);
+        if (!row) throw new Error('no active goal in this thread');
+        const prev = row.subgoals.length;
+        if (prev === 0) return 0;
+        this.config.store.patchSessionGoal(threadId, { subgoals: [] });
+        log.info({ threadId, cleared: prev }, 'subgoals cleared');
+        return prev;
+    }
+
+    renderSubgoals(threadId: string): string {
+        const row = this.get(threadId);
+        if (!row) return '(no active goal)';
+        if (row.subgoals.length === 0) return '(no subgoals — use /subgoal <text> to add criteria)';
+        return renderSubgoalsBlock(row.subgoals);
     }
 
     pause(threadId: string): SessionGoalRow | null {
@@ -156,16 +239,26 @@ export class GoalManager {
                 { threadId: args.threadId, turnsUsed: row.turnsUsed, maxTurns: row.maxTurns },
                 'goal paused — budget exhausted',
             );
+            emitHook('goal.paused', {
+                threadId: args.threadId,
+                turnsUsed: row.turnsUsed,
+                maxTurns: row.maxTurns,
+                reason: 'budget',
+            });
             return {
                 shouldContinue: false,
                 newStatus: 'paused',
                 turnsUsed: row.turnsUsed,
                 maxTurns: row.maxTurns,
                 stopReason: 'budget',
+                notificationKind: 'budget',
+                notificationMessage:
+                    `⏸ Goal paused — ${row.turnsUsed}/${row.maxTurns} turns used. ` +
+                    'Use /goal resume to keep going, or /goal clear to stop.',
             };
         }
 
-        const verdict = await this.judge(row.goal, args.agentReply);
+        const verdict = await this.judge(row.goal, args.agentReply, row.subgoals);
         const now = Date.now();
 
         if (verdict.verdict === 'skipped') {
@@ -189,6 +282,11 @@ export class GoalManager {
                     turnsUsed: row.turnsUsed,
                     maxTurns: row.maxTurns,
                     stopReason: 'parse_failures',
+                    notificationKind: 'parse_failures',
+                    notificationMessage:
+                        `⏸ Goal paused — the judge model (${nextFails} turns) isn't returning the ` +
+                        'required JSON verdict. Route extractorModel to a stricter model, then ' +
+                        '/goal resume to continue.',
                 };
             }
             this.config.store.patchSessionGoal(args.threadId, {
@@ -200,11 +298,14 @@ export class GoalManager {
             });
             return {
                 shouldContinue: true,
-                continuationPrompt: this.continuationPrompt(row.goal),
+                continuationPrompt: this.continuationPrompt(row.goal, row.subgoals),
                 verdict,
                 newStatus: 'active',
                 turnsUsed: nextTurns,
                 maxTurns: row.maxTurns,
+                notificationKind: 'continuing',
+                notificationMessage:
+                    `↻ Continuing toward goal (${nextTurns}/${row.maxTurns}): ${verdict.reason}`,
             };
         }
 
@@ -221,6 +322,12 @@ export class GoalManager {
                 { threadId: args.threadId, reason: verdict.reason },
                 'goal done',
             );
+            emitHook('goal.done', {
+                threadId: args.threadId,
+                turnsUsed: nextTurns,
+                maxTurns: row.maxTurns,
+                reason: verdict.reason,
+            });
             return {
                 shouldContinue: false,
                 verdict,
@@ -228,6 +335,8 @@ export class GoalManager {
                 turnsUsed: nextTurns,
                 maxTurns: row.maxTurns,
                 stopReason: 'done',
+                notificationKind: 'done',
+                notificationMessage: `✓ Goal achieved: ${verdict.reason}`,
             };
         }
 
@@ -245,15 +354,30 @@ export class GoalManager {
             newStatus: 'active',
             turnsUsed: nextTurns,
             maxTurns: row.maxTurns,
+            notificationKind: 'continuing',
+            notificationMessage:
+                `↻ Continuing toward goal (${nextTurns}/${row.maxTurns}): ${verdict.reason}`,
         };
     }
 
-    async judge(goal: string, agentReply: string): Promise<GoalJudgeVerdict> {
+    async judge(
+        goal: string,
+        agentReply: string,
+        subgoals: ReadonlyArray<string> = [],
+    ): Promise<GoalJudgeVerdict> {
         const snippet = agentReply.slice(0, JUDGE_RESPONSE_SNIPPET_CHARS);
-        const user =
-            `Goal:\n${goal}\n\n` +
-            `Agent's most recent response:\n${snippet}\n\n` +
-            `Is the goal satisfied?`;
+        const cleanSubs = subgoals.map((s) => (s ?? '').trim()).filter((s) => s.length > 0);
+        const currentTime = new Date().toISOString();
+        const user = cleanSubs.length > 0
+            ? JUDGE_USER_TEMPLATE_WITH_SUBGOALS
+                .replace('{goal}', goal)
+                .replace('{subgoals_block}', renderSubgoalsBlock(cleanSubs))
+                .replace('{response}', snippet)
+                .replace('{current_time}', currentTime)
+            : `Goal:\n${goal}\n\n` +
+              `Agent's most recent response:\n${snippet}\n\n` +
+              `Current time: ${currentTime}\n\n` +
+              `Is the goal satisfied?`;
 
         try {
             const signal = AbortSignal.timeout(this.judgeTimeoutMs);
@@ -278,9 +402,19 @@ export class GoalManager {
         }
     }
 
-    continuationPrompt(goal: string): string {
-        return CONTINUATION_TEMPLATE.replace('{goal}', goal);
+    continuationPrompt(goal: string, subgoals: ReadonlyArray<string> = []): string {
+        const cleanSubs = subgoals.map((s) => (s ?? '').trim()).filter((s) => s.length > 0);
+        if (cleanSubs.length === 0) {
+            return CONTINUATION_TEMPLATE.replace('{goal}', goal);
+        }
+        return CONTINUATION_TEMPLATE_WITH_SUBGOALS
+            .replace('{goal}', goal)
+            .replace('{subgoals_block}', renderSubgoalsBlock(cleanSubs));
     }
+}
+
+function renderSubgoalsBlock(subgoals: ReadonlyArray<string>): string {
+    return subgoals.map((s, i) => `- ${i + 1}. ${s}`).join('\n');
 }
 
 function extractText(content: unknown): string {

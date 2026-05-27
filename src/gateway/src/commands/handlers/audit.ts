@@ -205,7 +205,7 @@ function renderReport(findings: readonly Finding[]): string {
 
     return panel(sections, {
         header: headerBits.join(' · '),
-        footer: 'Static scan only — for a threat-intel audit, ask aragorn in chat.',
+        footer: 'Static scan only — for a threat-intel audit, ask your security worker in chat.',
     });
 }
 

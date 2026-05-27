@@ -51,9 +51,10 @@ export function bootstrapVault(opts: BootstrapOptions): VaultBootstrap {
     try {
         const rows = listSecrets(readDb);
         for (const row of rows) {
-            if (!opts.overrideEnv && process.env[row.name] !== undefined && process.env[row.name] !== '') {
-                continue;
-            }
+            const current = process.env[row.name];
+            const looksLikePlaceholder = typeof current === 'string' && /^__[a-z0-9_]+__$/i.test(current);
+            const shouldOverride = opts.overrideEnv === true || looksLikePlaceholder || current === undefined || current === '';
+            if (!shouldOverride) continue;
             const value = getSecret(readDb, readDek, row.name);
             if (value === undefined) continue;
             process.env[row.name] = value;

@@ -20,23 +20,17 @@ export const planCommand: CommandDef = {
         if (raw === '') {
             return {
                 text: [
-                    'PLAN MODE',
-                    '─────────',
-                    'Use plan mode when you want me to think through an approach',
-                    'and get your sign-off before doing anything.',
+                    'PLAN',
+                    '────',
+                    'Have me lay out a step-by-step plan before I start, so a',
+                    'multi-step task stays on track across turns.',
                     '',
-                    'Activate:',
-                    '  `/plan <task>`   — I draft a plan and send it with',
-                    '                     go / edit / no buttons.',
-                    '',
-                    'When a plan is on screen:',
-                    '  reply "go"      — approved, I execute',
-                    '  reply "no"      — rejected, plan dropped',
-                    '  anything else   — counts as an edit, I redraft',
+                    'Use:',
+                    '  `/plan <task>`   — I draft a step list and work through it,',
+                    '                     showing the plan first for heavy tasks.',
                     '',
                     'Cancel:',
-                    '  `/plan cancel`   — drop any active plan and continue',
-                    '                     in normal mode.',
+                    '  `/plan cancel`   — drop the current plan and continue normally.',
                 ].join('\n'),
             };
         }
@@ -60,17 +54,16 @@ export const planCommand: CommandDef = {
                     ? 'Plan dropped. Send a fresh request when ready.'
                     : 'No active plan to cancel.',
                 forwardToAgent: cleared
-                    ? '[The user invoked `/plan cancel`. The plan-mode state was just cleared at the interceptor level — there is no longer any plan or drafting state for this thread. Acknowledge briefly and wait for their next request. Do NOT reference the dropped plan.]'
+                    ? '[The user invoked `/plan cancel`. The plan scratchpad for this thread was just cleared — there is no longer any plan. Acknowledge briefly and wait for their next request. Do NOT reference the dropped plan.]'
                     : undefined,
             };
         }
 
         return {
-            text: `Drafting a plan for: ${truncate(raw, 80)}`,
+            text: `Planning: ${truncate(raw, 80)}`,
             forwardToAgent:
-                '[The user invoked `/plan` for this task — they want plan mode. Use `create_plan` to draft the approach, ' +
-                'send it via `send_message` with the standard `go` / `edit` / `no` buttons, and wait for approval before executing. ' +
-                'Do NOT call `delegate_task` or `spawn_background_task` until they approve.]\n\n' +
+                '[The user invoked `/plan` for this task — lay out the approach first. Use the `plan` tool (action=set) to record a `# goal` headline and a `## Steps` list, then work through the steps, marking each with update_step as you go. ' +
+                'For a heavy task (multiple workers or long-running), show the plan to the user before committing resources.]\n\n' +
                 escapeForBracketTemplate(raw),
         };
     },

@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve as resolvePath } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import * as yaml from 'js-yaml';
@@ -34,6 +34,26 @@ function parseHookYaml(absDir: string): ReturnType<typeof HookConfigSchema.parse
         return null;
     }
     return result.data;
+}
+
+function isSafeHookFile(path: string, hookId: string): boolean {
+    try {
+        const lst = lstatSync(path);
+        if (lst.isSymbolicLink()) {
+            log.warn({ hookId, path }, 'hook file is a symlink — refusing to load');
+            return false;
+        }
+        const st = statSync(path);
+        const mode = st.mode & 0o777;
+        if ((mode & 0o022) !== 0) {
+            log.warn({ hookId, path, mode: mode.toString(8) }, 'hook file is world- or group-writable — refusing to load');
+            return false;
+        }
+        return true;
+    } catch (err) {
+        log.warn({ hookId, path, err: err instanceof Error ? err.message : String(err) }, 'hook file stat failed — refusing to load');
+        return false;
+    }
 }
 
 /** Dynamic import of the handler module. Returns null if the module can't
@@ -119,6 +139,7 @@ export async function discoverAndLoadHooks(): Promise<RegisteredHook[]> {
                 log.warn({ id, script: config.script }, 'shell hook script not found');
                 continue;
             }
+            if (!isSafeHookFile(absScript, id)) continue;
             loaded.push({ id, config, absDir, kind: 'script', scriptPath: absScript });
             log.info({ id, events: config.events, script: absScript }, 'hook registered (shell)');
             continue;
@@ -126,6 +147,7 @@ export async function discoverAndLoadHooks(): Promise<RegisteredHook[]> {
 
         const handlerName = config.handler ?? 'handler.ts';
         const absHandler = resolvePath(absDir, handlerName);
+        if (!isSafeHookFile(absHandler, id)) continue;
         const handler = await loadTsHandler(absHandler);
         if (!handler) continue;
         loaded.push({ id, config, absDir, kind: 'ts', handler });

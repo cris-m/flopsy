@@ -1,9 +1,36 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { workspace, createLogger } from '@flopsy/shared';
 
 const log = createLogger('skill-loader');
+
+/**
+ * Resolve a skill name → SKILL.md path under the skills root, walking BOTH
+ * flat (skills/<name>/SKILL.md) and grouped (skills/<group>/<name>/SKILL.md)
+ * layouts. Returns null when not found.
+ */
+function findSkillPath(root: string, name: string): string | null {
+    const flat = join(root, name, 'SKILL.md');
+    if (existsSync(flat)) return flat;
+    let groups: string[];
+    try {
+        groups = readdirSync(root);
+    } catch {
+        return null;
+    }
+    for (const group of groups) {
+        const groupPath = join(root, group);
+        try {
+            if (!statSync(groupPath).isDirectory()) continue;
+        } catch {
+            continue;
+        }
+        const candidate = join(groupPath, name, 'SKILL.md');
+        if (existsSync(candidate)) return candidate;
+    }
+    return null;
+}
 
 /**
  * One resolved skill — what the executor passes to the agent caller for
@@ -67,11 +94,11 @@ export async function loadSkills(
             continue;
         }
 
-        const path = join(workspace.skills(), name, 'SKILL.md');
-        if (!existsSync(path)) {
+        const path = findSkillPath(workspace.skills(), name);
+        if (!path) {
             log.warn(
-                { jobId, name, path, op: 'skill-load' },
-                'skill file not found — fire will continue without it',
+                { jobId, name, op: 'skill-load' },
+                'skill file not found (checked flat + grouped layouts) — fire will continue without it',
             );
             missing.push(name);
             continue;

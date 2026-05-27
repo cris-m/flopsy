@@ -21,7 +21,6 @@
         "components": {}
     },
     "timezone": "UTC",
-    "models": {},
     "mcp": {
         "enabled": true,
         "servers": {
@@ -64,7 +63,8 @@
                     "HOME_ASSISTANT_TOKEN"
                 ],
                 "assignTo": [
-                    "sam"
+                    "sam",
+                    "gandalf"
                 ],
                 "description": "Smart home control: lights, climate, automations"
             },
@@ -187,7 +187,8 @@
                     "${MCP_ROOT}/twitter.ts"
                 ],
                 "assignTo": [
-                    "aragorn"
+                    "aragorn",
+                    "gandalf"
                 ],
                 "description": "X/Twitter via `@steipete/bird` (cookie auth, fragile — breaks when X changes its HTML). Enable when you need it."
             },
@@ -207,7 +208,8 @@
                     "GOOGLE_CLIENT_SECRET"
                 ],
                 "assignTo": [
-                    "legolas"
+                    "legolas",
+                    "gandalf"
                 ],
                 "description": "Gmail read/search/send/draft. Needs GOOGLE_CLIENT_ID/SECRET + `flopsy auth google`, then enable."
             },
@@ -227,7 +229,8 @@
                     "GOOGLE_CLIENT_SECRET"
                 ],
                 "assignTo": [
-                    "legolas"
+                    "legolas",
+                    "gandalf"
                 ],
                 "description": "Google Calendar read/write events, find free time. Same prereqs as gmail."
             },
@@ -247,7 +250,8 @@
                     "GOOGLE_CLIENT_SECRET"
                 ],
                 "assignTo": [
-                    "legolas"
+                    "legolas",
+                    "gandalf"
                 ],
                 "description": "Google Drive file search + read. Same prereqs as gmail.",
                 "callTimeoutMs": 300000
@@ -312,11 +316,57 @@
             }
         }
     },
+    // External coding agents driven over the Agent Client Protocol (ACP).
+    // Disabled by default: requires `npm i @agentclientprotocol/sdk` and the
+    // agent CLI's own auth (e.g. Claude Code uses your Anthropic credentials).
+    // When enabled, the main agent gets a `code_agent` tool that hands a coding
+    // task to the chosen agent in a sandboxed working dir under `cwdRoot`.
+    // Edits outside the job's cwd are blocked by the permission gate.
+    "acp": {
+        "enabled": false,
+        "cwdRoot": "work/code",
+        "permissionMode": "auto-allow-in-cwd",
+        "timeoutMs": 1800000,
+        "agents": {
+            "claude-code": {
+                "command": "npx",
+                "args": ["-y", "@zed-industries/claude-code-acp"]
+            }
+        }
+    },
     "memory": {
         "enabled": true,
         "embedder": {
             "provider": "ollama",
             "model": "nomic-embed-text:v1.5"
+        },
+        // Memory plugins — re-validated by the team package (parseMemoryConfig
+        // in memory/config.ts). All default disabled; flip `enabled` to use.
+        "plugins": {
+            // LLM-mediated add/update/delete/NOOP dedup on memory writes.
+            // Local Ollama model — no cloud key needed.
+            "smartWriter": {
+                "enabled": true,
+                "model": "ollama:qwen3-coder:480b-cloud",
+                "similarityThreshold": 0.7,
+                "topK": 3
+            },
+            // Proposes new skills from recurring procedural asks → skills-proposed/.
+            "skillSignals": {
+                "enabled": false,
+                "model": "ollama:qwen3-coder:480b-cloud",
+                "checkEveryNTurns": 8,
+                "windowSize": 8,
+                "minConfidence": 0.75
+            },
+            // Vector mirror of memory writes into local SQLite (uses embedder).
+            "sqliteMirror": { "enabled": false, "mirrorOnWrite": true },
+            // Honcho session/peer context (self-hosted) — needs all three set.
+            "honcho": { "enabled": false, "baseUrl": "http://localhost:8000", "peerName": "user", "aiPeer": "flopsy" },
+            // Mem0 vector+graph hybrid (self-hosted qdrant or cloud).
+            "mem0": { "enabled": false, "baseUrl": "http://localhost:8765" },
+            // Append-only JSONL audit of every memory write.
+            "audit": { "enabled": false, "maxQueryResults": 20 }
         }
     },
     "agents": [
@@ -345,13 +395,26 @@
             // specific voice instead of plain SOUL.md. Per-session
             // /personality choices still win over this default.
             // "defaultPersonality": "concise",
+            // Custom prompt file for this agent — overrides the type-based
+            // role-delta under content/roles/<role>/<type>.md. Path MUST be
+            // relative and resolve inside FLOPSY_HOME (the .flopsy workspace).
+            // Absolute paths and `..` escapes are rejected — keeps the prompt
+            // version-controllable alongside flopsy.json5 and prevents
+            // pointing at arbitrary host files.
+            //
+            // Drop a new agent without editing the source tree:
+            //   1. Create .flopsy/content/roles/worker/merchant.md
+            //   2. Add an agent entry with `"type": "merchant"` and either
+            //      let it auto-resolve roles/worker/merchant.md (no
+            //      promptPath needed), or set a custom location:
+            // "promptPath": "content/roles/worker/merchant.md",
             // 70B is fast enough to compose post-delegation replies (worker brief
             // + conversation + 33 tools) inside the 45s modelCallTimeoutMs.
             // The 675B mistral was timing out every turn — kept as last-ditch
             // fallback for hard problems where 70B might struggle, but only
             // after the local gemma so we don't waste 45s by default.
             //"model": "nvidia:meta/llama-3.3-70b-instruct",
-            "model": "openai:gpt-5.4",  // fastest paid option
+            "model": "ollama:qwen3-coder:480b-cloud",
             "model_config": {
                 "temperature": 0,
                 "maxTokens": 4096
@@ -359,11 +422,11 @@
             "fallback_models": [
                 {
                     "provider": "ollama",
-                    "name": "gemma4:e4b"
+                    "name": "kimi-k2.6:cloud"
                 },
                 {
-                    "provider": "nvidia",
-                    "name": "mistralai/mistral-large-3-675b-instruct-2512"
+                    "provider": "ollama",
+                    "name": "gemma4:e4b"
                 }
             ],
             "cost_tier": "medium",
@@ -432,14 +495,14 @@
                 "web",
                 "news"
             ],
-            "model": "nvidia:qwen/qwen2.5-72b-instruct",
+            "model": "ollama:qwen3-coder:480b-cloud",
             "model_config": {
                 "temperature": 0.5
             },
             "fallback_models": [
                 {
-                    "provider": "nvidia",
-                    "name": "meta/llama-3.3-70b-instruct"
+                    "provider": "ollama",
+                    "name": "kimi-k2.6:cloud"
                 },
                 {
                     "provider": "ollama",
@@ -472,16 +535,16 @@
             "role": "worker",
             "graph": "deep-research",
             "domain": "deep-research",
-            "toolsets": ["research", "web", "news"],
-            "model": "nvidia:meta/llama-3.3-70b-instruct",
+            "toolsets": ["research", "web", "news", "finance"],
+            "model": "ollama:qwen3-coder:480b-cloud",
             "model_config": {
                 "temperature": 0.3,
                 "maxTokens": 8192
             },
             "fallback_models": [
                 {
-                    "provider": "nvidia",
-                    "name": "qwen/qwen2.5-72b-instruct"
+                    "provider": "ollama",
+                    "name": "kimi-k2.6:cloud"
                 },
                 {
                     "provider": "ollama",
@@ -523,15 +586,15 @@
                 "utility",
                 "filesystem"
             ],
-            "model": "nvidia:meta/llama-3.1-8b-instruct",
+            "model": "ollama:qwen3-coder:480b-cloud",
             "model_config": {
                 "temperature": 0.3,
                 "maxTokens": 2048
             },
             "fallback_models": [
                 {
-                    "provider": "nvidia",
-                    "name": "meta/llama-3.3-70b-instruct"
+                    "provider": "ollama",
+                    "name": "kimi-k2.6:cloud"
                 },
                 {
                     "provider": "ollama",
@@ -581,15 +644,15 @@
                 "virustotal",
                 "shodan"
             ],
-            "model": "nvidia:meta/llama-3.3-70b-instruct",
+            "model": "ollama:qwen3-coder:480b-cloud",
             "model_config": {
                 "temperature": 0.2,
                 "maxTokens": 4096
             },
             "fallback_models": [
                 {
-                    "provider": "nvidia",
-                    "name": "meta/llama-3.1-8b-instruct"
+                    "provider": "ollama",
+                    "name": "kimi-k2.6:cloud"
                 },
                 {
                     "provider": "ollama",
@@ -632,15 +695,15 @@
                 "spotify",
                 "home-assistant"
             ],
-            "model": "nvidia:meta/llama-3.1-8b-instruct",
+            "model": "ollama:qwen3-coder:480b-cloud",
             "model_config": {
                 "temperature": 0.3,
                 "maxTokens": 4096
             },
             "fallback_models": [
                 {
-                    "provider": "nvidia",
-                    "name": "meta/llama-3.3-70b-instruct"
+                    "provider": "ollama",
+                    "name": "kimi-k2.6:cloud"
                 },
                 {
                     "provider": "ollama",
@@ -809,7 +872,7 @@
             }
         },
         "slack": {
-            "enabled": false,
+            "enabled": true,
             "botToken": "${SLACK_BOT_TOKEN}",
             "appToken": "${SLACK_APP_TOKEN}",
             "signingSecret": "${SLACK_SIGNING_SECRET}",
@@ -858,7 +921,6 @@
 
         "heartbeats": { "enabled": true },
         "scheduler":  { "enabled": true },
-        "webhooks": [],
 
         "healthMonitor": {
             "enabled": true,

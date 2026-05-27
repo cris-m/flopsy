@@ -41,12 +41,17 @@ export function getSecret(db: Db, dek: Buffer, name: string): string | undefined
     return out;
 }
 
-export function listSecrets(db: Db): SecretRow[] {
+const LIST_SECRETS_DEFAULT_LIMIT = 500;
+const LIST_SECRETS_MAX_LIMIT = 5000;
+
+export function listSecrets(db: Db, opts: { limit?: number; offset?: number } = {}): SecretRow[] {
+    const limit = Math.max(1, Math.min(opts.limit ?? LIST_SECRETS_DEFAULT_LIMIT, LIST_SECRETS_MAX_LIMIT));
+    const offset = Math.max(0, opts.offset ?? 0);
     const rows = db
         .prepare(
-            'SELECT name, created_at as createdAt, updated_at as updatedAt FROM vault_secrets ORDER BY name',
+            'SELECT name, created_at as createdAt, updated_at as updatedAt FROM vault_secrets ORDER BY name LIMIT ? OFFSET ?',
         )
-        .all() as SecretRow[];
+        .all(limit, offset) as SecretRow[];
     return rows;
 }
 

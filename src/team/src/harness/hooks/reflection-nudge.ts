@@ -11,13 +11,13 @@ interface NudgeOptions {
 }
 
 export function reflectionNudge(options: NudgeOptions = {}): Interceptor {
-    const threshold = Math.max(3, options.threshold ?? 5);
+    const threshold = Math.max(3, options.threshold ?? 8);
 
     return {
         name: 'reflection-nudge',
         afterToolCall(ctx) {
-            // DCL meta-tools are catalog discovery, not substantive work.
             if (ctx.toolName.startsWith('__')) return;
+            if (ctx.toolName.startsWith('skill_')) return;
 
             const count = ((ctx.store.get(STORE_COUNT_KEY) as number | undefined) ?? 0) + 1;
             ctx.store.set(STORE_COUNT_KEY, count);
@@ -30,7 +30,6 @@ export function reflectionNudge(options: NudgeOptions = {}): Interceptor {
                 { runId: ctx.runId, threadId: ctx.threadId, toolCount: count },
                 'reflection nudge fired',
             );
-            // afterToolCall can't mutate messages — beforeModelCall delivers the nudge.
         },
 
         beforeModelCall(ctx) {

@@ -1,8 +1,17 @@
 export { discoverAndLoadHooks } from './loader';
 export {
+    BLOCK_CAPABLE_EVENTS,
     HookRegistry,
     emitHook,
+    emitHookAwait,
     getHookRegistry,
     setHookRegistry,
 } from './registry';
-export type { HookConfig, HookContext, HookHandler, RegisteredHook } from './types';
+export type {
+    HookAggregate,
+    HookConfig,
+    HookContext,
+    HookHandler,
+    HookResult,
+    RegisteredHook,
+} from './types';

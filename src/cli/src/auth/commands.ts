@@ -1,19 +1,3 @@
-/**
- * `flopsy auth ...` — CLI surface for credential management.
- *
- * Commands:
- *   flopsy auth list              — supported providers + connection status
- *   flopsy auth status [provider] — details for one or all connected providers
- *   flopsy auth <provider>        — run OAuth (or re-auth) for a provider
- *   flopsy auth refresh <provider>— force refresh the access token
- *   flopsy auth revoke <provider> — revoke remotely + delete local credential
- *
- * Exit codes:
- *   0 — success
- *   1 — bad input / config (missing env, unknown provider, ...)
- *   2 — network / provider error
- */
-
 import { Command } from 'commander';
 import {
     deleteCredential,
@@ -21,6 +5,7 @@ import {
     loadCredential,
 } from './credential-store';
 import { getProvider, providerNames, PROVIDERS } from './providers/registry';
+import { refreshCredentialNow } from './refresh';
 
 function fail(message: string, code = 1): never {
     process.stderr.write(`error: ${message}\n`);
@@ -39,7 +24,8 @@ function formatExpiresAt(ms: number): string {
 }
 
 export function registerAuthCommands(root: Command): void {
-    const auth = root.command('auth').description('Manage service credentials');
+    const auth = root.command('auth').description('Manage service credentials')
+        .action((_opts: unknown, cmd: Command) => cmd.outputHelp());
 
     auth.command('list')
         .description('List supported providers and connection status')
@@ -93,17 +79,12 @@ export function registerAuthCommands(root: Command): void {
         .description('Force-refresh the access token for a provider')
         .argument('<provider>', 'Provider name')
         .action(async (name: string) => {
-            const provider = getProvider(name);
-            if (!provider) {
+            if (!getProvider(name)) {
                 fail(`Unknown provider "${name}". Available: ${providerNames().join(', ')}`);
             }
-            const current = loadCredential(provider.name);
-            if (!current) {
-                fail(`No credential for "${provider.name}". Run \`flopsy auth ${provider.name}\` first.`);
-            }
             try {
-                const refreshed = await provider.refresh(current);
-                console.log(`✓ Refreshed ${provider.name}. ${formatExpiresAt(refreshed.expiresAt)}.`);
+                const refreshed = await refreshCredentialNow(name);
+                console.log(`✓ Refreshed ${refreshed.provider}. ${formatExpiresAt(refreshed.expiresAt)}.`);
             } catch (err) {
                 fail(err instanceof Error ? err.message : String(err), 2);
             }
@@ -140,12 +121,8 @@ export function registerAuthCommands(root: Command): void {
             );
         });
 
-    // Catch-all provider commands — `flopsy auth google`, `flopsy auth notion`, …
-    //
-    // commander.js doesn't have a "rest-positional-as-subcommand" pattern,
-    // so we register one subcommand per provider explicitly. This also
-    // gives us per-provider --scopes / --port flags without argument
-    // conflicts.
+    // One subcommand per provider: commander.js has no rest-positional-as-subcommand, and this gives
+    // per-provider --scopes / --port flags without argument conflicts.
     for (const p of PROVIDERS) {
         auth.command(p.name)
             .description(`Authorize ${p.displayName}`)
@@ -154,11 +131,18 @@ export function registerAuthCommands(root: Command): void {
                 Number.parseInt(v, 10),
             )
             .option('--no-open', 'Do not auto-open the browser')
+            .option(
+                '--device',
+                'Use OAuth device flow (RFC 8628) — no browser callback. ' +
+                    'Only works for services whose scopes are on Google\'s device-flow ' +
+                    'allowlist (currently youtube + calendar). Other services throw.',
+            )
             .action(
                 async (opts: {
                     scopes?: string;
                     port?: number;
                     open?: boolean;
+                    device?: boolean;
                 }) => {
                     const extraScopes = opts.scopes
                         ? opts.scopes
@@ -171,6 +155,7 @@ export function registerAuthCommands(root: Command): void {
                             scopes: extraScopes,
                             callbackPort: opts.port,
                             noOpen: opts.open === false,
+                            useDeviceFlow: opts.device === true,
                         });
                         console.log(
                             `\n✓ Authorized ${p.name}${cred.email ? ` as ${cred.email}` : ''}.`,

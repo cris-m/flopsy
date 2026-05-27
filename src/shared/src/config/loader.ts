@@ -10,6 +10,12 @@ const ENV_VAR_PATTERN = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
 
 const PATH_KEY_RE = /(path|dir|file)$/i;
 
+// Keys re-resolved downstream with subdir awareness (resolveWorkspaceConfigPath
+// with a `state` default). The loader must NOT pre-anchor them to the HOME root,
+// or a bare "proactive.json" becomes <HOME>/proactive.json and the later
+// state/-resolution sees an absolute path and no-ops — splitting state out of state/.
+const SUBDIR_RESOLVED_KEYS = new Set(['statePath', 'retryQueuePath', 'dedupDbPath']);
+
 const DEFAULT_CONFIG_PATHS = ['flopsy.json5', 'flopsy.json'];
 
 let cached: FlopsyConfig | null = null;
@@ -38,7 +44,7 @@ function resolveWorkspacePaths(obj: unknown, root: string): void {
     if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return;
 
     for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
-        if (typeof value === 'string' && PATH_KEY_RE.test(key)) {
+        if (typeof value === 'string' && PATH_KEY_RE.test(key) && !SUBDIR_RESOLVED_KEYS.has(key)) {
             if (!value.startsWith('${') && !isAbsolute(value) && value.length > 0) {
                 (obj as Record<string, unknown>)[key] = resolve(root, value);
             }
@@ -113,6 +119,8 @@ export function loadConfig(path?: string): FlopsyConfig {
         );
     }
 
+    warnOnLegacyProactiveKeys(parsed, configPath);
+
     try {
         cached = flopsyConfigSchema.parse(parsed);
     } catch (err) {
@@ -133,6 +141,31 @@ export function loadConfig(path?: string): FlopsyConfig {
 
 export function clearConfigCache(): void {
     cached = null;
+}
+
+function warnOnLegacyProactiveKeys(parsed: unknown, configPath: string): void {
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+    const proactive = (parsed as Record<string, unknown>).proactive;
+    if (!proactive || typeof proactive !== 'object' || Array.isArray(proactive)) return;
+    const p = proactive as Record<string, unknown>;
+    const legacy: string[] = [];
+    const hb = p.heartbeats;
+    if (hb && typeof hb === 'object' && !Array.isArray(hb) && Array.isArray((hb as Record<string, unknown>).heartbeats)) {
+        legacy.push('proactive.heartbeats.heartbeats');
+    }
+    const sc = p.scheduler;
+    if (sc && typeof sc === 'object' && !Array.isArray(sc) && Array.isArray((sc as Record<string, unknown>).jobs)) {
+        legacy.push('proactive.scheduler.jobs');
+    }
+    if (Array.isArray(p.webhooks)) {
+        legacy.push('proactive.webhooks');
+    }
+    if (legacy.length > 0) {
+        console.warn(
+            `[config] legacy proactive schedules detected in ${configPath} — already imported into proactive.db; ` +
+            `remove ${legacy.join(' / ')} from flopsy.json5.`,
+        );
+    }
 }
 
 export function getConfigPath(explicitPath?: string): string | null {

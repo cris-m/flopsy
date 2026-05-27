@@ -25,11 +25,27 @@ export interface HookContext extends Record<string, unknown> {
     firedAt: number;
 }
 
+/**
+ * Pre-hooks on block-capable events may return one of these to influence the
+ * caller. Observation-only events ignore the return value. Shell hooks signal
+ * the same intent via exit code: 0 → undefined, 1 → block, 2 → context.
+ */
+export type HookResult =
+    | { action: 'block'; message?: string }
+    | { context: string }
+    | undefined;
+
+/** What an awaited emit returns after running all matching handlers. */
+export interface HookAggregate {
+    blocked: { hookId: string; message?: string } | null;
+    contexts: string[];
+}
+
 /** Handler signature loaded from `handler.ts`. Must be named `handle`. */
 export type HookHandler = (
     eventType: string,
     context: HookContext,
-) => void | Promise<void>;
+) => HookResult | void | Promise<HookResult | void>;
 
 /** What the loader records about each registered hook. */
 export interface RegisteredHook {

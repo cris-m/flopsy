@@ -7,6 +7,7 @@ import type { FlopsyGateway } from '@flopsy/gateway';
 
 import { TeamHandler } from './handler';
 import type { ThreadIdentity } from './handler';
+import { normalizeAcpConfig } from './acp';
 import { closeSharedLearningStore } from './harness';
 import { loadPersonalities } from './personalities';
 import { seedWorkspaceTemplates } from './seed-workspace';
@@ -15,9 +16,7 @@ import { setScheduleFacade } from './tools/schedule-registry';
 const log = createLogger('bootstrap');
 
 export interface BootstrapOptions {
-    /** Override the thread resolver. Default: threadId → userId (single tenant). */
     resolveThread?: (threadId: string) => Promise<ThreadIdentity> | ThreadIdentity;
-    /** Pick a specific agent by `name` as the gateway entry point. */
     entryAgentName?: string;
 }
 
@@ -38,6 +37,25 @@ export async function startFlopsyBot(
     }
     if (!definition.enabled) {
         throw new Error(`Bootstrap: agent "${definition.name}" is disabled in config.`);
+    }
+
+    // Pre-flight validation: every enabled agent MUST have either a primary `model`
+    // or a routing fallback. Silently passing here means the gateway boots but the
+    // agent dies at first turn with an opaque ModelLoader error. Fail loudly instead.
+    const missingModel = config.agents.filter(
+        (a) =>
+            a.enabled &&
+            !a.model &&
+            !a.routing?.tiers?.fast?.name &&
+            !a.routing?.tiers?.balanced?.name &&
+            !a.routing?.tiers?.powerful?.name,
+    );
+    if (missingModel.length > 0) {
+        throw new Error(
+            `Bootstrap: ${missingModel.length} enabled agent${missingModel.length === 1 ? '' : 's'} ` +
+                `missing both \`model\` and \`routing.tiers.*\`: ${missingModel.map((a) => a.name).join(', ')}. ` +
+                `Add a \`model: "provider:name"\` line to each, or disable them with \`enabled: false\`.`,
+        );
     }
 
     log.info(
@@ -101,7 +119,6 @@ export async function startFlopsyBot(
         );
     }
 
-    // preload returns in unspecified order; match the primary explicitly.
     const primaryRef = definition.model
         ? loaded.find((ref) => `${ref.provider}:${ref.name}` === definition.model)
         : undefined;
@@ -136,7 +153,6 @@ export async function startFlopsyBot(
 
     const modelRouter = modelRouters.get(definition.name);
 
-    // Extraction runs on the fast tier; fall back to primary.
     let extractorModel: BaseChatModel = model;
     if (modelRouter) {
         try {
@@ -153,7 +169,6 @@ export async function startFlopsyBot(
             );
         }
     }
-    // SessionExtractor is built inside TeamHandler so it shares the checkpointer.
 
     const seedStats = seedWorkspaceTemplates();
     log.info(seedStats, 'workspace template seed complete');
@@ -182,10 +197,10 @@ export async function startFlopsyBot(
         memory: config.memory,
         mcp: config.mcp,
         extractorModel,
-        ...(config.commitments ? { commitments: config.commitments } : {}),
         modelRouter: modelRouter ?? undefined,
         modelRouters,
         personalities,
+        acp: normalizeAcpConfig((config as { acp?: unknown }).acp),
         ...(observability ? { observability } : {}),
     });
 
@@ -193,10 +208,11 @@ export async function startFlopsyBot(
     gateway.setStructuredOutputModel(model);
     log.info({ activeThreads: handler.activeThreadCount }, 'Agent handler attached to gateway');
 
-    await gateway.start();
-    log.info('Gateway started; awaiting channel traffic');
-
-    // Engine is constructed inside gateway.start(), so this MUST run after.
+    const startPromise = gateway.start();
+    const engineReadyDeadline = Date.now() + 30_000;
+    while (!gateway.getProactiveEngine() && Date.now() < engineReadyDeadline) {
+        await new Promise((r) => setTimeout(r, 100));
+    }
     const engine = gateway.getProactiveEngine();
     if (engine) {
         setScheduleFacade({
@@ -209,7 +225,12 @@ export async function startFlopsyBot(
             listSchedules: () => engine.listSchedules(),
         });
         log.info('manage_schedule tool wired to proactive engine');
+    } else {
+        log.warn('proactive engine not ready after 30s — manage_schedule tool will be unavailable');
     }
+    startPromise
+        .then(() => log.info('Gateway started; awaiting channel traffic'))
+        .catch((err) => log.error({ err }, 'gateway start failed in background'));
 
     return async () => {
         log.info('Tearing down bootstrap');
@@ -224,7 +245,6 @@ function findAgentDefinition(config: FlopsyConfig, name: string): AgentDefinitio
     return config.agents.find((a) => a.name === name);
 }
 
-/** Build Observability from env. Triggers: OTEL_EXPORTER_OTLP_ENDPOINT, LANGSMITH_API_KEY, FLOPSY_OBSERVABILITY=1. */
 function buildObservability(): Observability | undefined {
     const otlpEndpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
     const langsmithKey = process.env.LANGSMITH_API_KEY;
@@ -252,7 +272,6 @@ function buildObservability(): Observability | undefined {
     }
 }
 
-/** Probe flopsy-sandbox:latest; background-build when missing so gateway start isn't blocked. */
 async function ensureSandboxImageIfNeeded(config: FlopsyConfig): Promise<void> {
     const needsImage = config.agents.some((a) => {
         const sb = (a as { sandbox?: Record<string, unknown> }).sandbox;
@@ -294,12 +313,10 @@ async function ensureSandboxImageIfNeeded(config: FlopsyConfig): Promise<void> {
 }
 
 function defaultResolveThread(threadId: string): ThreadIdentity {
-    // userId is the full peer routing key so harness + extractor share the same peer_id row.
     const peerId = threadId.split('#')[0] ?? threadId;
     return { userId: peerId };
 }
 
-// Split on the FIRST `:` so Ollama tags like `name:latest` stay attached.
 export function parseModelString(s: string): { provider: string; name: string } {
     const i = s.indexOf(':');
     if (i <= 0) {

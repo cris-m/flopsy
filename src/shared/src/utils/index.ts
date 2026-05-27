@@ -2,6 +2,7 @@ export { createLogger, setLogConfig, scrubPii, type LogLevel, type LoggerOptions
 export {
     resolveFlopsyHome,
     resolveWorkspacePath,
+    resolveWorkspaceConfigPath,
     ensureDir,
     createWorkspace,
     workspace,
@@ -32,3 +33,16 @@ export {
     TEMPLATE_FOLDERS,
     type SeedStats,
 } from './seed-workspace';
+export {
+    CHANNEL_CAPABILITY_HINTS,
+    CHANNEL_STYLE_HINTS,
+    channelCapabilityHint,
+    channelGuidance,
+    modelFamily,
+    hostInfo,
+} from './channel-capabilities';
+export {
+    resolveSecret,
+    resolveSecretValue,
+    resolveSecretOrThrow,
+} from './vault-resolve';

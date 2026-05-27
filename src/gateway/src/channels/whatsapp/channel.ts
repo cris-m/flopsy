@@ -7,14 +7,14 @@ import type {
 } from '@whiskeysockets/baileys';
 import type { Boom } from '@hapi/boom';
 import type { Peer, OutboundMessage, ReactionOptions, Media } from '@gateway/types';
+import { isTextDocument } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
 import { isSafeMediaUrl } from '@gateway/core/security';
 import type { WhatsAppChannelConfig } from './types';
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_TEXT_DOCUMENT_BYTES = 256 * 1024;
 
-// Baileys' `quoted` option needs the full WAMessage (signed with the
-// original message context) — cache inbounds to resolve replyTo on send.
 const REPLY_CACHE_MAX = 200;
 
 export class WhatsAppChannel extends BaseChannel {
@@ -82,12 +82,6 @@ export class WhatsAppChannel extends BaseChannel {
             });
 
             this.socket.ev.on('messages.upsert', async ({ messages }) => {
-                // Process the batch in parallel via Promise.allSettled.
-                // Previously the for-loop awaited downloadMediaMessage
-                // serially — a burst of 10 images stalled subsequent
-                // text-only messages behind 10 sequential downloads.
-                // Per-message try/catch (existing) prevents one failure
-                // from breaking the rest.
                 await Promise.allSettled(messages.map(async (msg) => {
                     try {
                         if (!msg.message || msg.key.fromMe) return;
@@ -98,13 +92,16 @@ export class WhatsAppChannel extends BaseChannel {
 
                         if (!this.isAllowed(senderId, peerType)) return;
 
-                        // Map insertion-order eviction → LRU-ish.
                         if (msg.key.id) {
                             this.replyCache.set(msg.key.id, msg);
                             if (this.replyCache.size > REPLY_CACHE_MAX) {
                                 const oldest = this.replyCache.keys().next().value;
                                 if (oldest) this.replyCache.delete(oldest);
                             }
+                        }
+
+                        if (this.channelConfig.sendReadReceipts !== false) {
+                            void this.socket?.readMessages([msg.key]).catch(() => {});
                         }
 
                         const m = msg.message;
@@ -144,8 +141,28 @@ export class WhatsAppChannel extends BaseChannel {
 
                         if (m.documentMessage) {
                             const doc = m.documentMessage;
-                            media.push({ type: 'document', fileName: doc.fileName ?? undefined, mimeType: doc.mimetype ?? undefined });
-                            if (!body) { body = `[Document: ${doc.fileName ?? doc.mimetype ?? 'file'}]`; synthetic = true; }
+                            const fileName = doc.fileName ?? undefined;
+                            const mimeType = doc.mimetype ?? undefined;
+                            const fileSize = typeof doc.fileLength === 'number' ? doc.fileLength : undefined;
+                            const isText = isTextDocument(mimeType, fileName);
+                            const withinSize = !fileSize || fileSize <= MAX_TEXT_DOCUMENT_BYTES;
+                            if (isText && withinSize) {
+                                try {
+                                    const { downloadMediaMessage } = await import('@whiskeysockets/baileys');
+                                    const buffer = await downloadMediaMessage(msg, 'buffer', {});
+                                    if (buffer instanceof Buffer && buffer.length <= MAX_TEXT_DOCUMENT_BYTES) {
+                                        const text = new TextDecoder('utf-8', { fatal: false }).decode(buffer);
+                                        media.push({ type: 'document', fileName, mimeType, fileSize, text });
+                                    } else {
+                                        media.push({ type: 'document', fileName, mimeType, fileSize });
+                                    }
+                                } catch {
+                                    media.push({ type: 'document', fileName, mimeType, fileSize });
+                                }
+                            } else {
+                                media.push({ type: 'document', fileName, mimeType, fileSize });
+                            }
+                            if (!body) { body = `[Document: ${fileName ?? mimeType ?? 'file'}]`; synthetic = true; }
                         }
 
                         if (m.videoMessage) {
@@ -175,11 +192,6 @@ export class WhatsAppChannel extends BaseChannel {
         } catch (err) {
             this.setStatus('error');
             this.emitError(toError(err));
-            // Socket leak guard: if makeWASocket returned but a later
-            // call (listener setup, auth load) threw, the socket
-            // reference is held on `this.socket` but never end()-ed.
-            // Subsequent reconnects build another one alongside, slowly
-            // accumulating open Noise handlers until the process OOMs.
             if (this.socket) {
                 try {
                     (this.socket as { end?: (err?: unknown) => void }).end?.(undefined);
@@ -218,7 +230,6 @@ export class WhatsAppChannel extends BaseChannel {
 
         const jid = message.peer.id;
 
-        // Cache miss drops the quote silently; message still delivers plain.
         const quoted = message.replyTo ? this.replyCache.get(message.replyTo) : undefined;
         const sendOpts: MiscMessageGenerationOptions = quoted ? { quoted } : {};
 
@@ -271,8 +282,48 @@ export class WhatsAppChannel extends BaseChannel {
 
     async sendTyping(peer: Peer): Promise<void> {
         if (!this.socket) return;
+        if (this.channelConfig.autoTyping === false) return;
         await this.socket.presenceSubscribe(peer.id);
         await this.socket.sendPresenceUpdate('composing', peer.id);
+    }
+
+    /**
+     * Delete a WhatsApp message we sent (reasoning auto-cleanup, orphan
+     * preview cleanup, etc.). Baileys's "delete-for-everyone" requires a
+     * full message key (remoteJid + fromMe + id + optional participant for
+     * groups). We reconstruct the key from peer.id + the returned message
+     * id; `fromMe: true` always — we only delete our OWN messages.
+     *
+     * WhatsApp's API only allows deleting your own messages within ~48h.
+     * Failures are swallowed (already-gone / too-old / not-permitted).
+     */
+    async deleteMessage(messageId: string, peer: Peer): Promise<void> {
+        if (!this.socket || !messageId) return;
+        try {
+            await this.socket.sendMessage(peer.id, {
+                delete: {
+                    remoteJid: peer.id,
+                    fromMe: true,
+                    id: messageId,
+                },
+            });
+        } catch {
+            /* best-effort; ignore if already gone, expired, or unsupported */
+        }
+    }
+
+    /**
+     * WhatsApp native: `>` blockquote (added Sept 2024) with an `_italic_`
+     * body to read as "thinking aloud" vs the user-facing answer. WhatsApp
+     * has no spoiler/collapsible primitive, so visual demotion via italic
+     * inside a blockquote is the best native option.
+     */
+    override formatReasoning(content: string): string {
+        const trimmed = content.trim();
+        if (!trimmed) return '';
+        const safe = trimmed.replace(/_/g, '\\_');
+        const lines = safe.split('\n').map((l) => l ? `> _${l}_` : '>');
+        return `> *💭 Reasoning*\n${lines.join('\n')}`;
     }
 
     async react(options: ReactionOptions): Promise<void> {

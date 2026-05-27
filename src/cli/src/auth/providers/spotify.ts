@@ -17,7 +17,7 @@
  *   Spotify's recommended flow for desktop/CLI apps.
  */
 
-import { loadConfig } from '@flopsy/shared';
+import { loadConfig, resolveSecret } from '@flopsy/shared';
 import {
     awaitOauthCallback,
     type CallbackResult,
@@ -89,13 +89,14 @@ function readRedirect(): ParsedRedirect {
 }
 
 function requireClientId(): string {
-    const id = process.env['SPOTIFY_CLIENT_ID']?.trim();
+    const id = resolveSecret('SPOTIFY_CLIENT_ID');
     if (!id) {
         throw new Error(
-            'SPOTIFY_CLIENT_ID is not set.\n' +
+            'SPOTIFY_CLIENT_ID is not set (env value missing or vault placeholder unresolved).\n' +
                 '  1. Create an app at https://developer.spotify.com/dashboard\n' +
                 '  2. Set the Redirect URI (from flopsy.json5 redirectBase)\n' +
-                '  3. Copy the Client ID, put it in .env: SPOTIFY_CLIENT_ID=...\n' +
+                '  3. Either: SPOTIFY_CLIENT_ID=<real-value> in .env (client IDs are public)\n' +
+                '     Or:    flopsy vault add SPOTIFY_CLIENT_ID "<value>"\n' +
                 '  4. Re-run `flopsy auth spotify`\n',
         );
     }

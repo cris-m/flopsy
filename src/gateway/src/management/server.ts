@@ -1,6 +1,6 @@
 /**
  * Read-only management HTTP server bound to 127.0.0.1 only. Auth via
- * `FLOPSY_MGMT_TOKEN` env or <FLOPSY_HOME>/mgmt-token file
+ * `GATEWAY_TOKEN` env or <FLOPSY_HOME>/gateway-token file
  * (auto-generated on first gateway boot). Unauthenticated requests get 401.
  */
 
@@ -59,6 +59,28 @@ export interface ManagementServerOptions {
         getStats(windowMs: number): Promise<unknown>;
         getFires(id: string, limit: number): unknown;
     };
+    readonly harnessActivityFn?: (windowMs: number) => unknown;
+    /**
+     * Drops the cached skill catalog in every running agent's `skills()`
+     * interceptor so the next turn re-scans `.flopsy/content/skills/`. Use
+     * after `flopsy skill install`, `proposed promote`, or `uninstall` to
+     * avoid a gateway restart.
+     */
+    readonly skillReloadFn?: () => { reloaded: boolean };
+    /**
+     * One-shot stateless agent invocation used by the skill-eval framework.
+     * Builds a fresh agent (fresh `skills()` interceptor → fresh catalog scan),
+     * runs the prompt, returns the agent's reply text and timing.
+     */
+    readonly evalRunFn?: (req: {
+        prompt: string;
+        timeoutMs?: number;
+    }) => Promise<{
+        reply: string;
+        durationMs: number;
+        tokenUsage?: { input: number; output: number };
+        error?: string;
+    }>;
     readonly chatHandler?: ChatHandler;
 }
 
@@ -97,7 +119,7 @@ export class ManagementServer {
         if (this.opts.token) {
             log.info({ host, port, auth: 'bearer', chat: !!this.opts.chatHandler }, 'management server listening');
         } else {
-            log.warn({ host, port, chat: !!this.opts.chatHandler }, 'management server listening WITHOUT auth — set FLOPSY_MGMT_TOKEN in production');
+            log.warn({ host, port, chat: !!this.opts.chatHandler }, 'management server listening WITHOUT auth — set GATEWAY_TOKEN in production');
         }
     }
 
@@ -108,7 +130,7 @@ export class ManagementServer {
     }
 
     private async onRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-        // Bearer token check — when FLOPSY_MGMT_TOKEN is set, require it
+        // Bearer token check — when GATEWAY_TOKEN is set, require it
         // on every non-ping request. Ping stays open so `flopsy management
         // ping` works before the user sets a token.
         let path: string;
@@ -210,6 +232,46 @@ export class ManagementServer {
                 return this.reply(res, 200, { fires: proactive.getFires(id, limit) });
             }
             return this.reply(res, 404, { error: 'not found', path });
+        }
+
+        if (req.method === 'POST' && path === '/management/skills/reload') {
+            if (!this.opts.skillReloadFn) {
+                return this.reply(res, 501, { error: 'skill reload endpoint not wired' });
+            }
+            return this.reply(res, 200, this.opts.skillReloadFn());
+        }
+
+        if (req.method === 'POST' && path === '/management/skill-eval-run') {
+            if (!this.opts.evalRunFn) {
+                return this.reply(res, 501, { error: 'skill-eval-run endpoint not wired' });
+            }
+            const body = await readJsonBody(req).catch((err: unknown) => {
+                this.reply(res, 400, { ...safeErrorBody(err) });
+                return null;
+            });
+            if (body === null) return;
+            const { prompt, timeoutMs } = body as { prompt?: unknown; timeoutMs?: unknown };
+            if (typeof prompt !== 'string' || prompt.length === 0) {
+                return this.reply(res, 400, { error: 'body must include `prompt` (non-empty string)' });
+            }
+            const tm = typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) ? timeoutMs : undefined;
+            try {
+                const out = await this.opts.evalRunFn({ prompt, ...(tm !== undefined ? { timeoutMs: tm } : {}) });
+                return this.reply(res, 200, out);
+            } catch (err) {
+                return this.reply(res, 500, { ...safeErrorBody(err) });
+            }
+        }
+
+        if (req.method === 'GET' && path === '/management/harness/activity') {
+            if (!this.opts.harnessActivityFn) {
+                return this.reply(res, 501, { error: 'harness activity endpoint not wired' });
+            }
+            const windowMs = Number(query.get('windowMs') ?? 86_400_000);
+            if (!Number.isFinite(windowMs) || windowMs <= 0 || windowMs > MAX_WINDOW_MS) {
+                return this.reply(res, 400, { error: 'windowMs out of range' });
+            }
+            return this.reply(res, 200, this.opts.harnessActivityFn(windowMs));
         }
 
         if (req.method === 'GET' && path === '/management/tasks') {

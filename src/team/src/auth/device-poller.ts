@@ -15,7 +15,12 @@ export interface DevicePollerHandle {
 }
 
 export interface DevicePollOptions {
-    readonly provider: 'google';
+    /**
+     * Per-service provider name (e.g. 'youtube', 'calendar'). Determines
+     * which credential file the poll result is saved to ('<provider>.json').
+     * Legacy 'google' still works but is no longer used in-chat.
+     */
+    readonly provider: string;
     readonly deviceCode: string;
     readonly intervalSeconds: number;
     readonly expiresAt: number;
@@ -45,10 +50,11 @@ export function startDevicePolling(opts: DevicePollOptions): DevicePollerHandle 
         }
         inFlight = true;
         try {
-            const result =
-                opts.provider === 'google'
-                    ? await googleDeviceFlow.poll(opts.deviceCode, opts.scopes)
-                    : { status: 'denied' as const };
+            const result = await googleDeviceFlow.poll(
+                opts.deviceCode,
+                opts.scopes,
+                opts.provider,
+            );
 
             if (cancelled) return;
 

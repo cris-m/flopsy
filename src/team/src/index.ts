@@ -29,7 +29,6 @@ export type {
     PairingPending,
     PairingApproved,
     ProactiveDecisionRow,
-    ProactiveCommitmentRow,
     SessionGoalRow,
     GoalStatus,
     GoalManagerConfig,

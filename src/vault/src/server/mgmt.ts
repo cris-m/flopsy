@@ -1,4 +1,5 @@
 import { createServer, type Server } from 'node:http';
+import type { Socket } from 'node:net';
 
 export interface MgmtServerOptions {
     host: string;
@@ -33,13 +34,25 @@ export function startMgmtServer(opts: MgmtServerOptions): Promise<MgmtServerHand
         res.end(JSON.stringify({ error: 'not found' }));
     });
 
+    const sockets = new Set<Socket>();
+    server.on('connection', (sock) => {
+        sockets.add(sock);
+        sock.once('close', () => sockets.delete(sock));
+    });
+
     return new Promise((resolve, reject) => {
         server.once('error', reject);
         server.listen(opts.port, opts.host, () => {
             server.removeListener('error', reject);
             resolve({
                 server,
-                close: () => new Promise<void>((res) => server.close(() => res())),
+                close: () => new Promise<void>((res) => {
+                    server.close(() => res());
+                    for (const s of sockets) {
+                        try { s.destroy(); } catch { /* */ }
+                    }
+                    sockets.clear();
+                }),
                 address: () => `${opts.host}:${opts.port}`,
             });
         });

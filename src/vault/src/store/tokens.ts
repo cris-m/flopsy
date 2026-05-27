@@ -1,5 +1,5 @@
 import type { Database as Db } from 'better-sqlite3';
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 export const TOKEN_PREFIX = 'fv_agt_';
 
@@ -88,30 +88,31 @@ export function verifyToken(db: Db, raw: string): VerifiedToken {
     const hash = hashToken(raw);
     const row = db
         .prepare(
-            'SELECT label, scope, expires_at as expiresAt, revoked, token_hash as tokenHash FROM vault_tokens WHERE token_hash = ?',
+            'SELECT label, scope, expires_at as expiresAt, revoked FROM vault_tokens WHERE token_hash = ?',
         )
-        .get(hash) as { label: string; scope: string; expiresAt: number | null; revoked: number; tokenHash: string } | undefined;
+        .get(hash) as { label: string; scope: string; expiresAt: number | null; revoked: number } | undefined;
     if (!row) throw new TokenVerifyError('invalid');
-    const expectedHash = Buffer.from(row.tokenHash, 'hex');
-    const actualHash = Buffer.from(hash, 'hex');
-    if (expectedHash.length !== actualHash.length || !timingSafeEqual(expectedHash, actualHash)) {
-        throw new TokenVerifyError('invalid');
-    }
     if (row.revoked) throw new TokenVerifyError('revoked');
     if (row.expiresAt !== null && row.expiresAt < Date.now()) throw new TokenVerifyError('expired');
     return { label: row.label, scope: decodeScope(row.scope), expiresAt: row.expiresAt };
 }
 
-export function listTokens(db: Db): TokenRow[] {
+const LIST_TOKENS_DEFAULT_LIMIT = 500;
+const LIST_TOKENS_MAX_LIMIT = 5000;
+
+export function listTokens(db: Db, opts: { limit?: number; offset?: number } = {}): TokenRow[] {
+    const limit = Math.max(1, Math.min(opts.limit ?? LIST_TOKENS_DEFAULT_LIMIT, LIST_TOKENS_MAX_LIMIT));
+    const offset = Math.max(0, opts.offset ?? 0);
     return db
         .prepare(
             `SELECT label, scope, expires_at as expiresAt,
                     CASE revoked WHEN 1 THEN 1 ELSE 0 END as revoked,
                     created_at as createdAt
              FROM vault_tokens
-             ORDER BY created_at DESC`,
+             ORDER BY created_at DESC
+             LIMIT ? OFFSET ?`,
         )
-        .all() as TokenRow[];
+        .all(limit, offset) as TokenRow[];
 }
 
 export function revokeToken(db: Db, label: string): boolean {

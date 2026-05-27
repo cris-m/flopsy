@@ -2,11 +2,7 @@ import { createLogger } from '@flopsy/shared';
 import type { BaseChatModel, CheckpointStore } from 'flopsygraph';
 import type { SkillCatalogEntry } from './skill-scanner';
 
-/**
- * Subset of ChatMessage we read from the checkpoint state. Defined here
- * (rather than imported from flopsygraph's llm types) so the extractor
- * stays decoupled from the message schema — we only need role + content.
- */
+// Local subset (not imported from flopsygraph) so the extractor stays decoupled from its message schema.
 interface ExtractorMessage {
     role?: string;
     content?: unknown;
@@ -32,35 +28,35 @@ const EXTRACTOR_SYSTEM = [
     'Output STRICT JSON matching this shape:',
     '{',
     '  "summary": "1-3 sentences describing what was discussed and the next step.",',
-    '  "skill_proposal": null OR {"name": "kebab-case-name", "description": "one-line capability summary", "when_to_use": "1-2 sentences describing the trigger condition", "body": "markdown body of the SKILL.md (steps, pitfalls, examples)"},',
-    '  "skill_lessons": [{"name": "<exact-existing-skill-name>", "lessons": ["short imperative lesson", "another lesson"]}]',
+    '  "skill_proposal": null OR {"name": "kebab-case-name", "category": "one of: channels|delegation|macos|media|memory|meta|output|productivity|research|security", "description": "one-line capability summary", "when_to_use": "1-2 sentences describing the trigger condition", "body": "markdown body of the SKILL.md (steps, pitfalls, examples)", "confidence": 0.0-1.0},',
+    '  "skill_lessons": [{"name": "<exact-existing-skill-name>", "lessons": ["short imperative lesson", "another lesson"]}],',
+    '  "memory_facts": ["durable fact about the user or their setup worth remembering in future sessions"]',
     '}',
     '',
     'Rules:',
-    '- Propose a skill whenever the transcript contains a reusable procedure with 3+ concrete steps that would help next time. Multi-step workflows, debugging recipes, specific tool sequences, and "I figured out how to X" moments all qualify. Bias toward proposing — a human reviews proposed/ before activation, so over-proposing is cheap.',
+    '- Propose a skill whenever the transcript contains a reusable procedure with 3+ concrete steps that would help next time. Multi-step workflows, debugging recipes, specific tool sequences, and "I figured out how to X" moments all qualify. Bias toward proposing.',
+    '- category (REQUIRED): pick the single best-fit folder — channels|delegation|macos|media|memory|meta|output|productivity|research|security. Every skill is stored at skills/<category>/<name>/, so this must be set. If unsure: data-gathering/web/social → research; documents/files/office → productivity; OS/desktop automation → macos; agent self-operation → meta.',
+    '- confidence: how sure you are this is a genuinely reusable, well-formed procedure that should be active immediately. 0.8+ means the steps are concrete, generalizable, and you would trust them next time with no edits → it activates automatically. Below 0.8 → it is parked for human review. A vague or half-formed idea is 0.3-0.6; a one-off with shaky steps is <0.3.',
     '- Skip skill_proposal (null) only for: pure Q&A with no procedure, casual chat, single-step actions already obvious from tool names, or duplicates of skills already in <existing_skills>.',
     '- skill_lessons appends learnings to skills LISTED in <existing_skills>. Use when the assistant invoked or relied on an existing skill in this session AND learned something the skill author would want to know (e.g. an edge case, a better arg, a pitfall). The `name` MUST exactly match an existing skill name. Empty array if nothing was learned worth appending.',
+    '- memory_facts: stable facts about the user, their environment, preferences, or settled decisions that should persist across sessions (e.g. "Lives in Goma", "Prefers concise replies", "Primary project is Bytepesa"). Skip session-scoped progress, transient state, and anything already obvious. Empty array if nothing durable was learned.',
     '- Never invent. If you didn\'t see it stated, don\'t include it.',
     '- Output JSON ONLY. No commentary. No markdown code fences.',
 ].join('\n');
 
 export interface SessionExtractorConfig {
     readonly model: BaseChatModel;
-    /**
-     * Source of truth for thread messages. Migrated from LearningStore to
-     * flopsygraph's CheckpointStore on 2026-05-08 so the team layer no
-     * longer mirrors messages into learning.db. The latest checkpoint's
-     * `state.messages` is what we extract from — pre-compaction history
-     * lives in older checkpoints (not currently consulted here).
-     */
+    // We extract from the latest checkpoint's state.messages (source of truth for thread messages).
     readonly checkpointer: CheckpointStore;
 }
 
 export interface SkillProposal {
     name: string;
+    category: string;
     description: string;
     when_to_use: string;
     body: string;
+    confidence: number;
 }
 
 export interface SkillLessonAppend {
@@ -72,6 +68,7 @@ export interface ExtractionResult {
     summary: string;
     skill_proposal: SkillProposal | null;
     skill_lessons: SkillLessonAppend[];
+    memory_facts: string[];
 }
 
 export class SessionExtractor {
@@ -86,9 +83,7 @@ export class SessionExtractor {
             closedThreadId,
             { limit: MESSAGE_WINDOW },
         );
-        // Restrict to user/assistant turns — system/tool internals would
-        // otherwise dilute the transcript and leak prompts into the
-        // extraction.
+        // User/assistant turns only — system/tool internals dilute the transcript and leak prompts.
         const messages = rawMessages.filter(
             (m) => m.role === 'user' || m.role === 'assistant',
         );
@@ -156,6 +151,7 @@ export class SessionExtractor {
                 summaryChars: parsed.summary.length,
                 skillProposed: parsed.skill_proposal?.name ?? null,
                 skillLessons: parsed.skill_lessons.length,
+                memoryFacts: parsed.memory_facts.length,
             },
             'session extracted',
         );
@@ -197,11 +193,6 @@ export function hasToolCallSignal(messages: ReadonlyArray<ExtractorMessage>): bo
 
 export const TRIVIAL_SESSION_CHAR_THRESHOLD = MIN_SUBSTANTIVE_CHARS;
 
-/**
- * Extract plain text from a ChatMessage `content` field. Handles the
- * `string | ContentBlock[]` union that flopsygraph's checkpoint state
- * carries; ContentBlock arrays get flattened by joining `.text` blocks.
- */
 function extractText(content: unknown): string {
     if (typeof content === 'string') return content;
     if (Array.isArray(content)) {
@@ -243,13 +234,41 @@ function parseAndValidate(raw: string): ExtractionResult | null {
 
     const skill_proposal = sanitizeSkillProposal(json['skill_proposal']);
     const skill_lessons = sanitizeSkillLessons(json['skill_lessons']);
+    const memory_facts = sanitizeMemoryFacts(json['memory_facts']);
 
-    return { summary, skill_proposal, skill_lessons };
+    return { summary, skill_proposal, skill_lessons, memory_facts };
+}
+
+const MAX_MEMORY_FACT_CHARS = 280;
+
+function sanitizeMemoryFacts(raw: unknown): string[] {
+    if (!Array.isArray(raw)) return [];
+    const out: string[] = [];
+    for (const item of raw) {
+        if (out.length >= MAX_LIST_ITEMS) break;
+        if (typeof item !== 'string') continue;
+        const t = item.trim();
+        if (t.length === 0) continue;
+        out.push(t.slice(0, MAX_MEMORY_FACT_CHARS));
+    }
+    return out;
 }
 
 const SKILL_NAME_RE = /^[a-z][a-z0-9-]{1,63}$/;
 const MAX_SKILL_BODY_CHARS = 8000;
 const MAX_SKILL_LESSON_CHARS = 200;
+
+export const SKILL_CATEGORIES = [
+    'channels', 'delegation', 'macos', 'media', 'memory',
+    'meta', 'output', 'productivity', 'research', 'security',
+] as const;
+// Catch-all for an omitted/invented category — keeps the skill out of the flat root, flags for triage.
+const DEFAULT_SKILL_CATEGORY = 'meta';
+
+function normalizeCategory(raw: unknown): string {
+    const c = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+    return (SKILL_CATEGORIES as readonly string[]).includes(c) ? c : DEFAULT_SKILL_CATEGORY;
+}
 
 function sanitizeSkillProposal(raw: unknown): SkillProposal | null {
     if (!isObject(raw)) return null;
@@ -259,11 +278,15 @@ function sanitizeSkillProposal(raw: unknown): SkillProposal | null {
     const body = typeof raw['body'] === 'string' ? raw['body'].trim() : '';
     if (!name || !description || !when_to_use || !body) return null;
     if (!SKILL_NAME_RE.test(name)) return null;
+    const rawConfidence = typeof raw['confidence'] === 'number' ? raw['confidence'] : 0;
+    const confidence = Number.isFinite(rawConfidence) ? Math.min(1, Math.max(0, rawConfidence)) : 0;
     return {
         name,
+        category: normalizeCategory(raw['category']),
         description: description.slice(0, 240),
         when_to_use: when_to_use.slice(0, 480),
         body: body.slice(0, MAX_SKILL_BODY_CHARS),
+        confidence,
     };
 }
 

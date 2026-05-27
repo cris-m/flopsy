@@ -8,9 +8,9 @@ const DEFAULT_IDLE_MINUTES = 24 * 60;       // 24h idle = new session
 
 const SESSION_SEPARATOR = '#';
 
-export type ResetMode = 'none' | 'daily' | 'idle' | 'both';
+type ResetMode = 'none' | 'daily' | 'idle' | 'both';
 
-export interface SessionResetPolicy {
+interface SessionResetPolicy {
     /**
      * Which rotation triggers are active. Default 'both' (daily AND idle).
      * 'none' disables rotation — sessions live forever (debug only).
@@ -22,13 +22,13 @@ export interface SessionResetPolicy {
     idleMinutes?: number;
 }
 
-export interface ResolveOptions {
+interface ResolveOptions {
     source: SessionSource;
     /** True when triggered by /new — force a new session even if current is fresh. */
     force?: boolean;
 }
 
-export interface ResolveResult {
+interface ResolveResult {
     /** `<peer_id>#<session_id>` — what handler/checkpointer should use. */
     threadId: string;
     peerId: string;

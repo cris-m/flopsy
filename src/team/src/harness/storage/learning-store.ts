@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
-import { chmodSync, realpathSync } from 'fs';
-import { dirname, resolve } from 'path';
+import { randomBytes } from 'node:crypto';
+import { chmodSync, realpathSync, readFileSync, writeFileSync, renameSync } from 'fs';
+import { dirname, join, resolve } from 'path';
 import { createLogger, resolveFlopsyHome, resolveWorkspacePath, ensureDir } from '@flopsy/shared';
 
 const log = createLogger('learning-store');
@@ -8,6 +9,10 @@ const log = createLogger('learning-store');
 /** Current schema version. Bump when adding new tables or columns,
  *  AND add a corresponding entry to MIGRATIONS for the upgrade path. */
 const SCHEMA_VERSION = 4;
+
+// A restart-interrupted turn is worth auto-resuming only if the user returns within
+// this window; older flags are treated as stale (no surprise "continuing…" days later).
+const RESUME_PENDING_TTL_MS = 30 * 60 * 1000;
 
 /**
  * One ordered migration step. `fromVersion` is the schema version applied AGAINST.
@@ -165,6 +170,7 @@ export interface SessionGoalRow {
     lastReason: string | null;
     channelName: string;
     peerId: string;
+    subgoals: string[];
 }
 
 interface DbSessionGoalRow {
@@ -180,6 +186,7 @@ interface DbSessionGoalRow {
     last_reason: string | null;
     channel_name: string;
     peer_id: string;
+    subgoals: string;
 }
 
 /** Rolled-up activity for `flopsy team activity`. */
@@ -245,43 +252,6 @@ export interface ProactiveDecisionRow {
  * Inferred follow-up commitment. States: pending | delivered | dismissed | expired.
  * Always thread-bound; scope carries `agentId:channel:peerId`.
  */
-export interface ProactiveCommitmentRow {
-    /** SQLite auto-increment id. Required when surfacing — the agent
-     * includes it in `reportedIds.commitments[]` to mark delivered. */
-    id: number;
-    peerId: string;
-    /** Comma-joined `<agentId>:<channelName>:<peerId>` — the strict scope. */
-    scope: string;
-    channel: string;
-    agentId: string;
-    /** One-sentence check-in lead the proactive fire will surface. */
-    followUp: string;
-    dueAtMs: number;
-    /** Extractor's confidence — only rows ≥ 0.7 should be recorded. */
-    confidence: number;
-    /** Optional thread/turn id the extractor pulled this from (for audit). */
-    sourceTurnId: string | null;
-    status: 'pending' | 'delivered' | 'dismissed' | 'expired';
-    createdAt: number;
-    /** When status flipped to delivered/dismissed/expired. */
-    resolvedAt: number | null;
-}
-
-interface DbProactiveCommitmentRow {
-    id: number;
-    peer_id: string;
-    scope: string;
-    channel: string;
-    agent_id: string;
-    follow_up: string;
-    due_at_ms: number;
-    confidence: number;
-    source_turn_id: string | null;
-    status: 'pending' | 'delivered' | 'dismissed' | 'expired';
-    created_at: number;
-    resolved_at: number | null;
-}
-
 interface DbProactiveDecisionRow {
     id: number;
     peer_id: string;
@@ -343,7 +313,6 @@ export class LearningStore {
         this.dropLegacyMessageTables();
         // Idempotent additive tables (no SCHEMA_VERSION bump required).
         this.ensureProactiveDecisionsTable();
-        this.ensureProactiveCommitmentsTable();
         log.info({ path: this.dbPath, version: SCHEMA_VERSION }, 'LearningStore ready');
     }
 
@@ -683,6 +652,58 @@ export class LearningStore {
             )
             .get(peerId) as DbSessionRow | undefined;
         return r ? rowToSession(r) : null;
+    }
+
+    // ── Resume-on-restart (file sidecar, not the DB) ──────────────────────────
+    // A peer is flagged while a turn is in-flight (mark at turn start, clear at a
+    // non-aborted turn end). If the process dies mid-turn — a restart — the clear
+    // never runs, so the flag survives and the next message resumes the task.
+    private resumePendingPath(): string {
+        return join(dirname(this.dbPath), 'resume-pending.json');
+    }
+    private readResumePending(): Record<string, number> {
+        try {
+            const data = JSON.parse(readFileSync(this.resumePendingPath(), 'utf-8'));
+            return typeof data === 'object' && data !== null ? (data as Record<string, number>) : {};
+        } catch {
+            return {};
+        }
+    }
+    private writeResumePending(map: Record<string, number>): void {
+        const dest = this.resumePendingPath();
+        const tmp = `${dest}.${randomBytes(4).toString('hex')}.tmp`;
+        try {
+            writeFileSync(tmp, JSON.stringify(map), 'utf-8');
+            renameSync(tmp, dest);
+        } catch (err) {
+            log.debug({ err }, 'resume-pending write failed (non-fatal)');
+        }
+    }
+    markResumePending(peerId: string): void {
+        const m = this.readResumePending();
+        m[peerId] = Date.now();
+        this.writeResumePending(m);
+    }
+    /** True iff a turn for this peer was interrupted recently (within the resume window). */
+    isResumePending(peerId: string): boolean {
+        const at = this.readResumePending()[peerId];
+        return at != null && Date.now() - at < RESUME_PENDING_TTL_MS;
+    }
+    clearResumePending(peerId: string): void {
+        const m = this.readResumePending();
+        if (peerId in m) {
+            delete m[peerId];
+            this.writeResumePending(m);
+        }
+    }
+
+    // Most-recently-active peer across all channels — used by the shutdown notice
+    // to reach "the last channel" the user was talking on.
+    getMostRecentPeer(): { peerId: string; channel: string } | null {
+        const r = this.db
+            .prepare(`SELECT peer_id, channel FROM peers ORDER BY last_active_at DESC LIMIT 1`)
+            .get() as { peer_id: string; channel: string } | undefined;
+        return r ? { peerId: r.peer_id, channel: r.channel } : null;
     }
 
     closeSession(sessionId: string, reason: SessionCloseReason, closedAt: number = Date.now()): void {
@@ -1129,8 +1150,8 @@ export class LearningStore {
                     `INSERT INTO session_goals
                        (thread_id, goal, status, turns_used, max_turns,
                         parse_failures, created_at, last_turn_at,
-                        last_verdict, last_reason, channel_name, peer_id)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        last_verdict, last_reason, channel_name, peer_id, subgoals)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT(thread_id) DO UPDATE SET
                        goal           = excluded.goal,
                        status         = excluded.status,
@@ -1141,7 +1162,8 @@ export class LearningStore {
                        last_verdict   = excluded.last_verdict,
                        last_reason    = excluded.last_reason,
                        channel_name   = excluded.channel_name,
-                       peer_id        = excluded.peer_id`,
+                       peer_id        = excluded.peer_id,
+                       subgoals       = excluded.subgoals`,
                 )
                 .run(
                     row.threadId,
@@ -1156,6 +1178,7 @@ export class LearningStore {
                     row.lastReason,
                     row.channelName,
                     row.peerId,
+                    JSON.stringify(row.subgoals ?? []),
                 );
         });
     }
@@ -1163,7 +1186,7 @@ export class LearningStore {
     patchSessionGoal(
         threadId: string,
         patch: Partial<Pick<SessionGoalRow,
-            'status' | 'turnsUsed' | 'parseFailures' | 'lastTurnAt' | 'lastVerdict' | 'lastReason'>>,
+            'status' | 'turnsUsed' | 'parseFailures' | 'lastTurnAt' | 'lastVerdict' | 'lastReason' | 'subgoals'>>,
     ): void {
         const sets: string[] = [];
         const values: (string | number | null)[] = [];
@@ -1173,6 +1196,7 @@ export class LearningStore {
         if (patch.lastTurnAt !== undefined) { sets.push('last_turn_at = ?'); values.push(patch.lastTurnAt); }
         if (patch.lastVerdict !== undefined) { sets.push('last_verdict = ?'); values.push(patch.lastVerdict); }
         if (patch.lastReason !== undefined) { sets.push('last_reason = ?'); values.push(patch.lastReason); }
+        if (patch.subgoals !== undefined) { sets.push('subgoals = ?'); values.push(JSON.stringify(patch.subgoals)); }
         if (sets.length === 0) return;
         this.runWrite(() => {
             this.db
@@ -1294,147 +1318,54 @@ export class LearningStore {
     `);
     }
 
-    /** Separate from proactive_decisions; commitments have their own lifecycle. */
-    private ensureProactiveCommitmentsTable(): void {
-        this.db.exec(`
-      CREATE TABLE IF NOT EXISTS proactive_commitments (
-        id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        peer_id         TEXT    NOT NULL,
-        scope           TEXT    NOT NULL,
-        channel         TEXT    NOT NULL,
-        agent_id        TEXT    NOT NULL,
-        follow_up       TEXT    NOT NULL,
-        due_at_ms       INTEGER NOT NULL,
-        confidence      REAL    NOT NULL,
-        source_turn_id  TEXT,
-        status          TEXT    NOT NULL DEFAULT 'pending',
-        created_at      INTEGER NOT NULL,
-        resolved_at     INTEGER
-      );
-      CREATE INDEX IF NOT EXISTS idx_pc_due
-        ON proactive_commitments(status, due_at_ms);
-      CREATE INDEX IF NOT EXISTS idx_pc_scope_due
-        ON proactive_commitments(scope, status, due_at_ms);
-      CREATE INDEX IF NOT EXISTS idx_pc_peer_created
-        ON proactive_commitments(peer_id, created_at DESC);
-    `);
-    }
-
-    /** Best-effort insert; returns auto-increment id. */
-    recordCommitment(
-        row: Omit<ProactiveCommitmentRow, 'id' | 'createdAt' | 'resolvedAt' | 'status'> & {
-            createdAt?: number;
-            status?: ProactiveCommitmentRow['status'];
-        },
-    ): number {
-        const createdAt = row.createdAt ?? Date.now();
-        const status: ProactiveCommitmentRow['status'] = row.status ?? 'pending';
-        const result = this.db
+    /**
+     * Aggregate harness telemetry for the last `windowMs`. Single round-trip
+     * shape consumed by the management endpoint + `flopsy status --harness`.
+     * Cheap: 3 indexed scans, capped result sets.
+     */
+    getHarnessActivity(windowMs: number = 24 * 60 * 60 * 1000): {
+        windowMs: number;
+        proactive: { delivered: number; suppressed: number; errored: number };
+        topToolFailures: ReadonlyArray<{ toolName: string; errorPattern: string; count: number; lastSeen: number }>;
+    } {
+        const since = Date.now() - Math.max(60_000, windowMs);
+        const proactiveRows = this.db
             .prepare(
-                `INSERT INTO proactive_commitments
-                   (peer_id, scope, channel, agent_id, follow_up,
-                    due_at_ms, confidence, source_turn_id, status,
-                    created_at, resolved_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+                `SELECT delivered, silence_reason FROM proactive_decisions WHERE fired_at >= ?`,
             )
-            .run(
-                row.peerId,
-                row.scope,
-                row.channel,
-                row.agentId,
-                row.followUp,
-                row.dueAtMs,
-                row.confidence,
-                row.sourceTurnId ?? null,
-                status,
-                createdAt,
-            );
-        this.onWrite();
-        return Number(result.lastInsertRowid);
-    }
-
-    /** Read by `peer_id` (channel-agnostic) so commitments surface regardless of fire channel. */
-    listDueCommitments(peerId: string, nowMs: number, limit = 5): ProactiveCommitmentRow[] {
-        const rows = this.db
+            .all(since) as Array<{ delivered: number; silence_reason: string | null }>;
+        let delivered = 0;
+        let suppressed = 0;
+        let errored = 0;
+        for (const r of proactiveRows) {
+            if (r.delivered === 1) delivered++;
+            else if (r.silence_reason === 'error') errored++;
+            else suppressed++;
+        }
+        const toolRows = this.db
             .prepare(
-                `SELECT * FROM proactive_commitments
-                  WHERE peer_id = ?
-                    AND status = 'pending'
-                    AND due_at_ms <= ?
-                  ORDER BY due_at_ms ASC
-                  LIMIT ?`,
+                `SELECT tool_name, error_pattern, count, last_seen
+                   FROM tool_failures
+                  WHERE last_seen >= ?
+                  ORDER BY count DESC, last_seen DESC
+                  LIMIT 5`,
             )
-            .all(peerId, nowMs, limit) as DbProactiveCommitmentRow[];
-        return rows.map((r) => ({
-            id: r.id,
-            peerId: r.peer_id,
-            scope: r.scope,
-            channel: r.channel,
-            agentId: r.agent_id,
-            followUp: r.follow_up,
-            dueAtMs: r.due_at_ms,
-            confidence: r.confidence,
-            sourceTurnId: r.source_turn_id,
-            status: r.status,
-            createdAt: r.created_at,
-            resolvedAt: r.resolved_at,
-        }));
-    }
-
-    /** Flip status. Used by the executor and `flopsy commitments dismiss`. */
-    resolveCommitment(
-        id: number,
-        status: 'delivered' | 'dismissed' | 'expired',
-        nowMs = Date.now(),
-    ): boolean {
-        const result = this.db
-            .prepare(
-                `UPDATE proactive_commitments
-                    SET status = ?, resolved_at = ?
-                  WHERE id = ? AND status = 'pending'`,
-            )
-            .run(status, nowMs, id);
-        if (result.changes > 0) this.onWrite();
-        return result.changes > 0;
-    }
-
-    /** Daily-budget guard for the extractor. Counts pending+delivered only. */
-    countCommitmentsCreatedSince(peerId: string, sinceMs: number): number {
-        const row = this.db
-            .prepare(
-                `SELECT COUNT(*) as n FROM proactive_commitments
-                  WHERE peer_id = ?
-                    AND created_at >= ?
-                    AND status IN ('pending', 'delivered')`,
-            )
-            .get(peerId, sinceMs) as { n: number } | undefined;
-        return row?.n ?? 0;
-    }
-
-    /** Operator-facing list — used by `flopsy commitments list` CLI. */
-    listCommitmentsForPeer(peerId: string, limit = 20): ProactiveCommitmentRow[] {
-        const rows = this.db
-            .prepare(
-                `SELECT * FROM proactive_commitments
-                  WHERE peer_id = ?
-                  ORDER BY created_at DESC
-                  LIMIT ?`,
-            )
-            .all(peerId, limit) as DbProactiveCommitmentRow[];
-        return rows.map((r) => ({
-            id: r.id,
-            peerId: r.peer_id,
-            scope: r.scope,
-            channel: r.channel,
-            agentId: r.agent_id,
-            followUp: r.follow_up,
-            dueAtMs: r.due_at_ms,
-            confidence: r.confidence,
-            sourceTurnId: r.source_turn_id,
-            status: r.status,
-            createdAt: r.created_at,
-            resolvedAt: r.resolved_at,
-        }));
+            .all(since) as Array<{
+            tool_name: string;
+            error_pattern: string;
+            count: number;
+            last_seen: number;
+        }>;
+        return {
+            windowMs,
+            proactive: { delivered, suppressed, errored },
+            topToolFailures: toolRows.map((r) => ({
+                toolName: r.tool_name,
+                errorPattern: r.error_pattern,
+                count: r.count,
+                lastSeen: r.last_seen,
+            })),
+        };
     }
 
     clearToolFailuresFor(peerId: string, toolName: string): number {
@@ -1445,27 +1376,6 @@ export class LearningStore {
                 .run(peerId, toolName).changes;
         });
         return changes;
-    }
-
-    listRecentDismissedFollowUps(
-        peerId: string,
-        options: { limit?: number; windowMs?: number } = {},
-    ): ReadonlyArray<{ followUp: string; resolvedAt: number | null }> {
-        const limit = Math.max(1, Math.min(options.limit ?? 10, 50));
-        const windowMs = options.windowMs ?? 30 * 24 * 60 * 60 * 1000;
-        const since = Date.now() - windowMs;
-        const rows = this.db
-            .prepare(
-                `SELECT follow_up, resolved_at
-                   FROM proactive_commitments
-                  WHERE peer_id = ?
-                    AND status = 'dismissed'
-                    AND coalesce(resolved_at, created_at) >= ?
-                  ORDER BY coalesce(resolved_at, created_at) DESC
-                  LIMIT ?`,
-            )
-            .all(peerId, since, limit) as Array<{ follow_up: string; resolved_at: number | null }>;
-        return rows.map((r) => ({ followUp: r.follow_up, resolvedAt: r.resolved_at }));
     }
 
     /** Insert one row per fire. Best-effort — callers should swallow errors. */
@@ -1539,6 +1449,22 @@ export class LearningStore {
             )
             .all(peerId, since, limit) as DbProactiveDecisionRow[];
         return rows.map(rowToProactiveDecision);
+    }
+
+    // Proactive engagement (delivered + replied) across ALL peers in a window — global, not peer-scoped,
+    // because the `proactive` skill is shared. Used by the skill-edit validation gate.
+    getProactiveEngagement(
+        sinceMs: number,
+        untilMs: number = Date.now(),
+    ): { delivered: number; replied: number } {
+        const row = this.db
+            .prepare(
+                `SELECT COUNT(*) AS delivered, COALESCE(SUM(user_responded), 0) AS replied
+                   FROM proactive_decisions
+                  WHERE delivered = 1 AND fired_at >= ? AND fired_at <= ?`,
+            )
+            .get(sinceMs, untilMs) as { delivered: number; replied: number } | undefined;
+        return { delivered: row?.delivered ?? 0, replied: row?.replied ?? 0 };
     }
 
     private applyInitialSchema(): void {
@@ -1655,7 +1581,8 @@ export class LearningStore {
         last_verdict   TEXT,
         last_reason    TEXT,
         channel_name   TEXT    NOT NULL,
-        peer_id        TEXT    NOT NULL
+        peer_id        TEXT    NOT NULL,
+        subgoals       TEXT    NOT NULL DEFAULT '[]'
       );
       CREATE INDEX IF NOT EXISTS idx_session_goals_active
         ON session_goals(status, last_turn_at);
@@ -1748,6 +1675,11 @@ function rowToBackgroundTask(r: DbBackgroundTaskRow): BackgroundTaskRow {
 }
 
 function rowToSessionGoal(r: DbSessionGoalRow): SessionGoalRow {
+    let subgoals: string[] = [];
+    try {
+        const parsed = JSON.parse(r.subgoals ?? '[]');
+        if (Array.isArray(parsed)) subgoals = parsed.filter((x): x is string => typeof x === 'string');
+    } catch { subgoals = []; }
     return {
         threadId: r.thread_id,
         goal: r.goal,
@@ -1761,6 +1693,7 @@ function rowToSessionGoal(r: DbSessionGoalRow): SessionGoalRow {
         lastReason: r.last_reason,
         channelName: r.channel_name,
         peerId: r.peer_id,
+        subgoals,
     };
 }
 
@@ -1818,7 +1751,7 @@ function rowToSession(r: DbSessionRow): SessionRow {
 /** Sortable id `s-<unix-day>-<7-hex>` (ORDER BY session_id naturally orders by date). */
 function generateSessionId(): string {
     const dayNum = Math.floor(Date.now() / 86_400_000);
-    const suffix = Math.floor(Math.random() * 0xfffffff).toString(16).padStart(7, '0');
+    const suffix = randomBytes(4).toString('hex').slice(0, 7);
     return `s-${dayNum}-${suffix}`;
 }
 

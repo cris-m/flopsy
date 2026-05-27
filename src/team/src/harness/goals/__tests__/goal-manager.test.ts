@@ -197,4 +197,150 @@ describe('GoalManager', () => {
         expect(Date.now() - start).toBeLessThan(7_000);
         vi.restoreAllMocks();
     }, 8_000);
+
+    describe('notification messages (Hermes parity)', () => {
+        it('emits "✓ Goal achieved: <reason>" on done', async () => {
+            const mgr = makeManager(
+                asModel(new FakeModel(async () => '{"done":true,"reason":"shipped the deploy script"}')),
+            );
+            mgr.set({ threadId: 'tn1', channelName: 'chat', peerId: 'chat:u1', goal: 'ship it' });
+            const result = await mgr.maybeContinue({ threadId: 'tn1', agentReply: 'done' });
+            expect(result?.notificationKind).toBe('done');
+            expect(result?.notificationMessage).toBe('✓ Goal achieved: shipped the deploy script');
+        });
+
+        it('emits "↻ Continuing toward goal (N/MAX): <reason>" on continue', async () => {
+            const mgr = makeManager(
+                asModel(new FakeModel(async () => '{"done":false,"reason":"still 2 files to go"}')),
+                { maxTurns: 5 },
+            );
+            mgr.set({ threadId: 'tn2', channelName: 'chat', peerId: 'chat:u1', goal: 'write 4 files' });
+            const result = await mgr.maybeContinue({ threadId: 'tn2', agentReply: 'wrote 2' });
+            expect(result?.notificationKind).toBe('continuing');
+            expect(result?.notificationMessage).toBe('↻ Continuing toward goal (1/5): still 2 files to go');
+        });
+
+        it('emits "⏸ Goal paused — N/MAX turns used..." on budget exhaustion', async () => {
+            const mgr = makeManager(
+                asModel(new FakeModel(async () => '{"done":false,"reason":"more work"}')),
+                { maxTurns: 1 },
+            );
+            mgr.set({ threadId: 'tn3', channelName: 'chat', peerId: 'chat:u1', goal: 'do it' });
+            await mgr.maybeContinue({ threadId: 'tn3', agentReply: 'try 1' });
+            const result = await mgr.maybeContinue({ threadId: 'tn3', agentReply: 'try 2' });
+            expect(result?.notificationKind).toBe('budget');
+            expect(result?.notificationMessage).toContain('⏸ Goal paused');
+            expect(result?.notificationMessage).toContain('1/1 turns used');
+            expect(result?.notificationMessage).toContain('/goal resume');
+        });
+
+        it('emits "⏸ Goal paused — judge model..." after consecutive parse failures', async () => {
+            const mgr = makeManager(
+                asModel(new FakeModel(async () => 'not json at all')),
+                { maxConsecutiveParseFailures: 2 },
+            );
+            mgr.set({ threadId: 'tn4', channelName: 'chat', peerId: 'chat:u1', goal: 'do it' });
+            await mgr.maybeContinue({ threadId: 'tn4', agentReply: 'r1' });
+            const result = await mgr.maybeContinue({ threadId: 'tn4', agentReply: 'r2' });
+            expect(result?.notificationKind).toBe('parse_failures');
+            expect(result?.notificationMessage).toContain('⏸ Goal paused');
+            expect(result?.notificationMessage).toContain("isn't returning the required JSON verdict");
+            expect(result?.notificationMessage).toContain('/goal resume');
+        });
+
+        it('does NOT emit a notification when there is no active goal', async () => {
+            const mgr = makeManager(asModel(new FakeModel(async () => '{"done":true,"reason":"x"}')));
+            const result = await mgr.maybeContinue({ threadId: 'tn-none', agentReply: 'r' });
+            expect(result).toBeNull();
+        });
+    });
+
+    describe('subgoals (Hermes /subgoal parity)', () => {
+        it('adds a subgoal to an active goal and persists', () => {
+            const mgr = makeManager(asModel(new FakeModel(async () => '{"done":false,"reason":""}')));
+            mgr.set({ threadId: 'sg1', channelName: 'chat', peerId: 'chat:u1', goal: 'ship feature' });
+            const updated = mgr.addSubgoal('sg1', '  include the migration guide  ');
+            expect(updated.subgoals).toEqual(['include the migration guide']);
+            const reloaded = mgr.get('sg1');
+            expect(reloaded?.subgoals).toEqual(['include the migration guide']);
+        });
+
+        it('refuses empty / too-long subgoals', () => {
+            const mgr = makeManager(asModel(new FakeModel(async () => '{"done":false,"reason":""}')));
+            mgr.set({ threadId: 'sg2', channelName: 'chat', peerId: 'chat:u1', goal: 'ship feature' });
+            expect(() => mgr.addSubgoal('sg2', '   ')).toThrow(/empty/);
+            expect(() => mgr.addSubgoal('sg2', 'x'.repeat(401))).toThrow(/too long/);
+        });
+
+        it('refuses subgoals on a non-active goal', () => {
+            const mgr = makeManager(asModel(new FakeModel(async () => '{"done":false,"reason":""}')));
+            mgr.set({ threadId: 'sg3', channelName: 'chat', peerId: 'chat:u1', goal: 'g' });
+            mgr.pause('sg3');
+            expect(() => mgr.addSubgoal('sg3', 'extra')).toThrow(/paused/);
+        });
+
+        it('removes a subgoal by 1-based index', () => {
+            const mgr = makeManager(asModel(new FakeModel(async () => '{"done":false,"reason":""}')));
+            mgr.set({ threadId: 'sg4', channelName: 'chat', peerId: 'chat:u1', goal: 'g' });
+            mgr.addSubgoal('sg4', 'first');
+            mgr.addSubgoal('sg4', 'second');
+            mgr.addSubgoal('sg4', 'third');
+            const { removed, remaining } = mgr.removeSubgoal('sg4', 2);
+            expect(removed).toBe('second');
+            expect(remaining).toBe(2);
+            expect(mgr.get('sg4')?.subgoals).toEqual(['first', 'third']);
+        });
+
+        it('throws on out-of-range remove index', () => {
+            const mgr = makeManager(asModel(new FakeModel(async () => '{"done":false,"reason":""}')));
+            mgr.set({ threadId: 'sg5', channelName: 'chat', peerId: 'chat:u1', goal: 'g' });
+            mgr.addSubgoal('sg5', 'only');
+            expect(() => mgr.removeSubgoal('sg5', 0)).toThrow(/out of range/);
+            expect(() => mgr.removeSubgoal('sg5', 5)).toThrow(/out of range/);
+        });
+
+        it('clears all subgoals and returns previous count', () => {
+            const mgr = makeManager(asModel(new FakeModel(async () => '{"done":false,"reason":""}')));
+            mgr.set({ threadId: 'sg6', channelName: 'chat', peerId: 'chat:u1', goal: 'g' });
+            mgr.addSubgoal('sg6', 'a');
+            mgr.addSubgoal('sg6', 'b');
+            expect(mgr.clearSubgoals('sg6')).toBe(2);
+            expect(mgr.get('sg6')?.subgoals).toEqual([]);
+            expect(mgr.clearSubgoals('sg6')).toBe(0);
+        });
+
+        it('continuationPrompt includes subgoals block when subgoals exist', () => {
+            const mgr = makeManager(asModel(new FakeModel(async () => '{"done":false,"reason":""}')));
+            const withoutSubs = mgr.continuationPrompt('ship X');
+            expect(withoutSubs).not.toContain('Additional criteria');
+            const withSubs = mgr.continuationPrompt('ship X', ['add tests', 'update docs']);
+            expect(withSubs).toContain('Additional criteria');
+            expect(withSubs).toContain('- 1. add tests');
+            expect(withSubs).toContain('- 2. update docs');
+        });
+
+        it('judge factors subgoals into its prompt', async () => {
+            let capturedPrompt = '';
+            const fake = new FakeModel(async (msgs) => {
+                capturedPrompt = String((msgs[msgs.length - 1] as { content: string }).content);
+                return '{"done":false,"reason":"test"}';
+            });
+            const mgr = makeManager(asModel(fake));
+            await mgr.judge('ship X', 'I shipped X', ['add tests', 'update docs']);
+            expect(capturedPrompt).toContain('Additional criteria');
+            expect(capturedPrompt).toContain('add tests');
+            expect(capturedPrompt).toContain('update docs');
+            expect(capturedPrompt).toContain('For each numbered criterion');
+        });
+
+        it('renderSubgoals returns helpful messages on empty / no-goal', () => {
+            const mgr = makeManager(asModel(new FakeModel(async () => '{"done":false,"reason":""}')));
+            expect(mgr.renderSubgoals('nonexistent')).toBe('(no active goal)');
+            mgr.set({ threadId: 'sg7', channelName: 'chat', peerId: 'chat:u1', goal: 'g' });
+            expect(mgr.renderSubgoals('sg7')).toContain('no subgoals');
+            mgr.addSubgoal('sg7', 'first');
+            const rendered = mgr.renderSubgoals('sg7');
+            expect(rendered).toContain('- 1. first');
+        });
+    });
 });

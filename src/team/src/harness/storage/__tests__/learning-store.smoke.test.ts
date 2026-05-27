@@ -1,7 +1,7 @@
 /**
  * LearningStore smoke tests — covers session lifecycle and tool-failure
  * tracking. Per-peer agent memory (profile / notes / directives) was moved
- * to the unified BaseStore (memory.db); see SqliteMemoryStore tests.
+ * to the unified BaseStore (memory.db); see SqliteMemoryProvider tests.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'fs';

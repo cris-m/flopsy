@@ -58,6 +58,30 @@ export interface BackgroundTaskEvent {
     readonly completedAt: number;
     /** Set for internal worker tasks so ChannelWorker can use <task-notification> format. */
     readonly workerName?: string;
+    /**
+     * Last assistant text the worker produced before failing/timing-out.
+     * Surface for task_error events so the parent agent can recover useful
+     * work — claude-code's extractPartialResult pattern.
+     */
+    readonly partialResult?: string;
+}
+
+/**
+ * Error thrown by SubAgentRunner implementations when the underlying
+ * sub-agent invocation fails BUT the runner was able to recover an
+ * in-flight assistant text (e.g. from a checkpoint snapshot). The catch
+ * block in `runInBackground` reads `.partialResult` and forwards it on
+ * the task_error event.
+ */
+export class PartialResultError extends Error {
+    readonly partialResult: string | undefined;
+    readonly cause: unknown;
+    constructor(cause: unknown, partialResult: string | undefined) {
+        super(cause instanceof Error ? cause.message : String(cause));
+        this.name = 'PartialResultError';
+        this.partialResult = partialResult;
+        this.cause = cause;
+    }
 }
 
 /** Implementations MUST honour `signal` for cancellation. */
@@ -99,7 +123,7 @@ const schema = z.object({
         .string()
         .min(1)
         .describe(
-            'Teammate role to delegate to (e.g. "legolas", "gimli"). Must be a configured worker.',
+            'Teammate to delegate to — name from your team roster in the system prompt.',
         ),
     task: z
         .string()
@@ -144,29 +168,22 @@ type SpawnArgs = Omit<z.infer<typeof schema>, 'tools' | 'timeoutMs'> & {
 export const spawnBackgroundTaskTool = defineTool({
     name: 'spawn_background_task',
     description: [
-        'Start a long-running task in the background and return IMMEDIATELY. You\'ll be notified via a system task-notification message when it completes; multiple spawns run in parallel.',
-        'Use this when the task takes longer than ~2 minutes OR when the user shouldn\'t wait. For quick work you need before replying, use delegate_task instead.',
+        'Start a long-running task in the background and return immediately. A task-notification arrives when it completes; spawns run in parallel. Default timeoutMs 1800000 (30 min), max 7200000 (2 h). For work under ~2 minutes use delegate_task instead.',
         '',
-        'Pick the worker:',
-        '  - "saruman"  — deep multi-round research with citations. Default for "state of X", multi-angle briefs, contradiction-surfacing. 3–15 min.',
-        '  - "legolas"  — quick web scout (<30s). Use when stacking many independent lookups in parallel.',
-        '  - "gimli"    — analysis of large structured inputs.',
+        'Targets:',
+        '  worker — pick from the `## Your Team` table in your system prompt (single source of truth). NEVER guess a name not listed there.',
         '',
-        'Examples: "state of post-quantum crypto" → saruman. "compare LangGraph vs CrewAI vs AutoGen" → saruman (one worker, multi-angle). "what changed in the Rust 2027 edition?" → legolas. "review this 200-line config" → gimli.',
+        'Behaviour:',
+        '  - suits research briefs and anything over ~2 min.',
+        '  - teammate has no conversation memory — pack angles, source hints, claims to fact-check, output shape into the task string.',
+        '  - workers may delegate further; max depth 3, loops blocked.',
+        '  - spawn multiple in one turn when topics are independent. Don\'t serialise independent work.',
+        '  - call send_message right after spawning to tell the user it started.',
         '',
-        'Spawn multiple in the same turn when topics are independent (e.g., "research X for plan A AND check Y for plan B"). Don\'t serialize independent work.',
-        'Right after spawning, call send_message to tell the user it has started.',
-        '',
-        'The teammate has NO memory of the conversation — pack into the task string: angles, source hints, claims to fact-check, output shape. The teammate CAN delegate further if the task crosses domains (max depth = 3, loops are blocked).',
-        '',
-        'Example call:',
-        '  {',
-        '    "worker": "saruman",',
-        '    "task": "Brief on the post-quantum crypto landscape, 5 angles, primary sources only.",',
-        '    "tools": ["web_search", "web_extract"],',
-        '    "description": "PQ crypto landscape brief",',
-        '    "timeoutMs": 600000',
-        '  }',
+        'Style (apply when the notification arrives):',
+        '  - require an inline canonical URL for every non-trivial factual claim. Surface URLs when relaying; don\'t strip them.',
+        '  - for multi-source briefs, ask the worker to surface contradictions rather than pick one silently.',
+        '  - relay as "Worker reports X" until you have verified the claim yourself.',
     ].join('\n'),
     schema,
     execute: async (args, ctx) => {
@@ -315,12 +332,15 @@ function launch(
     });
 
     // Aborts the whole controller so the runner's LLM call sees signal.aborted.
+    // The `reason` flows through to AbortSignal.reason, letting the catch block
+    // distinguish a deadline-driven kill from a network failure that happens to
+    // also surface as an AbortError.
     const timeoutTimer = setTimeout(() => {
         logger?.warn?.(
             { taskId: task.id, worker: args.worker, timeoutMs },
             'spawn_background_task: ceiling reached, aborting',
         );
-        task.abortPair?.whole.abort();
+        task.abortPair?.whole.abort({ kind: 'task_timeout', timeoutMs });
     }, timeoutMs);
 
     void runInBackground({
@@ -446,8 +466,38 @@ async function runInBackground(args: {
         logger?.info?.({ taskId, durationMs: Date.now() - startedAt, outputFile: outputFile ?? null }, 'spawn: completed');
     } catch (err) {
         const aborted = args.abortSignal.aborted;
+        const reason = aborted ? args.abortSignal.reason : undefined;
+        const isTaskTimeout =
+            !!reason &&
+            typeof reason === 'object' &&
+            (reason as { kind?: unknown }).kind === 'task_timeout';
+
         const status: 'failed' | 'killed' = aborted ? 'killed' : 'failed';
-        const message = err instanceof Error ? err.message : String(err);
+        const durationMs = Date.now() - startedAt;
+        const isPartial = err instanceof PartialResultError;
+        const partialResult = isPartial ? err.partialResult : undefined;
+        const rawErr = isPartial ? err.cause : err;
+        const rawMessage = rawErr instanceof Error ? rawErr.message : String(rawErr);
+
+        // Surface a timeout-shaped message when the spawn deadline fired so the
+        // main agent's wake-up turn can react to "timed out" rather than the
+        // opaque "fetch aborted" surface error. Mirrors claude-code's killed-vs-
+        // failed split — same data, just labeled at the source.
+        let message: string;
+        if (isTaskTimeout) {
+            const cfgMs = (reason as { timeoutMs?: unknown }).timeoutMs;
+            const cfgSec =
+                typeof cfgMs === 'number' && Number.isFinite(cfgMs)
+                    ? Math.round(cfgMs / 1000)
+                    : undefined;
+            const ranSec = Math.round(durationMs / 1000);
+            message =
+                cfgSec !== undefined
+                    ? `Task timed out after ${ranSec}s (configured ceiling: ${cfgSec}s). Worker '${workerName}' did not return a result in time.`
+                    : `Task timed out after ${ranSec}s. Worker '${workerName}' did not return a result in time.`;
+        } else {
+            message = rawMessage;
+        }
 
         const current = registry.get(taskId);
         if (current) {
@@ -463,9 +513,18 @@ async function runInBackground(args: {
             error: message,
             completedAt: Date.now(),
             workerName,
+            ...(partialResult ? { partialResult } : {}),
         });
         logger?.warn?.(
-            { taskId, durationMs: Date.now() - startedAt, err: message, aborted },
+            {
+                taskId,
+                durationMs,
+                err: message,
+                rawErr: rawMessage,
+                aborted,
+                isTaskTimeout,
+                partialResultChars: partialResult?.length ?? 0,
+            },
             'spawn: failed',
         );
     } finally {

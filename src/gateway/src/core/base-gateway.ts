@@ -323,6 +323,14 @@ export abstract class BaseGateway implements Gateway {
     }
 
     async stop(): Promise<void> {
+        // Pre-stop work runs while channels are still connected (e.g. the
+        // shutdown notice must send before the disconnect loop below).
+        try {
+            await this.onBeforeStop();
+        } catch (err) {
+            this.log.warn({ err }, 'onBeforeStop failed (non-fatal)');
+        }
+
         if (this.dedupSweep) {
             clearInterval(this.dedupSweep);
             this.dedupSweep = null;
@@ -748,6 +756,9 @@ export abstract class BaseGateway implements Gateway {
     protected abstract route(message: Message): Promise<void>;
     protected async onStart(): Promise<void> {}
     protected async onStop(): Promise<void> {}
+
+    /** Runs at the very start of stop(), before channels disconnect. Override for shutdown-time work that needs live channels. */
+    protected async onBeforeStop(): Promise<void> {}
     /** Subclass hook fired on each dedup-clean inbound. Default is a no-op. */
     protected async onUserActivity(_message: Message): Promise<void> {}
     protected getProactiveHealth(): Record<string, unknown> {

@@ -1,7 +1,8 @@
 {
   "name": "@flopsy/vault",
   "version": "1.0.0",
-  "description": "Encrypted credential broker for FlopsyBot — AES-256-GCM, Argon2id KEK, KEK/DEK key wrapping",
+  "description": "Language-agnostic encrypted credential broker for AI agents. AES-256-GCM at rest, Argon2id KEK, MITM HTTPS proxy with placeholder substitution, scoped tokens with TTL + revocation, tamper-evident audit log.",
+  "keywords": ["vault", "credential-broker", "ai-agent", "https-proxy", "secrets", "mitm"],
   "private": true,
   "type": "module",
   "main": "./src/index.ts",
@@ -13,7 +14,6 @@
     }
   },
   "dependencies": {
-    "@flopsy/shared": "*",
     "@noble/hashes": "^1.5.0",
     "better-sqlite3": "^11.0.0",
     "node-forge": "^1.3.1"

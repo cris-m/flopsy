@@ -116,7 +116,10 @@ export function createWorkspace(env: NodeJS.ProcessEnv = process.env) {
         // Cache (safe to nuke).
         cache:         (...parts: string[]) => sub('cache', ...parts),
         toolOutputs:   () => sub('cache', 'tool-outputs'),
-        workerOutputs: () => sub('cache', 'worker-outputs'),
+        // Worker outputs sit under work/ — they're per-task agent artifacts
+        // (offloaded long replies) and belong with the sandbox's runtime
+        // state, not under cache/ where they'd be considered nuke-safe.
+        workerOutputs: () => sub('work', 'worker-outputs'),
 
         // The sandbox bind-mounts <HOME> as /workspace; paths under work/ map directly.
         work:          (...parts: string[]) => sub('work', ...parts),
@@ -134,6 +137,36 @@ export function createWorkspace(env: NodeJS.ProcessEnv = process.env) {
 }
 
 /** Subdirs under <HOME>/work the agent uses to organise outputs (iterable by bootstrap). */
+/**
+ * Normalize a config path so users can write bare filenames in flopsy.json5
+ * and have them auto-resolve under the canonical subdir. Lets the config
+ * stay short + portable:
+ *
+ *   "proactive.json"      → <HOME>/state/proactive.json   (bare → defaultSubdir)
+ *   "state/proactive.json" → <HOME>/state/proactive.json  (relative under HOME)
+ *   "memory/USER.md"      → <HOME>/memory/USER.md         (relative under HOME)
+ *   "/abs/path/db.sqlite" → /abs/path/db.sqlite           (absolute, honored)
+ *
+ * Pass `defaultSubdir` (e.g. 'state', 'content/prompts') as the place a
+ * bare filename should land. Callers without a sensible default should
+ * pass '' to require a path with a separator.
+ */
+export function resolveWorkspaceConfigPath(
+    value: string,
+    defaultSubdir: string,
+): string {
+    if (!value) return value;
+    if (value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value)) return value;
+    if (value.includes('/') || value.includes('\\')) {
+        // Relative path with separator — anchor under FLOPSY_HOME directly.
+        return join(resolveFlopsyHome(), value);
+    }
+    // Bare filename — drop into the convention subdir.
+    return defaultSubdir
+        ? join(resolveFlopsyHome(), defaultSubdir, value)
+        : join(resolveFlopsyHome(), value);
+}
+
 export const WORK_SUBDIRS = [
     'audio',
     'video',

@@ -6,7 +6,7 @@
  * the target channel worker's event queue as a `task_complete` event.
  *
  * Writes go through the management HTTP endpoint so the live gateway registers
- * the route without a restart. Reads use proactive.db directly (offline).
+ * the route without a restart. Reads use learning.db directly (offline) — proactive schedules consolidated there.
  */
 
 import { Command } from 'commander';

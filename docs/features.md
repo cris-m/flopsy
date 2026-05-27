@@ -256,7 +256,8 @@ Fast, no-LLM handlers run before any agent turn. Available in every channel:
 | `/plan` | Inspect / cancel the active plan state for this thread |
 | `/cron` / `/heartbeat` | In-chat schedule management (mirrors `flopsy schedule …`) |
 | `/insights` | Token usage + activity summary |
-| `/goal <text>` | Set a standing goal — agent self-continues until done (see [goal.md](./goal.md)) |
+| `/goal <text>` | Set a standing goal — agent self-continues until done, emits `↻ Continuing` / `✓ Goal achieved` notifications (see [goal.md](./goal.md)) |
+| `/subgoal <text>` | Layer extra criteria on the active goal mid-loop; judge requires goal AND every subgoal before saying done (see [goal.md](./goal.md)) |
 | `/help` (`/?`) | List every registered slash command |
 
 Auto-discoverable — new slash handlers land in `/help` automatically on the next restart.

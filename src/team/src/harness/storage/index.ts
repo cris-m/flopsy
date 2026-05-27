@@ -18,7 +18,6 @@ export type {
     TokenDailyByModel,
     ToolFailureRow,
     ProactiveDecisionRow,
-    ProactiveCommitmentRow,
     SessionGoalRow,
     GoalStatus,
 } from './learning-store';

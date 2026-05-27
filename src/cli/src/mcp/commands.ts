@@ -70,7 +70,8 @@ function ensureMcpBlock(parsed: RawConfig): Record<string, unknown> {
 }
 
 export function registerMcpCommands(root: Command): void {
-    const mcp = root.command('mcp').description('Manage MCP server registry in flopsy.json5');
+    const mcp = root.command('mcp').description('Manage MCP server registry in flopsy.json5')
+        .action((_opts: unknown, cmd: Command) => cmd.outputHelp());
 
     mcp.command('list')
         .description('List configured MCP servers and their enabled status')

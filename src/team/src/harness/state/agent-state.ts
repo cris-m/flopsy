@@ -268,8 +268,15 @@ export class AgentStateTracker {
 }
 
 let globalTracker: AgentStateTracker | undefined;
+let cleanupTimer: NodeJS.Timeout | undefined;
 
 export function getAgentStateTracker(): AgentStateTracker {
-    if (!globalTracker) globalTracker = new AgentStateTracker();
+    if (!globalTracker) {
+        globalTracker = new AgentStateTracker();
+        cleanupTimer = setInterval(() => {
+            try { globalTracker?.cleanup(3_600_000); } catch { /* */ }
+        }, 600_000);
+        cleanupTimer.unref?.();
+    }
     return globalTracker;
 }

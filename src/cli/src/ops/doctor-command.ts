@@ -66,6 +66,7 @@ async function runAllChecks(): Promise<CheckResult[]> {
     }
 
     results.push(checkMainAgent(config.config));
+    results.push(...checkAgentModels(config.config));
     results.push(...checkEnvPlaceholders(config.config));
     results.push(await checkOllama(config.config));
     results.push(...checkAuthCredentials());
@@ -112,6 +113,45 @@ function checkMainAgent(cfg: { agents?: ReadonlyArray<{ name: string; role?: str
     return { name: 'main agent', status: 'ok', message: mains[0].name };
 }
 
+/**
+ * Every enabled agent must have either a primary `model` field or a routing-tier
+ * fallback — otherwise the gateway boots but the agent crashes at first turn
+ * with an opaque ModelLoader error. The bootstrap also throws on this; doctor
+ * catches it BEFORE you try `npm start`, with a more directed message.
+ */
+function checkAgentModels(cfg: {
+    agents?: ReadonlyArray<{
+        name: string;
+        enabled?: boolean;
+        model?: string;
+        routing?: { tiers?: { fast?: { name?: string }; balanced?: { name?: string }; powerful?: { name?: string } } };
+        promptPath?: string;
+    }>;
+}): CheckResult[] {
+    const enabled = (cfg.agents ?? []).filter((a) => a.enabled !== false);
+    const missingModel: string[] = [];
+    for (const a of enabled) {
+        const hasModel = !!a.model;
+        const hasRouting =
+            !!a.routing?.tiers?.fast?.name ||
+            !!a.routing?.tiers?.balanced?.name ||
+            !!a.routing?.tiers?.powerful?.name;
+        if (!hasModel && !hasRouting) missingModel.push(a.name);
+    }
+    if (missingModel.length === 0) {
+        return [{ name: 'agent models', status: 'ok', message: `${enabled.length} enabled agent${enabled.length === 1 ? '' : 's'} have a model or routing fallback` }];
+    }
+    return [
+        {
+            name: 'agent models',
+            status: 'fail',
+            message: `${missingModel.length} enabled agent${missingModel.length === 1 ? '' : 's'} missing both \`model\` and routing fallback`,
+            details: missingModel,
+            fix: 'Add `model: "provider:name"` to each, or set `enabled: false`',
+        },
+    ];
+}
+
 function checkEnvPlaceholders(cfg: Record<string, unknown>): CheckResult[] {
     // Walk the config looking for `${VAR}` strings and collect any that
     // aren't satisfied by process.env. Placeholders with `:-default` are
@@ -150,8 +190,20 @@ function checkEnvPlaceholders(cfg: Record<string, unknown>): CheckResult[] {
     ];
 }
 
-async function checkOllama(cfg: { memory?: { embedder?: { baseUrl?: string } } }): Promise<CheckResult> {
-    const baseUrl = cfg.memory?.embedder?.baseUrl ?? 'http://localhost:11434';
+async function checkOllama(cfg: { memory?: { enabled?: boolean; embedder?: { provider?: string; baseUrl?: string } } }): Promise<CheckResult> {
+    // Ollama only matters when memory has an embedder configured. A
+    // memory-disabled or embedder-less deploy (keyword-only memory) doesn't
+    // need it, so probing localhost and blocking-failing on a healthy system
+    // was a false negative. Treat unreachable as a non-blocking warn — the
+    // gateway still starts; only embeddings are unavailable.
+    if (cfg.memory?.enabled === false) {
+        return { name: 'ollama', status: 'info', message: 'memory disabled — embedder check skipped' };
+    }
+    const embedder = cfg.memory?.embedder;
+    if (!embedder) {
+        return { name: 'ollama', status: 'info', message: 'no embedder configured (keyword-only memory)' };
+    }
+    const baseUrl = embedder.baseUrl ?? 'http://localhost:11434';
     try {
         const res = await fetch(`${baseUrl}/api/tags`, {
             signal: AbortSignal.timeout(2000),
@@ -168,8 +220,8 @@ async function checkOllama(cfg: { memory?: { embedder?: { baseUrl?: string } } }
     } catch {
         return {
             name: 'ollama',
-            status: 'fail',
-            message: `unreachable at ${baseUrl}`,
+            status: 'warn',
+            message: `unreachable at ${baseUrl} — embeddings unavailable (memory still works as keyword-only)`,
             fix: 'Start Ollama: `ollama serve` (or `brew services start ollama`)',
         };
     }
@@ -304,43 +356,65 @@ function checkStateDirs(): CheckResult[] {
 }
 
 /**
- * Dot-on-left layout — matches `flopsy channel list` / `flopsy team` / `status`:
+ * Sectioned layout — bold section headers, └-tree sub-items, conditional
+ * "issues to fix" block at the top so problems are visible without scrolling.
  *
- *     General
- *       ● node          v25.9.0
- *       ● flopsy.json5  parses (/…/flopsy.json5)
- *       ● env placeholders  9 unset        (red dot)
- *           · GOOGLE_CHAT_VERIFICATION_TOKEN
- *           · SLACK_APP_TOKEN
- *           fix: Set in `.env` at the repo root
- *       ○ auth          no credentials stored
+ *     ⚠ 2 issues need attention
+ *     ✖ env placeholders — 5 unset
+ *       └ fix: Set in `.env` or adjust config to use defaults
+ *     ⚠ auth: gmail — expires in 12m
+ *       └ fix: flopsy auth refresh gmail
+ *     ─────────────────────────────────────────────
  *
- *     ● 1 failing · ● 7 ok · ◦ 3 info
+ *     Runtime
+ *     │  ● node    v25.9.0
+ *     │  ● ollama  http://localhost:11434
  *
- * Each row carries its state in the dot colour; no trailing icon needed.
- * Continuation rows (details, fix) indent under the label so they read
- * as belonging to the parent check without the heavier tree connectors.
+ *     Config
+ *     │  ● flopsy.json5     parses (/…/flopsy.json5)
+ *     │  ● main agent       gandalf
+ *     │  ● env placeholders 5 unset
+ *     │    └ GOOGLE_CHAT_VERIFICATION_TOKEN
+ *     │    └ SLACK_APP_TOKEN
+ *     │    └ fix: Set in `.env` at the repo root
+ *
+ *     ─────────────────────────────────────────────
+ *     ● 23 ok · ● 7 failing
  */
 function render(results: readonly CheckResult[]): void {
     const termWidth = process.stdout.columns ?? 80;
     const rule = dim('─'.repeat(Math.max(40, Math.min(termWidth, 120))));
     const indent = '  ';
-
-    console.log('');
-    console.log(rule);
-    console.log('');
-
-    // A dim vertical line runs down the left side of each group, from
-    // the header row to the last sub-item, visually bracketing the
-    // section without drawing a box. `│` is U+2502 — renders cleanly
-    // on every terminal. Dim colour keeps it a structural hint, not
-    // a main-content character.
     const bar = dim('│');
+    const tree = dim('└');
 
-    const byGroup = groupByPrefix(results);
-    for (let groupIdx = 0; groupIdx < byGroup.length; groupIdx++) {
-        const [group, entries] = byGroup[groupIdx];
-        console.log(`${indent}${chalk.bold(group)}`);
+    console.log('');
+
+    // Top-of-output triage block — only renders when something needs action.
+    // Lets the user see the action list without scrolling past 30 OK rows.
+    const failed = results.filter((r) => r.status === 'fail');
+    const warned = results.filter((r) => r.status === 'warn');
+    const issueCount = failed.length + warned.length;
+    if (issueCount > 0) {
+        const headerGlyph = failed.length > 0 ? chalk.red('✖') : chalk.yellow('⚠');
+        const issueWord = issueCount === 1 ? 'issue needs' : 'issues need';
+        console.log(`${indent}${headerGlyph} ${chalk.bold(`${issueCount} ${issueWord} attention`)}`);
+        for (const r of [...failed, ...warned]) {
+            const glyph = r.status === 'fail' ? chalk.red('✖') : chalk.yellow('⚠');
+            console.log(`${indent}${glyph} ${r.name} ${dim('—')} ${r.message}`);
+            if (r.fix) {
+                console.log(`${indent}  ${tree} ${dim(`fix: ${r.fix}`)}`);
+            }
+        }
+        console.log('');
+        console.log(`${indent}${rule}`);
+        console.log('');
+    }
+
+    const bySection = groupBySection(results);
+    for (let i = 0; i < bySection.length; i++) {
+        const [section, entries] = bySection[i];
+        console.log(`${indent}${chalk.bold(section)}`);
 
         const labelWidth = Math.max(
             ...entries.map((r) => r.name.replace(/^[^:]+: /, '').length),
@@ -351,21 +425,19 @@ function render(results: readonly CheckResult[]): void {
             const dot = statusDot(r.status);
             const displayName = r.name.replace(/^[^:]+: /, '');
             const paddedLabel = displayName + ' '.repeat(labelWidth - displayName.length);
-            console.log(
-                `${indent}${bar}  ${dot} ${paddedLabel}  ${r.message}`,
-            );
+            console.log(`${indent}${bar}  ${dot} ${paddedLabel}  ${r.message}`);
 
             if (r.details?.length) {
                 for (const d of r.details) {
-                    console.log(`${indent}${bar}    ${dim('·')} ${d}`);
+                    console.log(`${indent}${bar}    ${tree} ${d}`);
                 }
             }
             if (r.fix && r.status !== 'ok' && r.status !== 'info') {
-                console.log(`${indent}${bar}    ${dim('fix:')} ${dim(r.fix)}`);
+                console.log(`${indent}${bar}    ${tree} ${dim(`fix: ${r.fix}`)}`);
             }
         }
 
-        if (groupIdx < byGroup.length - 1) console.log('');
+        if (i < bySection.length - 1) console.log('');
     }
 
     console.log('');
@@ -404,31 +476,40 @@ function summarize(results: readonly CheckResult[]): string {
     return parts.join(' · ');
 }
 
-/** Group checks under section headers by the name prefix (`auth: ...`, `mcp: ...`). */
-function groupByPrefix(results: readonly CheckResult[]): ReadonlyArray<[string, CheckResult[]]> {
+// Explicit name → section map; ordered top-to-bottom for the final layout.
+// Adding a new check? Drop its `name` into the right section here.
+const SECTION_ORDER = ['Runtime', 'Config', 'State', 'Gateway', 'Auth', 'MCP'] as const;
+const SECTION_BY_NAME: Record<string, (typeof SECTION_ORDER)[number]> = {
+    'node': 'Runtime',
+    'ollama': 'Runtime',
+    'flopsy.json5': 'Config',
+    'main agent': 'Config',
+    'env placeholders': 'Config',
+    '.flopsy/': 'State',
+    '.flopsy/state/': 'State',
+    '.flopsy/auth/': 'State',
+    'gateway': 'Gateway',
+};
+
+function sectionFor(name: string): (typeof SECTION_ORDER)[number] {
+    if (SECTION_BY_NAME[name]) return SECTION_BY_NAME[name];
+    if (name.startsWith('auth:') || name.startsWith('auth ')) return 'Auth';
+    if (name.startsWith('mcp:') || name.startsWith('mcp ')) return 'MCP';
+    return 'Runtime';
+}
+
+/** Group checks under named sections in a fixed semantic order. */
+function groupBySection(
+    results: readonly CheckResult[],
+): ReadonlyArray<[string, CheckResult[]]> {
     const groups = new Map<string, CheckResult[]>();
     for (const r of results) {
-        const prefix = r.name.includes(': ') ? r.name.split(': ')[0] : 'General';
-        const key =
-            prefix === 'node' ||
-            prefix === 'ollama' ||
-            prefix === 'gateway' ||
-            prefix === 'flopsy.json5' ||
-            prefix === 'main agent' ||
-            prefix === 'env placeholders' ||
-            prefix === '.flopsy/' ||
-            prefix === '.flopsy/state/' ||
-            prefix === '.flopsy/auth/'
-                ? 'General'
-                : prefix.charAt(0).toUpperCase() + prefix.slice(1);
+        const key = sectionFor(r.name);
         if (!groups.has(key)) groups.set(key, []);
         groups.get(key)!.push(r);
     }
-    // Ensure General comes first for readability.
-    return [...groups.entries()].sort(([a], [b]) => {
-        if (a === 'General') return -1;
-        if (b === 'General') return 1;
-        return a.localeCompare(b);
-    });
+    return SECTION_ORDER
+        .filter((s) => groups.has(s))
+        .map((s) => [s, groups.get(s)!] as [string, CheckResult[]]);
 }
 

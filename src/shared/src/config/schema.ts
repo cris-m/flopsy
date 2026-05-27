@@ -44,8 +44,6 @@ const modelSourceSchema = z.object({
     routing: modelRoutingSchema,
 });
 
-const modelsConfigSchema = z.object({}).default({});
-
 const dmPolicySchema = z.enum(['pairing', 'allowlist', 'open', 'disabled']);
 const groupPolicySchema = z.enum(['allowlist', 'open', 'disabled']);
 const groupActivationSchema = z.enum(['mention', 'always']);
@@ -75,6 +73,11 @@ const baseChannelSchema = z.object({
     dm: dmSchema.default({}),
     group: groupSchema.optional(),
     ackReaction: ackReactionSchema,
+    showThinking: z.boolean().default(false).describe(
+        'When true, surface the agent\'s reasoning ("thinking") on this channel ' +
+        'as a single edit-in-place message. Default false — matches Hermes/openclaw ' +
+        'industry pattern (reasoning lives in observability logs, not chat history).',
+    ),
 });
 
 const whatsappSchema = baseChannelSchema.extend({
@@ -85,12 +88,6 @@ const whatsappSchema = baseChannelSchema.extend({
     autoTyping: z.boolean().default(true),
     contextMessages: z.number().int().min(0).max(200).default(50),
     maxChunkSize: z.number().int().min(100).max(10000).default(4000),
-    media: z
-        .object({
-            inboundMax: z.number().default(10_485_760),
-            outboundMax: z.number().default(10_485_760),
-        })
-        .default({}),
 });
 
 const telegramSchema = baseChannelSchema.extend({
@@ -233,7 +230,7 @@ const gatewaySchema = z.object({
             maxEntries: z.number().default(10_000),
         })
         .default({}),
-    /** Management HTTP endpoint for CLI live-queries. 127.0.0.1 only; auth via `FLOPSY_MGMT_TOKEN`. */
+    /** Management HTTP endpoint for CLI live-queries. 127.0.0.1 only; auth via `GATEWAY_TOKEN`. */
     management: z
         .object({
             enabled: z.boolean().default(true),
@@ -247,9 +244,6 @@ const loggingSchema = z.object({
     level: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent']).default('info'),
     pretty: z.boolean().default(false),
     file: z.string().optional(),
-    components: z
-        .record(z.string(), z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent']))
-        .default({}),
 });
 
 const webhookSchema = z
@@ -283,7 +277,7 @@ const deliveryTargetSchema = z.object({
         .default([]),
 });
 
-const heartbeatDefinitionSchema = z.object({
+export const heartbeatDefinitionSchema = z.object({
     id: z.string().min(1).optional(),
     name: z.string().min(1),
     enabled: z.boolean().default(true),
@@ -330,7 +324,7 @@ const cronPayloadSchema = z.object({
     skills: z.array(z.string().min(1)).optional(),
 });
 
-const jobDefinitionSchema = z.object({
+export const jobDefinitionSchema = z.object({
     id: z.string().min(1),
     name: z.string().min(1),
     description: z.string().optional(),
@@ -354,8 +348,16 @@ const healthMonitorSchema = z
 const proactiveSchema = z
     .object({
         enabled: z.boolean().default(false),
-        statePath: z.string().default('state/proactive.json'),
-        retryQueuePath: z.string().default('state/retry-queue.json'),
+        // Path resolution: bare filename ("proactive.json") auto-resolves
+        // under <HOME>/state/. Relative paths anchor to FLOPSY_HOME. Absolute
+        // paths are honored as-given. See `resolveWorkspaceConfigPath`.
+        statePath: z.string().default('proactive.json'),
+        retryQueuePath: z.string().default('retry-queue.json'),
+        // Consolidated: proactive runtime schedules + deliveries + reported-item
+        // dedup share `learning.db` with the harness learning store. Reunites
+        // proactive data (proactive_decisions already lived in learning.db) into
+        // one file. Distinct table names; safe to share (WAL + busy_timeout).
+        dedupDbPath: z.string().default('learning.db'),
         /** Fallback delivery target when a schedule has no explicit `delivery`. */
         delivery: deliveryTargetSchema.optional(),
         /** Auto-route to the channel+peer of the user's most recent inbound message. */
@@ -371,19 +373,13 @@ const proactiveSchema = z
         heartbeats: z
             .object({
                 enabled: z.boolean().default(false),
-                /** @deprecated Schedules live in proactive.db; array kept only for one-time migration. */
-                heartbeats: z.array(heartbeatDefinitionSchema).default([]),
             })
             .default({}),
         scheduler: z
             .object({
                 enabled: z.boolean().default(false),
-                /** @deprecated — see heartbeats.heartbeats above. */
-                jobs: z.array(jobDefinitionSchema).default([]),
             })
             .default({}),
-        /** @deprecated — webhooks will migrate to proactive.db in the next pass. */
-        webhooks: z.array(externalWebhookSchema).default([]),
         healthMonitor: healthMonitorSchema,
     })
     .default({});
@@ -436,6 +432,10 @@ const agentDefinitionSchema = z.object({
     // Only 'main' is load-bearing; other values are informational labels.
     type: z.string().default('main'),
     domain: z.string().optional(),
+    /** Sharp delegation trigger surfaced in the delegate_task/spawn roster, e.g.
+     *  "deep multi-source research with citations — state-of-X, comparisons". When
+     *  absent the roster falls back to `domain`. */
+    whenToUse: z.string().optional(),
     config: z.record(z.unknown()).optional(),
 
     /** "provider:name" format (e.g., "anthropic:claude-3-5-sonnet"). */
@@ -491,6 +491,15 @@ const memorySchema = z.object({
     memoryCharLimit: z.number().int().min(0).default(2200),
     /** User-profile char budget (USER.md + `profile` combined); ~1375 ≈ 500 tokens. */
     userCharLimit: z.number().int().min(0).default(1375),
+    /**
+     * Memory plugins (smartWriter, honcho, mem0, audit, sqliteMirror,
+     * skillSignals). Passed through untyped here — the team package owns the
+     * authoritative shape via `MemoryConfigRawSchema` (memory/config.ts) and
+     * re-validates it in `parseMemoryConfig`. WITHOUT this passthrough, the
+     * top-level validate would strip `memory.plugins` and every plugin would
+     * silently default to disabled (the bug that made smartWriter a no-op).
+     */
+    plugins: z.record(z.unknown()).optional(),
 });
 
 /**
@@ -528,16 +537,18 @@ const mcpSchema = z.object({
     servers: z.record(mcpServerSchema).default({}),
 });
 
-/**
- * Inferred-commitments. Off by default. Opt-in to fire a hidden post-turn LLM pass
- * that extracts future check-ins; smart-pulse surfaces them later.
- */
-const commitmentsSchema = z.object({
+const acpAgentSchema = z.object({
+    command: z.string(),
+    args: z.array(z.string()).default([]),
+    env: z.record(z.string()).optional(),
+});
+
+const acpSchema = z.object({
     enabled: z.boolean().default(false),
-    /** Rolling 24h cap per peer; prevents stale check-in overflow. */
-    maxPerDay: z.number().int().min(0).max(50).default(3),
-    /** Confidence floor; higher = fewer, higher-quality commitments. */
-    minConfidence: z.number().min(0).max(1).default(0.7),
+    cwdRoot: z.string().default('work/code'),
+    permissionMode: z.enum(['auto-allow-in-cwd', 'deny-all']).default('auto-allow-in-cwd'),
+    timeoutMs: z.number().int().min(1).default(1_800_000),
+    agents: z.record(acpAgentSchema).default({}),
 });
 
 export const flopsyConfigSchema = z
@@ -548,11 +559,10 @@ export const flopsyConfigSchema = z
         webhook: webhookSchema,
         proactive: proactiveSchema,
         logging: loggingSchema.default({}),
-        models: modelsConfigSchema.default({}),
         agents: z.array(agentDefinitionSchema).default([]),
         memory: memorySchema.default({}),
-        commitments: commitmentsSchema.default({}),
         mcp: mcpSchema.default({}),
+        acp: acpSchema.default({}),
         timezone: z.string().default('UTC'),
     })
     .strict();
@@ -568,7 +578,6 @@ export type SignalConfig = z.infer<typeof signalSchema>;
 export type IMessageConfig = z.infer<typeof imessageSchema>;
 export type SlackConfig = z.infer<typeof slackSchema>;
 export type GoogleChatConfig = z.infer<typeof googlechatSchema>;
-export type ExternalWebhookConfigSchema = z.infer<typeof externalWebhookSchema>;
 export type LoggingConfig = z.infer<typeof loggingSchema>;
 export type WebhookSection = z.infer<typeof webhookSchema>;
 export type ProactiveConfig = z.infer<typeof proactiveSchema>;
@@ -582,8 +591,6 @@ export type ModelConfig = z.infer<typeof modelConfigSchema>;
 export type ModelRef = z.infer<typeof modelRefSchema>;
 export type ModelRouting = z.infer<typeof modelRoutingSchema>;
 export type ModelSource = z.infer<typeof modelSourceSchema>;
-export type ModelsConfig = z.infer<typeof modelsConfigSchema>;
 export type MemoryConfig = z.infer<typeof memorySchema>;
-export type CommitmentsConfig = z.infer<typeof commitmentsSchema>;
 export type McpConfig = z.infer<typeof mcpSchema>;
 export type McpServerConfig = z.infer<typeof mcpServerSchema>;

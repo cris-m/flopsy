@@ -1,32 +1,58 @@
 import { writeFile, rename, mkdir, readFile } from 'fs/promises';
 import { join } from 'path';
-import { existsSync } from 'fs';
+import { existsSync, readdirSync, statSync } from 'fs';
 import { createLogger } from '@flopsy/shared';
+import { scanSkillContent, hasCriticalFinding } from './skill-content-scanner';
+import { SkillUsageStore, lessonFingerprint } from './skill-usage-store';
 
 const log = createLogger('skill-writer');
 
-/**
- * Resolve the paths for a skill inside the skills directory.
- *
- * The `skills()` interceptor in flopsygraph expects the structure:
- *   <skillsPath>/<skillName>/SKILL.md
- *
- * It validates that the frontmatter `name` field EXACTLY matches the directory
- * name. If they diverge, the interceptor silently drops the skill.
- */
-function skillPaths(skillsPath: string, skillName: string) {
-    const dir = join(skillsPath, skillName);
+// Grouped layout when category given, else flat (legacy): <skillsPath>/[category/]<skillName>/SKILL.md
+function skillPaths(skillsPath: string, skillName: string, category?: string) {
+    const dir = category
+        ? join(skillsPath, category, skillName)
+        : join(skillsPath, skillName);
     const file = join(dir, 'SKILL.md');
     return { dir, file };
 }
 
-/**
- * Ensure the frontmatter `name:` field in a SKILL.md body matches
- * the directory name (required by the flopsygraph skills() interceptor).
- * If the field is missing or wrong, it is inserted/replaced.
- */
+// Category becomes a path segment, so it must be a single safe identifier.
+// Open-ended (any new group is allowed) but no dots/slashes/traversal.
+const SAFE_CATEGORY_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
+
+function extractCategory(content: string): string | null {
+    if (!content.startsWith('---')) return null;
+    const closeIdx = content.indexOf('\n---', 3);
+    if (closeIdx === -1) return null;
+    const fm = content.slice(3, closeIdx);
+    const m = fm.match(/^category:\s*(.+)$/m);
+    if (!m?.[1]) return null;
+    const category = m[1].trim().replace(/^["']|["']$/g, '').toLowerCase();
+    return SAFE_CATEGORY_RE.test(category) ? category : null;
+}
+
+function skillExistsAnywhere(skillsPath: string, skillName: string): boolean {
+    return resolveExistingSkillFile(skillsPath, skillName) !== null;
+}
+
+function resolveExistingSkillFile(skillsPath: string, skillName: string): string | null {
+    const flat = join(skillsPath, skillName, 'SKILL.md');
+    if (existsSync(flat)) return flat;
+    let groups: string[];
+    try { groups = readdirSync(skillsPath); }
+    catch { return null; }
+    for (const group of groups) {
+        const groupPath = join(skillsPath, group);
+        try { if (!statSync(groupPath).isDirectory()) continue; }
+        catch { continue; }
+        const candidate = join(groupPath, skillName, 'SKILL.md');
+        if (existsSync(candidate)) return candidate;
+    }
+    return null;
+}
+
+// The skills() interceptor ignores a skill unless frontmatter `name:` matches its directory.
 function ensureNameField(content: string, skillName: string): string {
-    // If there's no frontmatter at all, prepend minimal one.
     if (!content.startsWith('---')) {
         return `---\nname: ${skillName}\n---\n\n${content}`;
     }
@@ -44,28 +70,41 @@ function ensureNameField(content: string, skillName: string): string {
     return `---${newFm}${content.slice(closeIdx)}`;
 }
 
-/**
- * Atomically write a new skill to `<skillsPath>/<skillName>/SKILL.md`.
- *
- * - Creates the subdirectory if needed.
- * - Ensures the frontmatter `name` field matches the directory name.
- * - Skips (returns false) if the file already exists — human-edited skills
- *   are never overwritten; the background reviewer may surface the same
- *   pattern twice but only the first write wins.
- * - Uses write-to-tmp + rename so the skills() interceptor never reads a
- *   partial file during a directory scan.
- */
+// Skips if the name exists anywhere (never overwrite human-edited skills); tmp+rename so the
+// interceptor never reads a partial file mid-scan.
 export async function writeSkillFile(
     skillsPath: string,
     skillName: string,
     content: string,
 ): Promise<boolean> {
-    const { dir, file: destPath } = skillPaths(skillsPath, skillName);
-
-    if (existsSync(destPath)) {
-        log.debug({ skillName, path: destPath }, 'skill already exists — skipping write');
+    if (skillExistsAnywhere(skillsPath, skillName)) {
+        log.debug({ skillName }, 'skill already exists somewhere under skillsPath — skipping write');
         return false;
     }
+
+    const oversize = checkSkillSize(content);
+    if (oversize) {
+        log.warn({ skillName, reason: oversize }, 'skill write BLOCKED — size cap exceeded');
+        return false;
+    }
+
+    const scanFindings = scanSkillContent(content);
+    if (hasCriticalFinding(scanFindings)) {
+        log.warn(
+            { skillName, findings: scanFindings.map((f) => ({ rule: f.rule, severity: f.severity })) },
+            'skill write BLOCKED — content contains critical danger patterns',
+        );
+        return false;
+    }
+    if (scanFindings.length > 0) {
+        log.info(
+            { skillName, findings: scanFindings.map((f) => f.rule) },
+            'skill write proceeding with non-critical scan findings',
+        );
+    }
+
+    const category = extractCategory(content);
+    const { dir, file: destPath } = skillPaths(skillsPath, skillName, category ?? undefined);
 
     await mkdir(dir, { recursive: true });
 
@@ -74,7 +113,7 @@ export async function writeSkillFile(
     try {
         await writeFile(tmpPath, normalizedContent, 'utf-8');
         await rename(tmpPath, destPath);
-        log.info({ skillName, path: destPath }, 'skill written');
+        log.info({ skillName, category, path: destPath }, 'skill written');
         return true;
     } catch (err) {
         try { await (await import('fs/promises')).unlink(tmpPath); } catch { /* ignored */ }
@@ -82,31 +121,37 @@ export async function writeSkillFile(
     }
 }
 
-/** Cap on bullet count in a `## Lessons Learned` section. Newest wins
- * (oldest bullets at the top are pruned). Keeps skills scannable when
- * the self-improve heartbeat fires every 4h and could otherwise grow
- * the section unboundedly. */
+// Newest-wins cap so the self-improve heartbeat can't grow the section unboundedly.
 const MAX_LESSONS_PER_SKILL = 20;
 
-/**
- * Append bullet points to the `## Lessons Learned` section of an existing skill.
- * Creates the section at the end of the file if it doesn't exist yet.
- * Returns false if the skill directory/file doesn't exist.
- *
- * After append, the section is capped at MAX_LESSONS_PER_SKILL bullets —
- * oldest entries (top of section) are pruned. This is the only invariant
- * change to existing callers; if you need the full append-only history,
- * remove or raise the cap.
- */
+// agentskills.io progressive-disclosure guidance; bigger skills move detail to reference/ subfiles.
+const MAX_SKILL_LINES = 500;
+function checkSkillSize(content: string): string | null {
+    const lines = content.split('\n').length;
+    if (lines > MAX_SKILL_LINES) {
+        return (
+            `SKILL.md is ${lines} lines, over the ${MAX_SKILL_LINES}-line cap. ` +
+            `Move detailed sections into reference/ subfiles and link to them ` +
+            `(see skill-creator for the progressive-disclosure pattern).`
+        );
+    }
+    return null;
+}
+
 export async function appendLessonsToSkill(
     skillsPath: string,
     skillName: string,
     lessons: string[],
 ): Promise<boolean> {
     if (lessons.length === 0) return false;
-    const { file: destPath } = skillPaths(skillsPath, skillName);
-
-    if (!existsSync(destPath)) {
+    // Rejected-edit buffer: never re-apply a lesson the validation gate reverted for hurting engagement.
+    const rejected = new Set(new SkillUsageStore(skillsPath).getRejectedEdits(skillName));
+    if (rejected.size > 0) {
+        lessons = lessons.filter((l) => !rejected.has(lessonFingerprint(l)));
+        if (lessons.length === 0) return false;
+    }
+    const destPath = resolveExistingSkillFile(skillsPath, skillName);
+    if (!destPath) {
         log.debug({ skillName }, 'skill file not found — cannot append lessons');
         return false;
     }
@@ -122,8 +167,6 @@ export async function appendLessonsToSkill(
         const newLines = capped.map((l) => `- ${l}`).join('\n');
         updated = `${existing.trimEnd()}\n\n${LESSONS_HEADER}\n${newLines}\n`;
     } else {
-        // Existing section: parse current bullets, append new ones, cap.
-        // Section spans from after the header line to the next H2 (or EOF).
         const sectionStart = headerIdx + LESSONS_HEADER.length;
         const afterHeader = existing.indexOf('\n## ', headerIdx + 1);
         const sectionEnd = afterHeader === -1 ? existing.length : afterHeader;
@@ -135,10 +178,18 @@ export async function appendLessonsToSkill(
             .filter((line) => line.startsWith('- '))
             .map((line) => line.slice(2));
 
-        // Newest wins: existing bullets first (older), new lessons last,
-        // then keep the trailing MAX_LESSONS_PER_SKILL.
+        // Reverse-dedup keeps the latest occurrence, so a re-stated lesson refreshes its position
+        // instead of stacking verbatim copies every fire.
         const combined = [...existingBullets, ...lessons];
-        const capped = combined.slice(-MAX_LESSONS_PER_SKILL);
+        const seen = new Set<string>();
+        const deduped: string[] = [];
+        for (let i = combined.length - 1; i >= 0; i--) {
+            const key = combined[i]!.trim().toLowerCase();
+            if (!key || seen.has(key)) continue;
+            seen.add(key);
+            deduped.unshift(combined[i]!);
+        }
+        const capped = deduped.slice(-MAX_LESSONS_PER_SKILL);
         const newSection = '\n' + capped.map((l) => `- ${l}`).join('\n') + '\n';
 
         updated = existing.slice(0, sectionStart) + newSection + existing.slice(sectionEnd);
@@ -156,18 +207,13 @@ export async function appendLessonsToSkill(
     }
 }
 
-/**
- * Update (or add) the `version` field in the YAML frontmatter of an existing skill.
- * Returns false if the skill directory/file doesn't exist.
- */
 export async function bumpSkillVersion(
     skillsPath: string,
     skillName: string,
     version: string,
 ): Promise<boolean> {
-    const { file: destPath } = skillPaths(skillsPath, skillName);
-
-    if (!existsSync(destPath)) {
+    const destPath = resolveExistingSkillFile(skillsPath, skillName);
+    if (!destPath) {
         log.debug({ skillName }, 'skill file not found — cannot bump version');
         return false;
     }
@@ -198,38 +244,15 @@ export async function bumpSkillVersion(
     }
 }
 
-/**
- * Result shape for `patchSkillFile`. Agents read `status` to decide what
- * to surface back to the user.
- */
 export interface PatchSkillResult {
-    /** True iff the patch was applied. */
     ok: boolean;
-    /**
-     * - `replaced`         — patch applied successfully
-     * - `not-found`        — `find` string doesn't occur in the file
-     * - `wrong-count`      — `find` occurs N times but `expectedCount` ≠ N
-     * - `skill-missing`    — no SKILL.md at the target path
-     * - `unchanged`        — `find` === `replace` (no-op refused)
-     */
     status: 'replaced' | 'not-found' | 'wrong-count' | 'skill-missing' | 'unchanged';
-    /** Number of times `find` actually occurred. */
     matches: number;
-    /** Human-readable summary for the agent to relay. */
     message: string;
 }
 
-/**
- * Find-and-replace within an existing SKILL.md. `patch` semantics:
- * exact-string match (no regex), atomic write, refuses unless `find`
- * occurs exactly `expectedCount` times (default 1). The strict-count check
- * prevents accidental over-replacement when a substring shows up in
- * unintended places.
- *
- * Use this when the agent needs to evolve a skill — fix a stale path,
- * correct a wrong example, refine wording — without rewriting the whole
- * SKILL.md. For full rewrites use `writeSkillFile` (after deleting).
- */
+// Exact-string (no regex), atomic; refuses unless `find` occurs exactly expectedCount times,
+// guarding against accidental over-replacement.
 export async function patchSkillFile(
     skillsPath: string,
     skillName: string,
@@ -237,14 +260,13 @@ export async function patchSkillFile(
     replace: string,
     expectedCount = 1,
 ): Promise<PatchSkillResult> {
-    const { file: destPath } = skillPaths(skillsPath, skillName);
-
-    if (!existsSync(destPath)) {
+    const destPath = resolveExistingSkillFile(skillsPath, skillName);
+    if (!destPath) {
         return {
             ok: false,
             status: 'skill-missing',
             matches: 0,
-            message: `Skill "${skillName}" not found at ${destPath}`,
+            message: `Skill "${skillName}" not found under ${skillsPath} (checked flat + grouped layouts)`,
         };
     }
     if (find === replace) {
@@ -278,6 +300,15 @@ export async function patchSkillFile(
     }
 
     const updated = existing.split(find).join(replace);
+    const oversize = checkSkillSize(updated);
+    if (oversize) {
+        return {
+            ok: false,
+            status: 'unchanged',
+            matches,
+            message: `Refused: post-patch ${oversize}`,
+        };
+    }
     const tmpPath = `${destPath}.tmp`;
     try {
         await writeFile(tmpPath, updated, 'utf-8');

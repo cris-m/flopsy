@@ -41,6 +41,11 @@ export type DelegateTaskConfigurable = Pick<
     runStore?: DelegateRunStore;
     /** Parent thread for the run (gateway routing key). Required with runStore. */
     threadId?: string;
+    onDelegationComplete?: (
+        task: string,
+        result: string,
+        childSessionId: string,
+    ) => void | Promise<void>;
 };
 
 const schema = z.object({
@@ -48,7 +53,7 @@ const schema = z.object({
         .string()
         .min(1)
         .describe(
-            'Teammate role to delegate to (e.g. "legolas", "gimli"). Must be a configured worker.',
+            'Teammate to delegate to — name from your team roster in the system prompt.',
         ),
     task: z
         .string()
@@ -101,26 +106,23 @@ type DelegateArgs = Omit<z.infer<typeof schema>, 'tools' | 'timeoutMs'> & {
 export const delegateTaskTool = defineTool({
     name: 'delegate_task',
     description: [
-        'Delegate a focused sub-task to a named teammate and BLOCK until the result returns (synchronous).',
-        'Use this when the work finishes in under 3 minutes (default timeoutMs = 180000, max 480000) AND you need the answer before you can reply. For longer work, use spawn_background_task instead.',
+        'Delegate a focused sub-task to a named teammate and block until the result returns. Default timeoutMs 180000, max 480000. For work over ~2 minutes use spawn_background_task instead.',
         '',
-        'Pick by shape of the task:',
-        '  - "legolas"  — quick web scout, Gmail, Calendar, Drive, YouTube. "what\'s X?" / "read my inbox" / "any events today?"',
-        '  - "saruman"  — deep multi-source briefs with citations. SLOW — usually prefer spawn_background_task(saruman).',
-        '  - "gimli"    — analysis, code review, local notes (Obsidian / Apple Notes / Reminders / Notion / Todoist).',
-        '  - "aragorn"  — security intel: VirusTotal, Shodan, sandbox triage.',
-        '  - "sam"      — media + home: Spotify, Home Assistant.',
+        'Targets:',
+        '  worker — pick from the `## Your Team` table in your system prompt (single source of truth). NEVER guess a name not listed there.',
         '',
-        'Examples: "summarize this doc" → legolas. "validate this JSON" → gimli. "is this hash malicious" → aragorn.',
-        'Avoid: "research the state of post-quantum crypto" — that\'s a brief, use spawn_background_task(saruman).',
+        'Behaviour:',
+        '  - teammate has no conversation memory — pack required context into the task string.',
+        '  - workers may delegate further; max depth 3, loops blocked.',
+        '  - emit multiple delegate_task calls in one assistant turn to run them in parallel. Don\'t serialise independent delegations.',
+        '  - for 5+ similar items to the same worker, call parallel_map() inside execute_code({use_tools: true}).',
+        '  - replies >1.5 KB auto-save to disk; the handoff returns an absolute path. Pass it verbatim to read_file for the full text.',
         '',
-        'The teammate has NO memory of the conversation — pack context into the task string.',
-        'Workers CAN delegate to other workers when a task crosses domains (max depth = 3, loops are blocked).',
-        'Launch multiple workers concurrently whenever possible. To do that, emit multiple delegate_task tool calls in a SINGLE assistant turn — the runtime executes them in parallel and returns all results before your next step. Never serialise independent delegations one turn at a time.',
-        'For 5+ similar items to the same worker, use execute_code({use_tools: true}) and call parallel_map() inside the sandbox — runs up to 5 concurrently, you only see the final array.',
-        'Long worker replies (>1.5 KB) auto-save to disk and fold to a header + 800-char preview. The handoff message includes the absolute path — pass it verbatim to read_file when you need the full text.',
+        'Style:',
+        '  - require verifiable handles (URL, message_id, file path, HTTP status) for any external claim or side effect. No handle → treat as uncited.',
+        '  - relay as "Worker reports X" until you have seen the evidence. Verify before confirming high-stakes actions.',
         '',
-        'On error: timed out → spawn a second worker on the same task in parallel and race them. Wrong/partial → retry once with a tighter prompt. After two failures, surface what you tried.',
+        'On error: timeout → race a second worker on the same task. Wrong or partial → retry once with a tighter prompt. After two failures, surface what you tried.',
     ].join('\n'),
     schema,
     execute: async (args, ctx) => {
@@ -168,6 +170,7 @@ export const delegateTaskTool = defineTool({
             parentSignal: ctx.signal,
             runStore: cfg.runStore,
             threadId: cfg.threadId,
+            onDelegationComplete: cfg.onDelegationComplete,
         });
     },
 });
@@ -249,9 +252,10 @@ async function runInline(
         parentSignal: AbortSignal | undefined;
         runStore: DelegateRunStore | undefined;
         threadId: string | undefined;
+        onDelegationComplete: DelegateTaskConfigurable['onDelegationComplete'];
     },
 ): Promise<string> {
-    const { registry, runner, depth, chain, logger, parentSignal, runStore, threadId } = deps;
+    const { registry, runner, depth, chain, logger, parentSignal, runStore, threadId, onDelegationComplete } = deps;
     const timeoutMs = args.timeoutMs ?? DEFAULT_DELEGATE_TIMEOUT_MS;
 
     const task = createTeammateTask({
@@ -319,10 +323,16 @@ async function runInline(
             );
             const augmented = appendGapMarker(result, gap, args.worker);
             persist('completed', augmented, null);
+            if (onDelegationComplete) {
+                try { await onDelegationComplete(args.task, augmented, task.id); } catch { /* */ }
+            }
             return augmented;
         }
 
         persist('completed', result, null);
+        if (onDelegationComplete) {
+            try { await onDelegationComplete(args.task, result, task.id); } catch { /* */ }
+        }
         return result;
     } catch (err) {
         const aborted = whole.signal.aborted;

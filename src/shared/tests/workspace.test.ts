@@ -138,7 +138,8 @@ describe('createWorkspace', () => {
         expect(ws.cache()).toBe('/my/home/cache');
         expect(ws.cache('thumb.png')).toBe('/my/home/cache/thumb.png');
         expect(ws.toolOutputs()).toBe('/my/home/cache/tool-outputs');
-        expect(ws.workerOutputs()).toBe('/my/home/cache/worker-outputs');
+        // workerOutputs lives under work/ (per-task agent artifacts, not nuke-safe).
+        expect(ws.workerOutputs()).toBe('/my/home/work/worker-outputs');
 
         // auth + runtime
         expect(ws.auth()).toBe('/my/home/auth');

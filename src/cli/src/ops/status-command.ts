@@ -26,6 +26,7 @@ import { listCredentialProviders, loadCredential } from '../auth/credential-stor
 import { isColorTty } from '../ui/pretty';
 import { cronJobsOf, heartbeatsOf, inboundWebhooksOf, readFlopsyConfig } from './config-reader';
 import { probeGatewayState } from './gateway-state';
+import { managementUrl } from './schedule-client';
 import { existsSync, readFileSync } from 'node:fs';
 import { workspace } from '@flopsy/shared';
 
@@ -34,10 +35,12 @@ export function registerStatusCommand(root: Command): void {
         .description('Show a unified status snapshot of gateway, channels, MCP, auth, and team')
         .option('--verbose', 'Expanded per-section detail view')
         .option('--json', 'Emit structured JSON for monitoring/automation')
-        .action(async (opts: { verbose?: boolean; json?: boolean }) => {
+        .option('--harness', 'Append a 24h harness activity rollup (proactive deliveries, top tool failures, memory/skill mtimes)')
+        .action(async (opts: { verbose?: boolean; json?: boolean; harness?: boolean }) => {
             const snapshot = await scanStatus();
+            const harness = opts.harness ? await fetchHarnessActivity() : undefined;
             if (opts.json) {
-                console.log(JSON.stringify(snapshot, null, 2));
+                console.log(JSON.stringify({ ...snapshot, ...(harness ? { harness } : {}) }, null, 2));
                 return;
             }
             const theme = buildTheme();
@@ -46,7 +49,60 @@ export function registerStatusCommand(root: Command): void {
             } else {
                 console.log(renderCliCompact(snapshot, theme, process.stdout.columns ?? 80));
             }
+            if (opts.harness) {
+                console.log(renderHarnessBlock(harness));
+            }
         });
+}
+
+interface HarnessActivity {
+    windowMs: number;
+    proactive: { delivered: number; suppressed: number; errored: number };
+    topToolFailures: ReadonlyArray<{ toolName: string; errorPattern: string; count: number; lastSeen: number }>;
+}
+
+async function fetchHarnessActivity(): Promise<HarnessActivity | undefined> {
+    const token = loadMgmtToken();
+    try {
+        const res = await fetch(managementUrl('/management/harness/activity'), {
+            headers: token ? { Authorization: `Bearer ${token}` } : {},
+            signal: AbortSignal.timeout(1500),
+        });
+        if (!res.ok) return undefined;
+        return (await res.json()) as HarnessActivity;
+    } catch {
+        return undefined;
+    }
+}
+
+function renderHarnessBlock(h: HarnessActivity | undefined): string {
+    const lines: string[] = [];
+    lines.push('');
+    lines.push(chalk.cyan('● Harness (last 24h)'));
+    if (!h) {
+        lines.push('  ' + chalk.dim('(no data — gateway not running or endpoint unreachable)'));
+        return lines.join('\n');
+    }
+    const p = h.proactive;
+    const total = p.delivered + p.suppressed + p.errored;
+    const rate = total > 0 ? Math.round((p.delivered / total) * 100) : 0;
+    lines.push(
+        `  proactive: ${chalk.green(String(p.delivered))} delivered  ${chalk.yellow(String(p.suppressed))} suppressed  ${chalk.red(String(p.errored))} errored  ` +
+            chalk.dim(`(${rate}% delivery rate, ${total} fires)`),
+    );
+    if (h.topToolFailures.length === 0) {
+        lines.push('  ' + chalk.dim('top tool failures: none'));
+    } else {
+        lines.push('  top tool failures:');
+        for (const t of h.topToolFailures) {
+            const ageH = Math.max(1, Math.round((Date.now() - t.lastSeen) / 3_600_000));
+            const pattern = t.errorPattern.length > 60 ? t.errorPattern.slice(0, 57) + '…' : t.errorPattern;
+            lines.push(
+                `    ${chalk.yellow(t.toolName)} ×${t.count}  ${chalk.dim(`(${ageH}h ago)`)}  ${chalk.dim(pattern)}`,
+            );
+        }
+    }
+    return lines.join('\n');
 }
 
 /**
@@ -326,9 +382,11 @@ async function probeVault(): Promise<{ vault?: StatusSnapshot['integrations']['v
     };
 }
 
-async function fetchLive(host: string, port: number): Promise<Record<string, unknown> | undefined> {
-    const mgmtPort = port + 1;
-    const url = `http://${host}:${mgmtPort}/management/status`;
+async function fetchLive(_host: string, _port: number): Promise<Record<string, unknown> | undefined> {
+    // Honors gateway.management.port from flopsy.json5; falls back to gateway.port + 2
+    // (NOT + 1 — that's the webhook port). See schedule-client:managementUrl for
+    // the rationale on why + 2 is the safe default.
+    const url = managementUrl('/management/status');
     const token = loadMgmtToken();
     try {
         const res = await fetch(url, {

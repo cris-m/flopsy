@@ -1,0 +1,13 @@
+[project]
+name = "tts-speak"
+version = "0.2.0"
+description = "Pocket-TTS deps for the tts-speak skill (text → WAV via main.py). Migrated from Orpheus-TTS — Pocket-TTS is 100M params (vs Orpheus's 3B), CPU-only by design, fits in a 6 GB sandbox without OOM."
+requires-python = ">=3.11,<3.15"
+dependencies = [
+    # Kyutai's CPU-tuned 100M-param TTS. ~6× realtime on M-series, ~2× on
+    # average x86_64 server CPUs. No GPU required, no llama-cpp-python,
+    # no 3 GB GGUF download — Pocket-TTS pulls a smaller model from HF.
+    "pocket-tts>=2.1.0",
+    # `audio` extra for soundfile (WAV writer used by stream_audio_chunks).
+    "soundfile>=0.12.0",
+]

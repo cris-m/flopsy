@@ -7,6 +7,10 @@ export interface GoalFacade {
     resume(threadId: string): SessionGoalRow | null;
     clear(threadId: string): boolean;
     maybeContinue(args: { threadId: string; agentReply: string }): Promise<MaybeContinueResult | null>;
+    addSubgoal(threadId: string, text: string): SessionGoalRow;
+    removeSubgoal(threadId: string, oneBasedIndex: number): { removed: string; remaining: number };
+    clearSubgoals(threadId: string): number;
+    renderSubgoals(threadId: string): string;
 }
 
 let facade: GoalFacade | null = null;

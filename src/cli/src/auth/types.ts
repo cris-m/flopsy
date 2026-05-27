@@ -35,6 +35,14 @@ export interface AuthorizeOptions {
     readonly callbackPort?: number;
     /** Suppress the automatic browser-open (print URL for copy/paste). */
     readonly noOpen?: boolean;
+    /**
+     * Use device flow (RFC 8628) instead of the browser callback. Only
+     * works for providers whose scopes are on Google's device-flow
+     * allowlist (currently: youtube full+readonly, calendar). Providers
+     * that throw `device flow not supported` block this branch with a
+     * clear error.
+     */
+    readonly useDeviceFlow?: boolean;
 }
 
 /**

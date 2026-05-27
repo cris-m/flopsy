@@ -15,7 +15,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { JobExecutor, parseConditionalResponse } from '../src/proactive/pipeline/executor';
+import { JobExecutor, parseConditionalResponse, isSilentSentinel } from '../src/proactive/pipeline/executor';
 import { StateStore } from '../src/proactive/state/store';
 import { ProactiveDedupStore } from '../src/proactive/state/dedup-store';
 import { PresenceManager } from '../src/proactive/state/presence';
@@ -142,10 +142,10 @@ describe('JobExecutor — basic delivery flow', () => {
         expect(state.lastAction).toBe('delivered');
     });
 
-    it('suppresses when the agent reply is empty/whitespace', async () => {
+    it('suppresses empty reply in conditional mode (always mode ships a fallback notice instead)', async () => {
         h.setAgent(async () => ({ response: '   \n  ' }));
         const exec = h.build();
-        const result = await exec.execute(makeJob());
+        const result = await exec.execute(makeJob({ deliveryMode: 'conditional' }));
 
         expect(result.action).toBe('suppressed');
         expect(h.sentMessages).toHaveLength(0);
@@ -437,5 +437,96 @@ describe('parseConditionalResponse — pure helper', () => {
             '```json\n{"status":"suppress","reason":"q"}\n```',
         );
         expect(out).toEqual({ status: 'suppress', reason: 'q' });
+    });
+});
+
+describe('isSilentSentinel — pure predicate', () => {
+    it('matches exact [SILENT]', () => {
+        expect(isSilentSentinel('[SILENT]')).toBe(true);
+    });
+
+    it('matches [SILENT] with surrounding whitespace', () => {
+        expect(isSilentSentinel(' [SILENT] ')).toBe(true);
+        expect(isSilentSentinel('\n[SILENT]\n')).toBe(true);
+        expect(isSilentSentinel('\t[SILENT]\t')).toBe(true);
+    });
+
+    it('does NOT match [SILENT] with trailing content', () => {
+        expect(isSilentSentinel('[SILENT] follow-up')).toBe(false);
+        expect(isSilentSentinel('[SILENT]\nwith more text')).toBe(false);
+        expect(isSilentSentinel('prefix [SILENT]')).toBe(false);
+    });
+
+    it('does NOT match lowercase or variant casing (case-sensitive)', () => {
+        expect(isSilentSentinel('[silent]')).toBe(false);
+        expect(isSilentSentinel('[Silent]')).toBe(false);
+    });
+
+    it('does NOT match unrelated text', () => {
+        expect(isSilentSentinel('hello world')).toBe(false);
+        expect(isSilentSentinel('')).toBe(false);
+        expect(isSilentSentinel('   ')).toBe(false);
+    });
+
+    it('handles null/undefined safely', () => {
+        expect(isSilentSentinel(null)).toBe(false);
+        expect(isSilentSentinel(undefined)).toBe(false);
+    });
+});
+
+describe('JobExecutor — [SILENT] sentinel suppression', () => {
+    let h: ReturnType<typeof makeHarness>;
+    afterEach(() => h.cleanup());
+    beforeEach(() => (h = makeHarness()));
+
+    it('suppresses delivery when agent emits exactly [SILENT] in always mode', async () => {
+        h.setAgent(async () => ({ response: '[SILENT]' }));
+        const exec = h.build();
+        const result = await exec.execute(makeJob({ deliveryMode: 'always' }));
+
+        expect(result.action).toBe('suppressed');
+        expect(h.sentMessages).toHaveLength(0);
+
+        const state = await h.store.getJobState('test-job');
+        expect(state.suppressedCount).toBe(1);
+        expect(state.deliveredCount).toBe(0);
+    });
+
+    it('suppresses delivery when agent emits [SILENT] in conditional mode', async () => {
+        h.setAgent(async () => ({ response: '[SILENT]' }));
+        const exec = h.build();
+        const result = await exec.execute(makeJob({ deliveryMode: 'conditional' }));
+
+        expect(result.action).toBe('suppressed');
+        expect(h.sentMessages).toHaveLength(0);
+    });
+
+    it('trims whitespace before matching the sentinel', async () => {
+        h.setAgent(async () => ({ response: '   [SILENT]\n' }));
+        const exec = h.build();
+        const result = await exec.execute(makeJob({ deliveryMode: 'always' }));
+
+        expect(result.action).toBe('suppressed');
+        expect(h.sentMessages).toHaveLength(0);
+    });
+
+    it('does NOT suppress when [SILENT] is followed by other content', async () => {
+        h.setAgent(async () => ({ response: '[SILENT] follow-up' }));
+        const exec = h.build();
+        const result = await exec.execute(makeJob({ deliveryMode: 'always' }));
+
+        // Not a sentinel — falls through to normal delivery.
+        expect(result.action).toBe('delivered');
+        expect(h.sentMessages).toHaveLength(1);
+        expect(h.sentMessages[0]!.text).toBe('[SILENT] follow-up');
+    });
+
+    it('delivers normal prose unchanged', async () => {
+        h.setAgent(async () => ({ response: 'normal pulse content' }));
+        const exec = h.build();
+        const result = await exec.execute(makeJob({ deliveryMode: 'always' }));
+
+        expect(result.action).toBe('delivered');
+        expect(h.sentMessages[0]!.text).toBe('normal pulse content');
     });
 });

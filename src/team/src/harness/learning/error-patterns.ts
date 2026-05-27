@@ -21,8 +21,17 @@
  */
 export function normalizeErrorPattern(raw: string): string {
     if (!raw) return '';
-    const firstLine = raw.split('\n')[0] ?? raw;
-    return firstLine
+    let head = (raw.split('\n')[0] ?? raw).trim();
+    // A first line that's only structural punctuation (e.g. "[" from a
+    // pretty-printed JSON/array error) carries no signal and collapses every
+    // distinct failure to one char. Detect it with a plain character check
+    // (no regex) and fall back to the whole error flattened to one line.
+    const STRUCTURAL = '[]{}(),';
+    const onlyStructural = head.length > 0 && [...head].every((c) => STRUCTURAL.includes(c));
+    if (head.length <= 2 || onlyStructural) {
+        head = raw.split('\n').join(' ').replace(/\s+/g, ' ').trim();
+    }
+    return head
         .replace(/\b(?:[a-z]:)?\/[\w./\-_]{4,}/gi, '<path>')
         .replace(/\b0x[0-9a-f]+/gi, '<hex>')
         .replace(/\b\d{6,}\b/g, '<id>')

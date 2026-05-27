@@ -3,10 +3,24 @@ import type {
     OutboundMessage,
     ReactionOptions,
     Message,
+    Media,
     StreamingCapability,
 } from '@gateway/types';
+import { isTextDocument } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
 import type { SlackChannelConfig } from './types';
+
+const MAX_TEXT_DOCUMENT_BYTES = 256 * 1024;
+
+interface SlackFile {
+    id?: string;
+    name?: string;
+    mimetype?: string;
+    filetype?: string;
+    size?: number;
+    url_private_download?: string;
+    url_private?: string;
+}
 
 export class SlackChannel extends BaseChannel {
     readonly name = 'slack';
@@ -47,8 +61,12 @@ export class SlackChannel extends BaseChannel {
                     channel?: string;
                     ts?: string;
                     thread_ts?: string;
+                    files?: SlackFile[];
                 };
-                if (msg.subtype || msg.bot_id || !msg.text) return;
+                if (msg.bot_id) return;
+                const isFileShare = msg.subtype === 'file_share' && Array.isArray(msg.files) && msg.files.length > 0;
+                if (msg.subtype && !isFileShare) return;
+                if (!msg.text && !isFileShare) return;
 
                 const isDm = msg.channel_type === 'im';
                 const peerType = isDm ? ('user' as const) : ('group' as const);
@@ -58,14 +76,16 @@ export class SlackChannel extends BaseChannel {
                 if (!this.isAllowed(isDm ? senderId : peerId, peerType)) return;
 
                 if (!isDm && this.channelConfig.groupActivation === 'mention') {
-                    if (!msg.text.includes(`<@${this.botUserId}>`)) return;
+                    if (!msg.text?.includes(`<@${this.botUserId}>`)) return;
                 }
 
                 let senderName: string | undefined;
                 try {
                     const info = await client.users.info({ user: senderId });
                     senderName = info.user?.real_name ?? info.user?.name;
-                } catch {}
+                } catch (err) {
+                    this.log.debug({ err, senderId }, 'slack users.info failed — senderName stays undefined');
+                }
 
                 let peerName: string | undefined;
                 if (isDm) {
@@ -74,19 +94,54 @@ export class SlackChannel extends BaseChannel {
                     try {
                         const info = await client.conversations.info({ channel: peerId });
                         peerName = info.channel?.name;
-                    } catch {}
+                    } catch (err) {
+                        this.log.debug({ err, peerId }, 'slack conversations.info failed — peerName stays undefined');
+                    }
+                }
+
+                const media: Media[] = [];
+                if (isFileShare && msg.files) {
+                    for (const f of msg.files) {
+                        const fileName = f.name;
+                        const mimeType = f.mimetype;
+                        const fileSize = f.size;
+                        const downloadUrl = f.url_private_download ?? f.url_private;
+                        const isText = isTextDocument(mimeType, fileName);
+                        const withinSize = !fileSize || fileSize <= MAX_TEXT_DOCUMENT_BYTES;
+                        if (downloadUrl && isText && withinSize) {
+                            try {
+                                const res = await fetch(downloadUrl, {
+                                    headers: { Authorization: `Bearer ${this.channelConfig.botToken}` },
+                                });
+                                if (res.ok) {
+                                    const buffer = await res.arrayBuffer();
+                                    if (buffer.byteLength <= MAX_TEXT_DOCUMENT_BYTES) {
+                                        const text = new TextDecoder('utf-8', { fatal: false }).decode(buffer);
+                                        media.push({ type: 'document', fileName, mimeType, fileSize, text });
+                                        continue;
+                                    }
+                                }
+                            } catch {
+                                /* fall through to metadata-only */
+                            }
+                        }
+                        media.push({ type: 'document', fileName, mimeType, fileSize });
+                    }
                 }
 
                 const ts = msg.ts ?? '';
+                const body = msg.text ?? (media.length > 0 ? `[${media[0]!.fileName ?? 'file'}]` : '');
                 const normalized: Message = {
                     id: ts,
                     channelName: this.name,
                     peer: { id: peerId, type: peerType, name: peerName },
                     sender: { id: senderId, name: senderName },
-                    body: msg.text,
+                    body,
+                    synthetic: !msg.text && media.length > 0 ? true : undefined,
                     timestamp: new Date(parseFloat(ts) * 1000).toISOString(),
                     replyTo:
                         msg.thread_ts && msg.thread_ts !== ts ? { id: msg.thread_ts } : undefined,
+                    media: media.length > 0 ? media : undefined,
                 };
 
                 await this.emit('onMessage', normalized);
@@ -127,7 +182,37 @@ export class SlackChannel extends BaseChannel {
     }
 
     async sendTyping(_peer: Peer): Promise<void> {
-        // Slack has no typing indicator API for bots
+    }
+
+    /**
+     * Delete a Slack message by timestamp. Used by reasoning auto-cleanup.
+     * Slack requires `channel` (= peer.id) and `ts` (= messageId returned
+     * from chat.postMessage). Failures swallowed — best-effort.
+     */
+    async deleteMessage(messageId: string, peer: Peer): Promise<void> {
+        if (!this.app) return;
+        try {
+            await this.app.client.chat.delete({
+                token: this.channelConfig.botToken,
+                channel: peer.id,
+                ts: messageId,
+            });
+        } catch {
+            /* already gone, permission-denied, or stale ts — ignore */
+        }
+    }
+
+    /**
+     * Slack mrkdwn: no native spoilers/collapsibles, so the next-best
+     * native styling is a `*bold*` header above a `>` blockquote. Slack
+     * visually demotes blockquote text (grey vertical bar + dimmer fg)
+     * so it reads as "secondary context" without competing with the answer.
+     */
+    override formatReasoning(content: string): string {
+        const trimmed = content.trim();
+        if (!trimmed) return '';
+        const quoted = trimmed.split('\n').map((l) => `> ${l}`).join('\n');
+        return `*💭 Reasoning*\n${quoted}`;
     }
 
     async react(options: ReactionOptions): Promise<void> {

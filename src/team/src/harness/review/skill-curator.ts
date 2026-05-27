@@ -1,30 +1,81 @@
-/**
- * SkillCurator — async sweeper that auto-manages skill lifecycle state.
- *
- * Runs at session-close time (non-blocking, best-effort). Only touches
- * agent-created skills (`is_agent_created: true`). Bundled / hand-crafted
- * skills are never auto-archived.
- *
- * Transitions:
- *   active  → stale    when last_viewed_at is older than STALE_AFTER_DAYS and
- *                       the skill has not been pinned
- *   stale   → archived when last_viewed_at is older than ARCHIVE_AFTER_DAYS
- *
- * A skill transitions back active→stale→active automatically when the agent
- * reads it (view sets state = 'active' if it was stale). This means the
- * curator is NOT destructive — it only adjusts catalog visibility.
- */
-
 import { readdirSync, existsSync } from 'fs';
 import { join } from 'path';
 import { createLogger } from '@flopsy/shared';
 import type { SkillUsageStore, SkillUsageRecord } from './skill-usage-store';
+import { patchSkillFile } from './skill-writer';
 
 const log = createLogger('skill-curator');
 
-/** Days of no reads before a skill becomes stale. */
+const VALIDATION_MIN_HOURS = 24;
+const VALIDATION_MIN_FIRES = 8;
+// reject if post-edit reply rate fell more than this (absolute) below baseline
+const VALIDATION_DEGRADE_MARGIN = 0.1;
+
+export interface ProactiveEngagementSource {
+    getProactiveEngagement(sinceMs: number, untilMs?: number): { delivered: number; replied: number };
+}
+
+export interface ValidationResult {
+    accepted: string[];
+    rejected: string[];
+    stillPending: string[];
+}
+
+// Only `proactive` is gated — the one fire type with a measurable engagement signal.
+export async function validatePendingEdits(
+    skillsPath: string,
+    store: SkillUsageStore,
+    engagement: ProactiveEngagementSource,
+    skillNames: readonly string[] = ['proactive'],
+    now: number = Date.now(),
+): Promise<ValidationResult> {
+    const result: ValidationResult = { accepted: [], rejected: [], stillPending: [] };
+    for (const name of skillNames) {
+        const edit = store.getPendingEdit(name);
+        if (!edit) continue;
+
+        const ageHours = (now - edit.appliedAt) / (60 * 60 * 1000);
+        if (ageHours < VALIDATION_MIN_HOURS) {
+            result.stillPending.push(name);
+            continue;
+        }
+        const post = engagement.getProactiveEngagement(edit.appliedAt, now);
+        if (post.delivered < VALIDATION_MIN_FIRES) {
+            result.stillPending.push(name);
+            continue;
+        }
+        const postRate = post.replied / post.delivered;
+
+        if (postRate + VALIDATION_DEGRADE_MARGIN < edit.baselineRate) {
+            let reverted = true;
+            for (const bullet of edit.bullets) {
+                try {
+                    const r = await patchSkillFile(skillsPath, name, `- ${bullet}`, '', 1);
+                    if (!r.ok) reverted = false;
+                } catch {
+                    reverted = false;
+                }
+            }
+            for (const fp of edit.fingerprints) store.addRejectedEdit(name, fp);
+            store.clearPendingEdit(name);
+            result.rejected.push(name);
+            log.info(
+                { name, baselineRate: edit.baselineRate, postRate: Number(postRate.toFixed(2)), n: post.delivered, reverted },
+                'curator: reverted skill edit that hurt engagement',
+            );
+        } else {
+            store.clearPendingEdit(name);
+            result.accepted.push(name);
+            log.info(
+                { name, baselineRate: edit.baselineRate, postRate: Number(postRate.toFixed(2)), n: post.delivered },
+                'curator: accepted validated skill edit',
+            );
+        }
+    }
+    return result;
+}
+
 const STALE_AFTER_DAYS = 30;
-/** Days of no reads before a stale skill is archived. */
 const ARCHIVE_AFTER_DAYS = 90;
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -34,10 +85,6 @@ export interface CuratorResult {
     markedArchived: string[];
 }
 
-/**
- * Run a single curator pass over all agent-created skills.
- * Returns a summary of what changed (empty arrays if nothing changed).
- */
 export function runSkillCurator(
     skillsPath: string,
     store: SkillUsageStore,
@@ -51,14 +98,8 @@ export function runSkillCurator(
     for (const name of Object.keys(allRecords)) {
         const rec = allRecords[name];
         if (!rec) continue;
-
-        // Only manage agent-created skills; never touch pinned skills.
         if (!rec.is_agent_created || rec.pinned) continue;
-
-        // Already archived — nothing more to do.
         if (rec.state === 'archived') continue;
-
-        // Skip if the skill file doesn't exist on disk (may have been manually deleted).
         if (!onDiskNames.has(name)) continue;
 
         const lastUsed = rec.last_viewed_at ? Date.parse(rec.last_viewed_at) : Date.parse(rec.created_at);

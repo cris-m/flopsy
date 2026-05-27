@@ -41,12 +41,13 @@ import {
     statSync,
     writeFileSync,
 } from 'node:fs';
-import { basename, isAbsolute, join, resolve as resolvePath } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve as resolvePath } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdtempSync } from 'node:fs';
 import { workspace } from '@flopsy/shared';
 import { bad, dim, info, ok, section, warn as warnLine } from '../ui/pretty';
 import { createInterface } from 'node:readline';
+import { readFlopsyConfig } from './config-reader';
 
 interface SkillSummary {
     name: string;
@@ -395,20 +396,39 @@ async function prepareSkill(source: InstallSource): Promise<PreparedSkill> {
 }
 
 /**
- * Promote a prepared skill from its staging dir to the active dir.
- * Refuses to overwrite an existing active skill — uninstall first or use
- * a different name. Returns the final destination path.
+ * Promote a prepared skill from its staging dir to the active dir, respecting
+ * the `category:` frontmatter so the install lands at
+ * `<HOME>/content/skills/<category>/<name>/SKILL.md`. Falls back to a flat
+ * layout when no category is declared. Refuses to overwrite an existing
+ * active skill anywhere in the tree (flat OR grouped) — uninstall first.
  */
 function promoteToActive(prepared: PreparedSkill): string {
-    const dest = join(workspace.skills(), prepared.skillName);
-    if (existsSync(dest)) {
+    const category = readSkillCategory(prepared.stagingDir);
+    const activeBase = workspace.skills();
+    const existing = findSkillPath(activeBase, prepared.skillName);
+    if (existing) {
         throw new Error(
-            `"${prepared.skillName}" is already active. Uninstall it first to replace.`,
+            `"${prepared.skillName}" is already active at ${existing.replace(/\/SKILL\.md$/, '')}. Uninstall it first to replace.`,
         );
     }
-    mkdirSync(workspace.skills(), { recursive: true });
+    const dest = category
+        ? join(activeBase, category, prepared.skillName)
+        : join(activeBase, prepared.skillName);
+    mkdirSync(dirname(dest), { recursive: true });
     cpSync(prepared.stagingDir, dest, { recursive: true });
     return dest;
+}
+
+function readSkillCategory(skillDir: string): string | null {
+    const skillMd = join(skillDir, 'SKILL.md');
+    if (!existsSync(skillMd)) return null;
+    try {
+        const raw = readFileSync(skillMd, 'utf-8');
+        const m = raw.match(/^category:\s*([a-zA-Z0-9_-]+)/m);
+        return m?.[1] ?? null;
+    } catch {
+        return null;
+    }
 }
 
 function readSkillSummary(dir: string, name: string): SkillSummary | null {
@@ -439,15 +459,67 @@ function listSkillsIn(dir: string): SkillSummary[] {
     const entries = readdirSync(dir);
     const out: SkillSummary[] = [];
     for (const entry of entries) {
+        const entryPath = join(dir, entry);
         try {
-            if (!statSync(join(dir, entry)).isDirectory()) continue;
+            if (!statSync(entryPath).isDirectory()) continue;
         } catch {
             continue;
         }
-        const summary = readSkillSummary(dir, entry);
-        if (summary) out.push(summary);
+        // Flat: dir/<entry>/SKILL.md
+        if (existsSync(join(entryPath, 'SKILL.md'))) {
+            const summary = readSkillSummary(dir, entry);
+            if (summary) out.push(summary);
+            continue;
+        }
+        // Grouped: dir/<group>/<sub>/SKILL.md — scan one level deeper.
+        let subEntries: string[];
+        try {
+            subEntries = readdirSync(entryPath);
+        } catch {
+            continue;
+        }
+        for (const sub of subEntries) {
+            const subPath = join(entryPath, sub);
+            try {
+                if (!statSync(subPath).isDirectory()) continue;
+            } catch {
+                continue;
+            }
+            if (!existsSync(join(subPath, 'SKILL.md'))) continue;
+            const summary = readSkillSummary(entryPath, sub);
+            if (summary) out.push(summary);
+        }
     }
     return out.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Resolve a skill name → its actual SKILL.md path, walking both layouts:
+ *   1. Flat:    <root>/<name>/SKILL.md
+ *   2. Grouped: <root>/<group>/<name>/SKILL.md
+ * Returns the full SKILL.md path or null when not found.
+ */
+function findSkillPath(root: string, name: string): string | null {
+    const flat = join(root, name, 'SKILL.md');
+    if (existsSync(flat)) return flat;
+    if (!existsSync(root)) return null;
+    let groups: string[];
+    try {
+        groups = readdirSync(root);
+    } catch {
+        return null;
+    }
+    for (const group of groups) {
+        const candidate = join(root, group, name, 'SKILL.md');
+        try {
+            if (existsSync(candidate) && statSync(join(root, group)).isDirectory()) {
+                return candidate;
+            }
+        } catch {
+            continue;
+        }
+    }
+    return null;
 }
 
 function renderList(skills: SkillSummary[], header: string): void {
@@ -580,7 +652,12 @@ export function registerSkillCommands(root: Command): void {
             try {
                 const dest = promoteToActive(prepared);
                 console.log(ok(`Installed "${prepared.skillName}" → ${dest}`));
-                console.log(dim('  Restart the gateway for the agent to pick it up.'));
+                const reloaded = await reloadSkillCatalog().catch(() => false);
+                if (reloaded) {
+                    console.log(dim('  Catalog hot-reloaded — next agent turn picks it up. No restart needed.'));
+                } else {
+                    console.log(dim('  Restart the gateway for the agent to pick it up (gateway not running or reload endpoint unreachable).'));
+                }
             } catch (err) {
                 console.log(bad(`Install failed: ${(err as Error).message}`));
                 process.exit(1);
@@ -590,40 +667,66 @@ export function registerSkillCommands(root: Command): void {
     skill
         .command('uninstall')
         .description(
-            'Move an active skill back to optional (re-installable later). Restart the gateway.',
+            'Move an active skill back to optional (re-installable later). Mirrors the source category — skills/<cat>/<name>/ → skills-optional/<cat>/<name>/.',
         )
         .argument('<name>', 'Skill name')
         .option('--purge', 'Delete the skill entirely instead of moving to optional', false)
-        .action((name: string, opts: { purge?: boolean }) => {
-            const active = join(workspace.skills(), name);
-            const optional = join(workspace.skillsOptional(), name);
-
-            if (!existsSync(active)) {
+        .action(async (name: string, opts: { purge?: boolean }) => {
+            // Resolve to the actual skill directory (parent of SKILL.md) —
+            // walks both flat and grouped layouts so we can preserve the
+            // category context when mirroring to optional/.
+            const activeSkillMd = findSkillPath(workspace.skills(), name);
+            if (!activeSkillMd) {
                 console.log(bad(`No active skill named "${name}"`));
                 process.exit(1);
             }
+            const active = activeSkillMd.replace(/\/SKILL\.md$/, '');
+            const category = readSkillCategory(active);
+            const optionalBase = workspace.skillsOptional();
+            const optional = category ? join(optionalBase, category, name) : join(optionalBase, name);
 
             try {
                 if (opts.purge) {
                     rmSync(active, { recursive: true, force: true });
                     console.log(ok(`Purged "${name}" (no recovery — re-author or re-fetch).`));
-                    return;
-                }
-                if (existsSync(optional)) {
+                } else if (existsSync(optional)) {
                     // Avoid clobbering an existing optional copy — purge the
                     // active one (it's the same content) instead of moving.
                     rmSync(active, { recursive: true, force: true });
                     console.log(
-                        ok(`Removed "${name}" from active (a copy already exists in optional).`),
+                        ok(`Removed "${name}" from active (a copy already exists in optional at ${optional}).`),
                     );
                 } else {
-                    mkdirSync(workspace.skillsOptional(), { recursive: true });
+                    mkdirSync(dirname(optional), { recursive: true });
                     renameSync(active, optional);
-                    console.log(ok(`Uninstalled "${name}" → moved to optional.`));
+                    console.log(ok(`Uninstalled "${name}" → ${optional}`));
                 }
-                console.log(dim('  Restart the gateway to refresh the catalog.'));
+                const reloaded = await reloadSkillCatalog().catch(() => false);
+                if (reloaded) {
+                    console.log(dim('  Catalog hot-reloaded — next agent turn picks it up. No restart needed.'));
+                } else {
+                    console.log(dim('  Restart the gateway to refresh the catalog (gateway not running or reload endpoint unreachable).'));
+                }
             } catch (err) {
                 console.log(bad(`Uninstall failed: ${(err as Error).message}`));
+                process.exit(1);
+            }
+        });
+
+    skill
+        .command('reload')
+        .description('Force a live re-scan of the skills catalog across all running agents (no gateway restart needed)')
+        .action(async () => {
+            try {
+                const reloaded = await reloadSkillCatalog();
+                if (reloaded) {
+                    console.log(ok('Skill catalog reload requested — next agent turn re-scans.'));
+                } else {
+                    console.log(bad('Reload endpoint did not confirm — gateway may not be running.'));
+                    process.exit(1);
+                }
+            } catch (err) {
+                console.log(bad(`Reload failed: ${(err as Error).message}`));
                 process.exit(1);
             }
         });
@@ -633,11 +736,9 @@ export function registerSkillCommands(root: Command): void {
         .description('Print a skill\'s SKILL.md (works for both active and optional)')
         .argument('<name>', 'Skill name')
         .action((name: string) => {
-            const candidates = [
-                join(workspace.skills(), name, 'SKILL.md'),
-                join(workspace.skillsOptional(), name, 'SKILL.md'),
-            ];
-            const found = candidates.find((p) => existsSync(p));
+            const found =
+                findSkillPath(workspace.skills(), name) ??
+                findSkillPath(workspace.skillsOptional(), name);
             if (!found) {
                 console.log(bad(`No skill named "${name}" (active or optional).`));
                 process.exit(1);
@@ -679,25 +780,35 @@ export function registerSkillCommands(root: Command): void {
 
     proposed
         .command('accept <name>')
-        .description('Promote a proposed skill to active (moves proposed/<name> → skills/<name>)')
-        .action((name: string) => {
+        .description('Promote a proposed skill to active. Respects `category:` frontmatter — lands at skills/<category>/<name>/.')
+        .action(async (name: string) => {
             const src = join(workspace.skillsProposed(), name);
-            const dest = join(workspace.skills(), name);
-            if (!existsSync(src)) {
+            if (!existsSync(join(src, 'SKILL.md'))) {
                 console.log(bad(`No proposed skill "${name}"`));
                 process.exit(1);
             }
-            if (existsSync(dest)) {
-                console.log(bad(`Active skill "${name}" already exists — rename the proposed one or remove the active first.`));
+            const category = readSkillCategory(src);
+            const activeBase = workspace.skills();
+            const existing = findSkillPath(activeBase, name);
+            if (existing) {
+                console.log(bad(`Active skill "${name}" already exists at ${existing.replace(/\/SKILL\.md$/, '')} — rename the proposed one or remove the active first.`));
                 process.exit(1);
             }
+            const dest = category ? join(activeBase, category, name) : join(activeBase, name);
             try {
+                mkdirSync(dirname(dest), { recursive: true });
                 renameSync(src, dest);
             } catch (err) {
                 console.log(bad(`Promotion failed: ${(err as Error).message}`));
                 process.exit(1);
             }
-            console.log(ok(`Promoted "${name}" to active. Restart the gateway for the agent to pick it up.`));
+            console.log(ok(`Promoted "${name}" → ${dest}`));
+            const reloaded = await reloadSkillCatalog().catch(() => false);
+            if (reloaded) {
+                console.log(dim('  Catalog hot-reloaded — next agent turn picks it up. No restart needed.'));
+            } else {
+                console.log(dim('  Restart the gateway for the agent to pick it up (gateway not running or reload endpoint unreachable).'));
+            }
         });
 
     proposed
@@ -718,5 +829,380 @@ export function registerSkillCommands(root: Command): void {
             console.log(ok(`Rejected "${name}".`));
         });
 
+    proposed
+        .command('promote <name>')
+        .description('Auto-promote a proposed skill via eval gate: runs evals/evals.json with and without the skill, promotes if pass-rate delta ≥ threshold')
+        .option('--threshold <n>', 'Minimum (with - without) pass-rate delta to promote (0..1)', '0.30')
+        .option('--timeout-ms <ms>', 'Per-eval timeout', '120000')
+        .option('--dry-run', 'Run evals but do not promote even on success', false)
+        .action(async (name: string, opts: { threshold?: string; timeoutMs?: string; dryRun?: boolean }) => {
+            const threshold = Number(opts.threshold ?? '0.30');
+            const timeoutMs = Number(opts.timeoutMs ?? '120000');
+            if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
+                console.log(bad('--threshold must be between 0 and 1'));
+                process.exit(1);
+            }
+            await runPromoteEval(name, { threshold, timeoutMs, dryRun: !!opts.dryRun });
+        });
+
+    skill
+        .command('eval <name>')
+        .description('Run a skill\'s evals/evals.json against the current catalog (skill must already be active). Prints pass/fail per assertion; non-zero exit on any failure.')
+        .option('--timeout-ms <ms>', 'Per-eval timeout', '120000')
+        .action(async (name: string, opts: { timeoutMs?: string }) => {
+            const timeoutMs = Number(opts.timeoutMs ?? '120000');
+            const path = findSkillPath(workspace.skills(), name);
+            if (!path) {
+                console.log(bad(`No active skill "${name}". Use \`flopsy skill list\` to see what's installed.`));
+                process.exit(1);
+            }
+            const evalsPath = join(path.replace(/\/SKILL\.md$/, ''), 'evals', 'evals.json');
+            if (!existsSync(evalsPath)) {
+                console.log(bad(`No evals file at ${evalsPath}. Add evals/evals.json with prompts + assertions to enable eval runs.`));
+                process.exit(1);
+            }
+            const cases = readEvalsFile(evalsPath);
+            console.log(section(`Eval — ${name} (${cases.length} cases)`));
+            const results = await runEvalSet(cases, timeoutMs);
+            const summary = summarizeEvalResults(results);
+            printEvalSummary('with-skill', summary);
+            if (summary.failedAssertions > 0 || summary.errors > 0) process.exit(1);
+        });
+
     skill.action((_opts: unknown, cmd: { outputHelp(): void }) => cmd.outputHelp());
+}
+
+/**
+ * Ask the running gateway to drop its cached skill catalog so the next
+ * agent turn re-scans `.flopsy/content/skills/`. Returns false silently
+ * when the gateway is not running or the endpoint isn't wired (older
+ * builds). Called automatically by install / accept / uninstall.
+ */
+async function reloadSkillCatalog(): Promise<boolean> {
+    try {
+        const { managementUrl } = await import('./schedule-client');
+        const { loadMgmtToken } = await import('@flopsy/shared');
+        const token = loadMgmtToken();
+        const res = await fetch(managementUrl('/management/skills/reload'), {
+            method: 'POST',
+            headers: token ? { Authorization: `Bearer ${token}` } : {},
+            signal: AbortSignal.timeout(2000),
+        });
+        if (!res.ok) return false;
+        const body = (await res.json()) as { reloaded?: boolean };
+        return body.reloaded === true;
+    } catch {
+        return false;
+    }
+}
+
+// ── Eval framework ──────────────────────────────────────────────────────────
+//
+// Two consumers:
+//   - `flopsy skill eval <name>`   → run-and-grade only (assumes skill active)
+//   - `flopsy skill proposed promote <name>` → with/without comparison +
+//      conditional promotion based on pass-rate delta.
+//
+// Both call /management/skill-eval-run for each prompt; the gateway builds a
+// fresh stateless agent per call (fresh skills() closure → fresh catalog scan)
+// so moving a skill in/out of the active dir between calls is enough to flip
+// the with/without state without a gateway restart.
+
+interface EvalCase {
+    id: string | number;
+    prompt: string;
+    assertions: Array<string | Record<string, unknown>>;
+}
+
+interface AssertionResult {
+    text: string;
+    passed: boolean;
+    evidence: string;
+}
+
+interface EvalCaseResult {
+    id: string | number;
+    prompt: string;
+    reply: string;
+    durationMs: number;
+    error?: string;
+    assertions: AssertionResult[];
+}
+
+interface EvalSummary {
+    totalCases: number;
+    errors: number;
+    totalAssertions: number;
+    passedAssertions: number;
+    failedAssertions: number;
+    passRate: number;
+    totalDurationMs: number;
+}
+
+function readEvalsFile(path: string): EvalCase[] {
+    let raw: unknown;
+    try {
+        raw = JSON.parse(readFileSync(path, 'utf-8'));
+    } catch (err) {
+        console.log(bad(`Failed to parse ${path}: ${(err as Error).message}`));
+        process.exit(1);
+    }
+    const evals = (raw as { evals?: unknown })?.evals;
+    if (!Array.isArray(evals)) {
+        console.log(bad(`Eval file must have shape { "evals": [...] }`));
+        process.exit(1);
+    }
+    const out: EvalCase[] = [];
+    for (let i = 0; i < evals.length; i++) {
+        const e = evals[i] as Record<string, unknown>;
+        if (typeof e?.prompt !== 'string') {
+            console.log(bad(`Eval #${i}: missing or non-string \`prompt\``));
+            process.exit(1);
+        }
+        if (!Array.isArray(e?.assertions) || e.assertions.length === 0) {
+            console.log(bad(`Eval #${i}: missing or empty \`assertions\` array`));
+            process.exit(1);
+        }
+        out.push({
+            id: (e.id as string | number | undefined) ?? i + 1,
+            prompt: e.prompt,
+            assertions: e.assertions as Array<string | Record<string, unknown>>,
+        });
+    }
+    return out;
+}
+
+function gradeAssertion(reply: string, assertion: string | Record<string, unknown>): AssertionResult {
+    if (typeof assertion === 'string') {
+        const passed = reply.toLowerCase().includes(assertion.toLowerCase());
+        return {
+            text: assertion,
+            passed,
+            evidence: passed
+                ? `Reply contains "${assertion}"`
+                : `Reply does NOT contain "${assertion}"`,
+        };
+    }
+    const text = (assertion['text'] as string) ?? JSON.stringify(assertion);
+    if (typeof assertion['contains'] === 'string') {
+        const needle = assertion['contains'];
+        const passed = reply.toLowerCase().includes(needle.toLowerCase());
+        return {
+            text,
+            passed,
+            evidence: passed
+                ? `Reply contains "${needle}"`
+                : `Reply does NOT contain "${needle}"`,
+        };
+    }
+    if (typeof assertion['regex'] === 'string') {
+        const flags = (assertion['flags'] as string | undefined) ?? '';
+        try {
+            const re = new RegExp(assertion['regex'], flags);
+            const m = reply.match(re);
+            return {
+                text,
+                passed: !!m,
+                evidence: m ? `matched: ${m[0].slice(0, 80)}` : `no match for /${assertion['regex']}/${flags}`,
+            };
+        } catch (err) {
+            return { text, passed: false, evidence: `invalid regex: ${(err as Error).message}` };
+        }
+    }
+    if (typeof assertion['file_exists'] === 'string') {
+        const p = assertion['file_exists'];
+        const passed = existsSync(p);
+        return {
+            text,
+            passed,
+            evidence: passed ? `${p} exists` : `${p} does NOT exist`,
+        };
+    }
+    return {
+        text,
+        passed: false,
+        evidence: 'unverifiable assertion shape — use string, {contains}, {regex}, or {file_exists}',
+    };
+}
+
+async function runEvalCase(c: EvalCase, timeoutMs: number): Promise<EvalCaseResult> {
+    const { managementUrl } = await import('./schedule-client');
+    const { loadMgmtToken } = await import('@flopsy/shared');
+    const token = loadMgmtToken();
+    let reply = '';
+    let durationMs = 0;
+    let runErr: string | undefined;
+    try {
+        const res = await fetch(managementUrl('/management/skill-eval-run'), {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            },
+            body: JSON.stringify({ prompt: c.prompt, timeoutMs }),
+            signal: AbortSignal.timeout(timeoutMs + 5000),
+        });
+        if (!res.ok) {
+            runErr = `mgmt endpoint returned ${res.status}`;
+        } else {
+            const body = (await res.json()) as { reply?: string; durationMs?: number; error?: string };
+            reply = body.reply ?? '';
+            durationMs = body.durationMs ?? 0;
+            if (body.error) runErr = body.error;
+        }
+    } catch (err) {
+        runErr = err instanceof Error ? err.message : String(err);
+    }
+    const assertions = c.assertions.map((a) => gradeAssertion(reply, a));
+    return { id: c.id, prompt: c.prompt, reply, durationMs, ...(runErr ? { error: runErr } : {}), assertions };
+}
+
+async function runEvalSet(cases: EvalCase[], timeoutMs: number): Promise<EvalCaseResult[]> {
+    const results: EvalCaseResult[] = [];
+    for (const c of cases) {
+        process.stdout.write(dim(`  running eval ${c.id}... `));
+        const r = await runEvalCase(c, timeoutMs);
+        const passed = r.assertions.filter((a) => a.passed).length;
+        const total = r.assertions.length;
+        const verdict = r.error ? bad('error') : passed === total ? ok(`${passed}/${total}`) : warnLine(`${passed}/${total}`);
+        console.log(`${verdict} ${dim(`(${r.durationMs}ms)`)}`);
+        if (r.error) console.log(dim(`    error: ${r.error}`));
+        for (const a of r.assertions) {
+            const marker = a.passed ? ok('✓') : bad('✗');
+            console.log(`    ${marker} ${a.text} ${dim(`— ${a.evidence}`)}`);
+        }
+        results.push(r);
+    }
+    return results;
+}
+
+function summarizeEvalResults(results: EvalCaseResult[]): EvalSummary {
+    let total = 0;
+    let passed = 0;
+    let errors = 0;
+    let totalMs = 0;
+    for (const r of results) {
+        if (r.error) errors++;
+        totalMs += r.durationMs;
+        for (const a of r.assertions) {
+            total++;
+            if (a.passed) passed++;
+        }
+    }
+    return {
+        totalCases: results.length,
+        errors,
+        totalAssertions: total,
+        passedAssertions: passed,
+        failedAssertions: total - passed,
+        passRate: total === 0 ? 0 : passed / total,
+        totalDurationMs: totalMs,
+    };
+}
+
+function printEvalSummary(label: string, s: EvalSummary): void {
+    const rate = (s.passRate * 100).toFixed(0);
+    console.log('');
+    console.log(`  ${label}: ${s.passedAssertions}/${s.totalAssertions} assertions  ${dim(`(${rate}% pass, ${s.errors} run errors, ${s.totalDurationMs}ms total)`)}`);
+}
+
+async function runPromoteEval(
+    name: string,
+    opts: { threshold: number; timeoutMs: number; dryRun: boolean },
+): Promise<void> {
+    const proposedDir = join(workspace.skillsProposed(), name);
+    if (!existsSync(join(proposedDir, 'SKILL.md'))) {
+        console.log(bad(`No proposed skill "${name}" at ${proposedDir}`));
+        process.exit(1);
+    }
+    const evalsPath = join(proposedDir, 'evals', 'evals.json');
+    if (!existsSync(evalsPath)) {
+        console.log(bad(`No evals at ${evalsPath}. Auto-promotion requires evals/evals.json — see skill-creator.`));
+        process.exit(1);
+    }
+    const cases = readEvalsFile(evalsPath);
+    if (cases.length < 3) {
+        console.log(bad(`Auto-promotion needs ≥3 eval cases; found ${cases.length}.`));
+        process.exit(1);
+    }
+
+    console.log(section(`Promote eval — ${name} (${cases.length} cases, threshold delta=${opts.threshold})`));
+
+    console.log(dim('\n  Phase 1: baseline (skill still in proposed/, NOT in catalog)'));
+    const baseline = await runEvalSet(cases, opts.timeoutMs);
+    const baselineSummary = summarizeEvalResults(baseline);
+    printEvalSummary('without-skill', baselineSummary);
+
+    const skillMd = readFileSync(join(proposedDir, 'SKILL.md'), 'utf-8');
+    const categoryMatch = skillMd.match(/^category:\s*([a-zA-Z0-9_-]+)/m);
+    const category = categoryMatch?.[1];
+    const activeBase = workspace.skills();
+    const activeDir = category ? join(activeBase, category, name) : join(activeBase, name);
+
+    if (existsSync(activeDir)) {
+        console.log(bad(`Active skill already exists at ${activeDir} — cannot promote.`));
+        process.exit(1);
+    }
+
+    console.log(dim('\n  Phase 2: temporarily promoting proposed/ → active/'));
+    mkdirSync(dirname(activeDir), { recursive: true });
+    renameSync(proposedDir, activeDir);
+
+    let withResults: EvalCaseResult[] = [];
+    let revertReason: string | null = null;
+    try {
+        console.log(dim('\n  Phase 3: with-skill run'));
+        withResults = await runEvalSet(cases, opts.timeoutMs);
+    } catch (err) {
+        revertReason = `with-skill run threw: ${err instanceof Error ? err.message : String(err)}`;
+    }
+
+    const withSummary = summarizeEvalResults(withResults);
+    printEvalSummary('with-skill', withSummary);
+
+    const delta = withSummary.passRate - baselineSummary.passRate;
+    console.log('');
+    console.log(`  delta: ${(delta * 100).toFixed(1)} pp (with - without)`);
+
+    let regressionCount = 0;
+    for (let i = 0; i < cases.length; i++) {
+        const b = baseline[i];
+        const w = withResults[i];
+        if (!b || !w) continue;
+        for (let j = 0; j < b.assertions.length; j++) {
+            const ba = b.assertions[j];
+            const wa = w.assertions[j];
+            if (ba?.passed && wa && !wa.passed) regressionCount++;
+        }
+    }
+    console.log(`  regressions: ${regressionCount} assertion${regressionCount === 1 ? '' : 's'} that passed without the skill now fail with it`);
+
+    const meetsThreshold = delta >= opts.threshold;
+    const passes = meetsThreshold && regressionCount === 0 && revertReason === null;
+
+    if (passes && !opts.dryRun) {
+        console.log('');
+        console.log(ok(`✔ Promoted "${name}" to ${activeDir}`));
+        console.log(dim('  Restart the gateway for the catalog to pick up the new skill.'));
+        return;
+    }
+
+    console.log('');
+    if (revertReason) {
+        console.log(bad(`Reverting: ${revertReason}`));
+    } else if (!meetsThreshold) {
+        console.log(bad(`Reverting: delta ${(delta * 100).toFixed(1)} pp < threshold ${(opts.threshold * 100).toFixed(0)} pp`));
+    } else if (regressionCount > 0) {
+        console.log(bad(`Reverting: ${regressionCount} regression${regressionCount === 1 ? '' : 's'}`));
+    } else if (opts.dryRun) {
+        console.log(info(`Dry run — reverting even though criteria pass`));
+    }
+    try {
+        renameSync(activeDir, proposedDir);
+        console.log(dim(`  Restored ${proposedDir}`));
+    } catch (err) {
+        console.log(bad(`FAILED to revert ${activeDir} → ${proposedDir}: ${(err as Error).message}`));
+        console.log(bad(`  MANUAL ACTION REQUIRED: move the directory back yourself.`));
+    }
+    process.exit(passes ? 0 : 1);
 }

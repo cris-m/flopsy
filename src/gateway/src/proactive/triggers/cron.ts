@@ -202,6 +202,9 @@ export class CronTrigger {
             ...(job.payload.script ? { script: job.payload.script } : {}),
             ...(job.payload.preCheckScript ? { preCheckScript: job.payload.preCheckScript } : {}),
             ...(job.payload.skills && job.payload.skills.length > 0 ? { skills: job.payload.skills } : {}),
+            ...(typeof job.payload.cooldownAfterSilences === 'number' && job.payload.cooldownAfterSilences > 0
+                ? { cooldownAfterSilences: job.payload.cooldownAfterSilences }
+                : {}),
         };
 
         await this.executor.execute(executionJob).catch((err) => {

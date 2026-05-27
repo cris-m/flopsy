@@ -1,7 +1,6 @@
-import { createLogger, resolveWorkspacePath, scrubPii, workspace } from '@flopsy/shared';
+import { createLogger, resolveWorkspacePath, workspace } from '@flopsy/shared';
 import type {
     AgentCallbacks,
-    AgentChunk,
     AgentHandler,
     AgentResult,
     AggregateTaskSummary,
@@ -11,51 +10,91 @@ import type {
     TaskStatusSummary,
     ThreadStatusSnapshot,
 } from '@flopsy/gateway';
-import { ProactiveDecisionSchema } from '@flopsy/gateway';
+import { emitHook, emitHookAwait, ProactiveDecisionSchema } from '@flopsy/gateway';
 import type { AgentDefinition, McpConfig } from '@flopsy/shared';
-import type { BaseChatModel, BaseStore, CheckpointStore, BaseTool, ChatMessage, Provider, ContentBlock, ModelRouter, TextBlock } from 'flopsygraph';
+import type { BaseChatModel, CheckpointStore, BaseTool, ChatMessage, Provider, ContentBlock, ModelRouter, TextBlock, InterceptorTurnContext, InterceptorSessionEndContext, InterceptorContext, MemoryWriteAction } from 'flopsygraph';
+import { defaultContextWindowFor } from 'flopsygraph';
 import {
     CheckpointManager,
     ModelLoader,
-    OllamaEmbedder,
     SqliteCheckpointStore,
-    SqliteMemoryStore,
     tokenCounter,
 } from 'flopsygraph';
 
 import { parseModelString } from './bootstrap';
+import {
+    transcodeAgentStream,
+    type AgentStreamHandle,
+} from './handler/stream-transcoder';
+import { redactSecrets } from './handler/redact';
+import {
+    fireTurnStart as fanoutFireTurnStart,
+    fireTurnEnd as fanoutFireTurnEnd,
+    fireSessionStart as fanoutFireSessionStart,
+    fireSessionEnd as fanoutFireSessionEnd,
+    fireDelegation as fanoutFireDelegation,
+    fireMemoryWrite as fanoutFireMemoryWrite,
+} from './handler/interceptor-fanout';
+import { ThreadPool } from './handler/thread-pool';
+import { McpLifecycle } from './handler/mcp-lifecycle';
+import { MemoryBinding } from './handler/memory-binding';
+import { GoalLifecycle } from './handler/goal-lifecycle';
+import { runSessionExtraction as runExtractionViaModule } from './handler/extraction-runner';
 import { createTeamMember, getCompactorStatus, resolveRole, summarizeForCompaction } from './factory';
 import type { TeamMember, TeamRosterEntry } from './factory';
+import type { Interceptor as FlopsygraphInterceptor } from 'flopsygraph';
+import type { MemoryProvider } from 'flopsygraph';
 import { getSharedLearningStore, getSharedPairingStore } from './harness';
 import { setPairingFacade, setPersonalityFacade, setInsightsFacade, setBranchFacade } from '@flopsy/gateway';
-import type { ExtractionResult, SkillProposal } from './harness/review';
+import type { ExtractionResult } from './harness/review';
 import { SessionExtractor } from './harness/review';
-import { GoalManager } from './harness/goals/goal-manager';
-import {
-    scanExistingSkills,
-    writeSkillFile,
-    appendLessonsToSkill,
-    SkillUsageStore,
-    runSkillCurator,
-} from './harness/review';
+import { GoalManager, type GoalNotificationKind } from './harness/goals/goal-manager';
 import { join as pathJoin } from 'path';
 import type { PersonalityRegistry } from './personalities';
-import {
-    McpClientManager,
-    bridgeAllTools,
-    filterToolsForAgent,
-    loadMcpServers,
-    type BridgedTool,
-} from './mcp';
+import type { BridgedTool } from './mcp';
 import type { LearningStore, SessionRow } from './harness';
 import { SessionResolver } from './session-resolver';
 import { TaskRegistry } from './state/task-registry';
+import { PartialResultError } from './tools/spawn-background-task';
+import { clearPlanForThread } from './tools/plan';
 import type {
     SubAgentFactory,
     SubAgentRunner,
 } from './tools/spawn-background-task';
 
 const log = createLogger('team-handler');
+
+const MID_SESSION_EXTRACT_EVERY = (() => {
+    const raw = process.env.FLOPSY_MID_SESSION_EXTRACT_EVERY?.trim();
+    if (!raw) return 3;
+    const n = Number(raw);
+    return Number.isInteger(n) && n > 0 ? n : 3;
+})();
+
+/**
+ * Detect "verified handle" signals in an assistant reply — concrete artifacts
+ * (URLs, absolute file paths, status codes, message IDs) that indicate
+ * something real happened in the turn. Used to trigger early session
+ * extraction on task success (Hermes-style trajectory capture).
+ */
+const VERIFIED_HANDLE_PATTERNS: readonly RegExp[] = [
+    /https?:\/\/[\w.-]+\/[\w./?=&%-]+/i,        // URL with a path (not just a domain)
+    /\/[A-Za-z][\w.-]*\/[\w.-]+\.\w{1,8}\b/,    // absolute file path with extension
+    /\bHTTP\/\d\.\d\s+2\d\d\b/,                 // explicit "HTTP/1.1 200" style
+    /\bstatus[:\s]+2\d\d\b/i,                    // "status: 200" / "status 201"
+    /\bmessage[_-]?id[:\s]+[\w-]+\b/i,           // "message_id: ..." / "message-id ..."
+    /\bsha-?256[:\s][a-f0-9]{16,}/i,             // hash output
+    /\bpr[/\s#]+\d+\s+(merged|opened|closed)\b/i, // "PR #42 merged"
+];
+function hasVerifiedHandle(text: string): boolean {
+    if (!text || text.length < 20) return false;
+    for (const re of VERIFIED_HANDLE_PATTERNS) {
+        if (re.test(text)) return true;
+    }
+    return false;
+}
+
+const AUTO_PROMOTE_CONFIDENCE = 0.8;
 
 /**
  * Hints rendered verbatim in the proactive agent's `<runtime>` block.
@@ -136,12 +175,6 @@ export interface TeamHandlerConfig {
     };
 
     readonly mcp?: McpConfig;
-    /** Off by default; when `enabled` + `extractorModel` set, runs fire-and-forget post-turn extraction. */
-    readonly commitments?: {
-        readonly enabled?: boolean;
-        readonly maxPerDay?: number;
-        readonly minConfidence?: number;
-    };
     /** Pre-built SessionExtractor; prefer `extractorModel`. Kept for tests that mock the extractor. */
     readonly sessionExtractor?: SessionExtractor;
     /** Auxiliary model used by the internally-built SessionExtractor (typically the fast tier). */
@@ -150,6 +183,7 @@ export interface TeamHandlerConfig {
     readonly modelRouters?: ReadonlyMap<string, ModelRouter>;
     readonly personalities?: PersonalityRegistry;
     readonly observability?: import('flopsygraph').Observability;
+    readonly acp?: import('./acp/types').AcpConfig;
 }
 
 interface ThreadEntry {
@@ -159,6 +193,8 @@ interface ThreadEntry {
     readonly buildSubAgent: SubAgentFactory;
     lastUsedAt: number;
     activeTurns: number;
+    turnNumber: number;
+    accumulatedMessages: ChatMessage[];
 }
 
 export class TeamHandler implements AgentHandler {
@@ -166,25 +202,27 @@ export class TeamHandler implements AgentHandler {
     private readonly maxThreads: number;
     private readonly store: LearningStore;
     private readonly sessionResolver!: SessionResolver;
-    private readonly threads = new Map<string, ThreadEntry>();
+    private readonly threads: ThreadPool<ThreadEntry>;
     private readonly entryDef: AgentDefinition;
     private readonly tokens: ReturnType<typeof tokenCounter>;
+    // Memory provider resolved once via flopsygraph's registry (file by default;
+    // swappable via config.memory.provider). The resolved provider is cached
+    // for the process; a load failure is NOT cached, so a transient boot error
+    // (e.g. dir not yet created) retries on the next access instead of pinning
+    // every future turn to the factory's fallback file tool.
+    // Memory is single-user per FLOPSY_HOME — MemoryBinding warns once if a
+    // second principal is routed to the same shared file.
+    private readonly memoryBinding: MemoryBinding;
     // Kept off state.db: gzipped checkpoint blobs would thrash the learning-store WAL.
     private readonly checkpointer: CheckpointStore;
-    private readonly memoryStore: BaseStore;
-    private readonly mcpManager: McpClientManager;
-    private readonly mcpAssignToMap: Readonly<Record<string, readonly string[]>>;
-    private readonly mcpServersCfg: McpConfig['servers'];
-    private mcpReady: Promise<readonly BridgedTool[]> = Promise.resolve([]);
-    private mcpSkipReasons: Readonly<Record<string, string>> = {};
-    private readonly mcpToolCounts = new Map<string, number>();
+    private readonly mcp: McpLifecycle;
     private sessionExtractor?: SessionExtractor;
-    private goalManager?: GoalManager;
-    private goalContinuationCallback?: (args: { threadId: string; channelName: string; peerId: string; prompt: string }) => void;
+    private readonly goal: GoalLifecycle;
     readonly modelRouter?: ModelRouter;
     readonly modelRouters?: ReadonlyMap<string, ModelRouter>;
     readonly personalities?: PersonalityRegistry;
     private readonly pendingRecapPromises = new Map<string, Promise<string | null>>();
+    private readonly midSessionExtractInFlight = new Set<string>();
 
     constructor(config: TeamHandlerConfig) {
         this.config = config;
@@ -194,6 +232,21 @@ export class TeamHandler implements AgentHandler {
         this.modelRouter = config.modelRouter;
         this.modelRouters = config.modelRouters;
         this.personalities = config.personalities;
+        this.threads = new ThreadPool<ThreadEntry>({
+            maxThreads: this.maxThreads,
+            log,
+            onEvict: (entry, threadId) => {
+                entry.entry.harnessInterceptor?.flush().catch((err: unknown) => {
+                    log.warn({ threadId, err: redactSecrets(err) }, 'eviction flush failed');
+                });
+                void fanoutFireSessionEnd(
+                    entry.entry.interceptors,
+                    threadId,
+                    'eviction',
+                    entry.accumulatedMessages,
+                );
+            },
+        });
 
         // 24h is well past any sensible spawn timeoutMs (max configured = 2h); kill anything older.
         try {
@@ -351,96 +404,64 @@ export class TeamHandler implements AgentHandler {
             });
         }
 
-        if (config.extractorModel) {
-            this.goalManager = new GoalManager({
-                model: config.extractorModel,
-                store: this.store,
-            });
-        }
-
-
-        const memoryCfg = config.memory ?? {};
-        const memoryEnabled = memoryCfg.enabled !== false;
-        const embedderCfg = memoryCfg.embedder;
-        const embedder =
-            memoryEnabled && embedderCfg?.model
-                ? new OllamaEmbedder(
-                      embedderCfg.model,
-                      {},
-                      undefined,
-                      embedderCfg.baseUrl,
-                  )
-                : undefined;
-        // softCapPerNamespace: entry-count guardrail across namespaces (content is char-bounded elsewhere).
-        this.memoryStore = new SqliteMemoryStore({
-            path: resolveWorkspacePath('state', 'memory.db'),
-            softCapPerNamespace: 50,
-            ...(embedder ? { embedder } : {}),
+        this.goal = new GoalLifecycle({
+            ...(config.extractorModel ? { extractorModel: config.extractorModel } : {}),
+            store: this.store,
         });
-        log.info(
-            {
-                memoryPath: resolveWorkspacePath('state', 'memory.db'),
-                memoryEnabled,
-                embedderModel: embedderCfg?.model ?? 'none',
-                embedderBaseUrl: embedderCfg?.baseUrl ?? 'default',
-            },
-            'memoryStore ready',
-        );
+
+
         this.tokens = tokenCounter({
             keyFn: (ctx) =>
                 (ctx.configurable as { threadId?: string })?.threadId ?? ctx.threadId,
             persistAcrossGraphEnd: true,
             onUpdate: (threadId, delta, _cumulative, ctx, response) => {
-                const date = localDateString();
-                // modelFallback pins _fallbackTo on response.raw for accurate token attribution.
-                const fallback = (response.raw as Record<string, unknown> | undefined)?.['_fallbackTo'] as
-                    { provider?: string; model?: string } | undefined;
-                this.store.recordTokenUsage({
-                    threadId,
-                    date,
-                    provider: fallback?.provider ?? ctx.provider,
-                    model:    fallback?.model    ?? ctx.model,
-                    input:  delta.input,
-                    output: delta.output,
-                });
+                try {
+                    const date = localDateString();
+                    const fallback = (response.raw as Record<string, unknown> | undefined)?.['_fallbackTo'] as
+                        { provider?: string; model?: string } | undefined;
+                    const provider = fallback?.provider ?? ctx.provider;
+                    const model = fallback?.model ?? ctx.model;
+                    if (!provider || !model) {
+                        log.debug(
+                            { threadId, provider, model, ctxProvider: ctx.provider, ctxModel: ctx.model },
+                            'token_usage skipped — provider/model undefined',
+                        );
+                        return;
+                    }
+                    if (delta.input === 0 && delta.output === 0) {
+                        return;
+                    }
+                    this.store.recordTokenUsage({
+                        threadId,
+                        date,
+                        provider,
+                        model,
+                        input: delta.input,
+                        output: delta.output,
+                    });
+                } catch (err) {
+                    log.warn(
+                        { err: redactSecrets(err), threadId },
+                        'token_usage write failed (token-counter swallows by default — non-fatal)',
+                    );
+                }
             },
         });
 
-        const mcpManager = new McpClientManager();
-        this.mcpManager = mcpManager;
-        this.mcpServersCfg = config.mcp?.servers ?? {};
-        const mcpServersCfg = this.mcpServersCfg;
-        this.mcpAssignToMap = Object.fromEntries(
-            Object.entries(mcpServersCfg)
-                .filter(([, srv]) => srv.enabled !== false)
-                .map(([name, srv]) => [name, srv.assignTo ?? []]),
-        );
-        const mcpEnabled = config.mcp?.enabled !== false;
-        if (mcpEnabled && Object.keys(mcpServersCfg).length > 0) {
-            this.mcpReady = (async () => {
-                try {
-                    const { servers, skipped } = await loadMcpServers(mcpServersCfg);
-                    this.mcpSkipReasons = { ...skipped };
-                    Object.entries(skipped).forEach(([name, reason]) =>
-                        log.info({ server: name, reason }, 'mcp server skipped'),
-                    );
-                    if (servers.length === 0) return [];
-                    await mcpManager.connect(servers);
-                    const bridged = await bridgeAllTools(mcpManager);
-                    this.mcpToolCounts.clear();
-                    for (const t of bridged) {
-                        this.mcpToolCounts.set(t.mcpServer, (this.mcpToolCounts.get(t.mcpServer) ?? 0) + 1);
-                    }
-                    return bridged;
-                } catch (err) {
-                    log.error(
-                        { err: redactSecrets(err) },
-                        'mcp connect/bridge failed — agents will run without MCP tools',
-                    );
-                    return [];
-                }
-            })();
-        }
+        this.mcp = new McpLifecycle(config.mcp);
+        this.mcp.initialize();
+        this.memoryBinding = new MemoryBinding({
+            config: config.memory,
+            checkpointer: this.checkpointer,
+            onMemoryWrite: (action, target, content, metadata) =>
+                fanoutFireMemoryWrite(
+                    [...this.threads.values()].map((e) => e.entry.interceptors),
+                    action,
+                    target,
+                    content,
+                    metadata,
+                ),
+        });
 
         const entry = config.team.find((a) => a.name === config.entryAgentName);
         if (!entry) {
@@ -463,13 +484,25 @@ export class TeamHandler implements AgentHandler {
     }
 
     getGoalManager(): GoalManager | undefined {
-        return this.goalManager;
+        return this.goal.getManager();
     }
 
     setGoalContinuationCallback(
         cb: (args: { threadId: string; channelName: string; peerId: string; prompt: string }) => void,
     ): void {
-        this.goalContinuationCallback = cb;
+        this.goal.setContinuationCallback(cb);
+    }
+
+    setGoalNotificationCallback(
+        cb: (args: {
+            threadId: string;
+            channelName: string;
+            peerId: string;
+            kind: GoalNotificationKind;
+            message: string;
+        }) => void,
+    ): void {
+        this.goal.setNotificationCallback(cb);
     }
 
     async invoke(
@@ -503,7 +536,25 @@ export class TeamHandler implements AgentHandler {
         });
         entry.lastUsedAt = Date.now();
 
+        // Resume-on-restart: read whether a prior turn was interrupted (flag survived
+        // a restart), then flag THIS turn in-flight. Cleared on a non-aborted end below.
+        const resumePeerId = threadId.split('#')[0] ?? threadId;
+        const wasInterrupted = this.store.isResumePending(resumePeerId);
+        this.store.markResumePending(resumePeerId);
+
         entry.activeTurns += 1;
+        entry.turnNumber += 1;
+        const turnCtx: InterceptorTurnContext = {
+            runId: `turn-${threadId}-${entry.turnNumber}`,
+            threadId,
+            signal: callbacks.signal,
+            configurable: {},
+            store: new Map<string, unknown>(),
+            turnNumber: entry.turnNumber,
+            userMessage: text,
+            ...(callbacks.channelName ? { platform: callbacks.channelName } : {}),
+        };
+        await fanoutFireTurnStart(entry.entry.interceptors, turnCtx);
         try {
             const configurable: Record<string, unknown> = {
                 onReply: callbacks.onReply,
@@ -535,27 +586,25 @@ export class TeamHandler implements AgentHandler {
                 runtimeHints: callbacks.runtimeHints,
                 taskStore: this.store,
                 runStore: this.store,
+                acp: this.config.acp,
+                onDelegationComplete: (task: string, result: string, childSessionId: string) =>
+                    fanoutFireDelegation(
+                        this.threads.get(threadId)?.entry.interceptors ?? [],
+                        threadId,
+                        task,
+                        result,
+                        childSessionId,
+                    ),
                 skillUsageStore: entry.entry.skillUsageStore,
                 onAuthSuccess: (provider: string) => {
                     // Fire-and-forget; awaiting would block the user's turn for 5-30s on slow MCP restart.
-                    if (!this.mcpServersCfg || Object.keys(this.mcpServersCfg).length === 0) return;
+                    if (!this.mcp.hasServers()) return;
                     void (async () => {
-                        let affected: string[] = [];
+                        let affected: readonly string[] = [];
                         try {
-                            affected = Object.entries(this.mcpServersCfg)
-                                .filter(([, srv]) =>
-                                    srv.enabled !== false &&
-                                    srv.requiresAuth?.includes(provider),
-                                )
-                                .map(([name]) => name);
+                            affected = await this.mcp.restartAfterAuth(provider);
                             if (affected.length === 0) return;
                             log.info({ provider, servers: affected }, 'reloading mcp servers after auth (background)');
-                            const { servers } = await loadMcpServers(
-                                Object.fromEntries(
-                                    affected.map((n) => [n, this.mcpServersCfg[n]!]),
-                                ),
-                            );
-                            if (servers.length > 0) await this.mcpManager.restartServers(servers);
                         } catch (err) {
                             log.warn(
                                 { provider, servers: affected, err: err instanceof Error ? err.message : String(err) },
@@ -577,38 +626,16 @@ export class TeamHandler implements AgentHandler {
                 },
             };
 
-            const effectiveText = awayRecap
+            let effectiveText = awayRecap
                 ? `[Continuity context — recap of your last session with this user: ${awayRecap}]\n[How to use this: if the user opens with a casual greeting like "hey", "how is everything", "what's up" — DO NOT reply with a generic "How can I help today?". Reference the recap: name what was in flight and ask if they want to continue, or proactively check the next step. If the user asks a direct question, answer it AND, if the recap mentions a pending follow-up, mention it briefly. Only ignore the recap if it's plainly irrelevant to what they just said.]\n\n${text}`
                 : text;
+            if (wasInterrupted) {
+                log.info({ threadId, resumePeerId }, 'resume-on-restart: prior turn was interrupted — injecting recovery note');
+                effectiveText = `[Restart recovery — the gateway restarted while you were mid-task and didn't finish replying to this user. The recent messages above are that conversation. Pick up where you left off and finish what they were waiting for — don't make them re-ask. If you genuinely can't tell what was pending, say you were interrupted by a restart and ask them to confirm.]\n\n${effectiveText}`;
+            }
             const content = buildContent(effectiveText, media);
 
-            type FlopsyStreamChunk = {
-                content?: string;
-                reasoning?: string;
-                toolCallDeltas?: Array<{ index: number; id?: string; name?: string; args?: string }>;
-            };
-            type ChunkEvent = { type: 'message-chunk'; chunk?: FlopsyStreamChunk };
-            type NodeEvent = { type: 'node-start' | 'node-finish'; node: string; updates?: Record<string, unknown> };
-            type ResultEvent = { type: 'result'; data?: { state?: unknown } };
-            type AgentStreamEvent = ChunkEvent | NodeEvent | ResultEvent | { type: string };
-
-            // Tool-call deltas arrive split (start has name+index, later deltas carry partial_json).
-            let lastToolName: string | undefined;
-            let lastToolIndex: number | undefined;
-            const toolArgsByIndex = new Map<number, string>();
-            let resultState: unknown = null;
-
-            const emit = (chunk: AgentChunk): void => {
-                if (!callbacks.onChunk) return;
-                try { callbacks.onChunk(chunk); } catch { /* preview path is best-effort */ }
-            };
-
-            const stream = (entry.entry.agent as unknown as {
-                stream: (
-                    input: { messages: Array<{ role: string; content: unknown }> },
-                    opts: { threadId: string; signal: AbortSignal; configurable: Record<string, unknown> },
-                ) => AsyncIterable<AgentStreamEvent>;
-            }).stream(
+            const stream = (entry.entry.agent as unknown as AgentStreamHandle).stream(
                 { messages: [{ role, content }] },
                 { threadId, signal: callbacks.signal, configurable },
             );
@@ -617,42 +644,7 @@ export class TeamHandler implements AgentHandler {
             const tokensBefore = this.tokens.getTotals(threadId)
                 ?? { input: 0, output: 0, reasoning: 0, cached: 0, calls: 0 };
 
-            for await (const event of stream) {
-                if (event.type === 'message-chunk') {
-                    const c = (event as ChunkEvent).chunk;
-                    if (!c) continue;
-                    if (c.content) emit({ type: 'text_delta', text: c.content });
-                    if (c.reasoning) emit({ type: 'thinking', text: c.reasoning });
-                    if (c.toolCallDeltas) {
-                        for (const d of c.toolCallDeltas) {
-                            if (d.name) {
-                                lastToolName = d.name;
-                                lastToolIndex = d.index;
-                            }
-                            if (d.args !== undefined) {
-                                const prev = toolArgsByIndex.get(d.index) ?? '';
-                                toolArgsByIndex.set(d.index, prev + d.args);
-                            }
-                        }
-                    }
-                } else if (event.type === 'node-start') {
-                    if ((event as NodeEvent).node === 'tools' && lastToolName) {
-                        const args = lastToolIndex !== undefined
-                            ? toolArgsByIndex.get(lastToolIndex)
-                            : undefined;
-                        emit({ type: 'tool_start', toolName: lastToolName, ...(args ? { args } : {}) });
-                    }
-                } else if (event.type === 'node-finish') {
-                    if ((event as NodeEvent).node === 'tools' && lastToolName) {
-                        emit({ type: 'tool_result', toolName: lastToolName });
-                        if (lastToolIndex !== undefined) toolArgsByIndex.delete(lastToolIndex);
-                        lastToolName = undefined;
-                        lastToolIndex = undefined;
-                    }
-                } else if (event.type === 'result') {
-                    resultState = (event as ResultEvent).data?.state;
-                }
-            }
+            const resultState = await transcodeAgentStream(stream, callbacks.onChunk);
 
             if (!resultState) {
                 throw new Error('agent stream completed without a result event');
@@ -699,6 +691,13 @@ export class TeamHandler implements AgentHandler {
 
             if (role === 'user') {
                 const peerId = threadId.split('#')[0] ?? threadId;
+                emitHook('turn.user.received', {
+                    peerId,
+                    threadId,
+                    replyLength: reply?.length ?? 0,
+                    promptTokens: usage?.promptTokens ?? 0,
+                    completionTokens: usage?.completionTokens ?? 0,
+                });
                 try {
                     this.sessionResolver.touch(peerId, 'user');
                 } catch (err) {
@@ -708,28 +707,71 @@ export class TeamHandler implements AgentHandler {
                     );
                 }
 
-                if (this.goalManager && this.goalContinuationCallback && reply) {
-                    const cb = this.goalContinuationCallback;
-                    void this.goalManager
-                        .maybeContinue({ threadId, agentReply: reply })
-                        .then((result) => {
-                            if (!result || !result.shouldContinue || !result.continuationPrompt) return;
-                            cb({
-                                threadId,
-                                channelName: callbacks.channelName,
-                                peerId,
-                                prompt: result.continuationPrompt,
-                            });
-                        })
-                        .catch((err) => {
-                            log.warn(
-                                { threadId, peerId, err: redactSecrets(err) },
-                                'goal manager threw (non-fatal, ignored)',
+                if (this.sessionExtractor && !this.midSessionExtractInFlight.has(peerId)) {
+                    try {
+                        const active = this.store.getActiveSession(peerId);
+                        // Trigger A: every-N-turn cadence (existing behavior)
+                        const cadenceHit = active
+                            && active.turnCount > 0
+                            && active.turnCount % MID_SESSION_EXTRACT_EVERY === 0;
+                        // Trigger B (NEW): task-success heuristic — when the reply
+                        // contains a "verified handle" (URL / file path / message-id /
+                        // 2xx status) AND the session has ≥3 turns of substance, fire
+                        // extraction immediately. Aligns with Hermes's trajectory-based
+                        // skill capture: real procedural patterns produce concrete
+                        // outputs; the moment they appear is the best time to
+                        // crystallize them as a skill.
+                        const taskSuccessHit = active
+                            && active.turnCount >= 3
+                            && !cadenceHit  // don't double-fire
+                            && active.turnCount % 3 === 0  // throttle: at most every 3 turns
+                            && hasVerifiedHandle(reply ?? '');
+                        if (active && (cadenceHit || taskSuccessHit)) {
+                            const sid = active.sessionId;
+                            this.midSessionExtractInFlight.add(peerId);
+                            log.debug(
+                                {
+                                    threadId,
+                                    turnCount: active.turnCount,
+                                    trigger: cadenceHit ? 'cadence' : 'task-success',
+                                },
+                                'session extraction triggered',
                             );
-                        });
+                            void this.runSessionExtraction(threadId, sid, peerId)
+                                .catch((err) =>
+                                    log.debug(
+                                        { threadId, err: redactSecrets(err) },
+                                        'mid-session extraction failed (non-fatal)',
+                                    ),
+                                )
+                                .finally(() => this.midSessionExtractInFlight.delete(peerId));
+                        }
+                    } catch (err) {
+                        log.debug(
+                            { threadId, err: redactSecrets(err) },
+                            'mid-session extraction check failed (non-fatal)',
+                        );
+                    }
+                }
+
+                if (reply) {
+                    this.goal.dispatchPostTurn({
+                        threadId,
+                        peerId,
+                        channelName: callbacks.channelName,
+                        agentReply: reply,
+                    });
                 }
             }
 
+            await fanoutFireTurnEnd(entry.entry.interceptors, turnCtx, reply ?? '');
+            emitHook('turn.assistant.completed', {
+                peerId: threadId.split('#')[0] ?? threadId,
+                threadId,
+                replyLength: reply?.length ?? 0,
+                promptTokens: usage?.promptTokens ?? 0,
+                completionTokens: usage?.completionTokens ?? 0,
+            });
             return {
                 reply,
                 didSendViaTool: false,
@@ -752,13 +794,34 @@ export class TeamHandler implements AgentHandler {
             throw err;
         } finally {
             entry.activeTurns -= 1;
+            // Clear the resume flag only on a NON-aborted end. A shutdown abort (or a
+            // process kill, where this never runs) leaves it set so the next message
+            // resumes the interrupted task.
+            if (!callbacks.signal.aborted) {
+                try { this.store.clearResumePending(resumePeerId); } catch { /* best-effort */ }
+            }
+            try { entry.registry.evictTerminal(); } catch { /* */ }
         }
     }
 
-    /**
+/**
      * Stateless single-agent invocation for proactive fires: fresh agent per call,
      * no thread cache, no worker team, no delegate/spawn/ask_user tools.
      */
+    /**
+     * Resolve the memory provider once through flopsygraph's registry. Memoized
+     * across all team-member builds. On load failure (bad config, ping fail) we
+     * log and return undefined so `createTeamMember` falls back to its direct
+     * file-tool construction — memory routing should degrade, not crash the agent.
+     */
+    private buildMemoryPlugins(): Promise<FlopsygraphInterceptor[]> {
+        return this.memoryBinding.buildPlugins();
+    }
+
+    private getMemoryProvider(userId?: string): Promise<MemoryProvider | undefined> {
+        return this.memoryBinding.getProvider(userId);
+    }
+
     async invokeStateless(
         text: string,
         threadId: string,
@@ -769,36 +832,35 @@ export class TeamHandler implements AgentHandler {
             readonly runtimeHints?: ReadonlyArray<string>;
         } = {},
     ): Promise<AgentResult> {
-        // Per-namespace char budgets — mirror getOrCreateThread's derivation.
         const memoryCharLimits: Record<string, number> = (() => {
             const memCfg = this.config.memory ?? {};
             const memLim = memCfg.memoryCharLimit ?? 2200;
             const usrLim = memCfg.userCharLimit ?? 1375;
-            return { profile: usrLim, memory: memLim, facts: memLim, directives: memLim };
+            return { user: usrLim, memory: memLim };
         })();
 
         // Reuse the cached entry's MCP filter so proactive sees the same surface for __load_tool__.
-        const allMcpTools = await this.mcpReady;
-        const filteredMcpTools = filterToolsForAgent(
+        const allMcpTools = await this.mcp.getReadyTools();
+        const filteredMcpTools = this.mcp.filterForAgent(
             allMcpTools,
             this.entryDef.name,
             this.entryDef.mcpServers,
-            this.mcpAssignToMap,
         );
-        const { staticMcpTools, dynamicMcpTools } = this.partitionMcpToolsByPreload(filteredMcpTools);
+        const { staticMcpTools, dynamicMcpTools } = this.mcp.partitionByPreload(filteredMcpTools);
         const mcpTools = dynamicMcpTools as unknown as BaseTool[];
         const mcpPreloadedTools = staticMcpTools as unknown as BaseTool[];
 
         const identity = await this.config.resolveThread(threadId);
+        const memoryStore = await this.getMemoryProvider(identity.userId);
 
         const member = createTeamMember(this.entryDef, {
             model: this.config.model,
             userId: identity.userId,
             userName: identity.userName,
             store: this.store,
-            memoryStore: this.memoryStore,
             memoryCharLimits,
-            extraInterceptors: [this.tokens],
+            ...(memoryStore ? { memoryStore } : {}),
+            extraInterceptors: [this.tokens, ...(await this.buildMemoryPlugins())],
             checkpointer: this.checkpointer,
             extraTools: mcpPreloadedTools.length > 0 ? mcpPreloadedTools : undefined,
             extraDynamicTools: mcpTools,
@@ -806,6 +868,7 @@ export class TeamHandler implements AgentHandler {
             // but pass [] so anything else that consults teamRoster sees the
             // expected "no workers visible" shape.
             teamRoster: [],
+            mainAgentName: this.entryDef.name,
             personalities: this.personalities,
             modelCallTimeoutMs: 180_000,
             // Strips delegate_task, spawn_background_task, ask_user, react, send_poll, manage_schedule.
@@ -857,34 +920,13 @@ export class TeamHandler implements AgentHandler {
         const tokensBefore = this.tokens.getTotals(threadId)
             ?? { input: 0, output: 0, reasoning: 0, cached: 0, calls: 0 };
 
-        type FlopsyStreamChunk = {
-            content?: string;
-            reasoning?: string;
-            toolCallDeltas?: Array<{ index: number; id?: string; name?: string; args?: string }>;
-        };
-        type ChunkEvent = { type: 'message-chunk'; chunk?: FlopsyStreamChunk };
-        type NodeEvent = { type: 'node-start' | 'node-finish'; node: string };
-        type ResultEvent = { type: 'result'; data?: { state?: unknown } };
-        type AgentStreamEvent = ChunkEvent | NodeEvent | ResultEvent | { type: string };
-
-        let resultState: unknown = null;
-
         try {
-            const stream = (member.agent as unknown as {
-                stream: (
-                    input: { messages: Array<{ role: string; content: unknown }> },
-                    opts: { threadId: string; signal: AbortSignal; configurable: Record<string, unknown> },
-                ) => AsyncIterable<AgentStreamEvent>;
-            }).stream(
+            const stream = (member.agent as unknown as AgentStreamHandle).stream(
                 { messages: [{ role: 'user', content: text }] },
                 { threadId, signal, configurable },
             );
 
-            for await (const event of stream) {
-                if (event.type === 'result') {
-                    resultState = (event as ResultEvent).data?.state;
-                }
-            }
+            const resultState = await transcodeAgentStream(stream);
 
             if (!resultState) {
                 throw new Error('proactive agent stream completed without a result event');
@@ -906,6 +948,20 @@ export class TeamHandler implements AgentHandler {
                     ? lastAssistant.content
                     : JSON.stringify(lastAssistant.content)
                 : null;
+
+            // [SILENT] sentinel: text-token contract documented in
+            // `src/team/templates/roles/main/proactive.md`. Detection only — the
+            // raw `[SILENT]` reply is propagated unchanged so the proactive
+            // executor's `isSilentSentinel` check (the canonical gate) sees it
+            // and finalizes with `silenceReason: 'silent_sentinel'`. Logging
+            // here only aids debugging when the stateless path is exercised in
+            // isolation; suppression itself happens at the executor.
+            if (typeof reply === 'string' && reply.trim() === '[SILENT]') {
+                log.info(
+                    { threadId, deliveryMode: options.deliveryMode },
+                    'proactive stateless: [SILENT] sentinel detected (executor will suppress)',
+                );
+            }
 
             const tokensAfter = this.tokens.getTotals(threadId)
                 ?? { input: 0, output: 0, reasoning: 0, cached: 0, calls: 0 };
@@ -1136,6 +1192,28 @@ export class TeamHandler implements AgentHandler {
         return { tokens, threshold, percentUsed, tokensRemaining, willCompactNext };
     }
 
+    /**
+     * Effective context window for this agent's model. Used by the channel
+     * worker to populate `contextLimit` on the CLI's progress bar even before
+     * the compactor has logged a check for the thread. Without this, the
+     * progress bar gets `0` for limit and falls back to the bare-number
+     * rendering (`ctx 718.4K ⚠`) instead of the bar form.
+     */
+    getModelContextWindow(): number {
+        // entryDef.model is the config-level model string (e.g.
+        // "nvidia:nvidia/nemotron-3-super-120b-a12b"), not the BaseChatModel
+        // instance. Pass it straight through; defaultContextWindowFor strips
+        // the provider prefix and matches against KNOWN_WINDOWS.
+        const m = this.entryDef.model;
+        const name = typeof m === 'string'
+            ? m
+            : (m as unknown as { modelId?: string; id?: string; name?: string })?.modelId
+            ?? (m as unknown as { id?: string })?.id
+            ?? (m as unknown as { name?: string })?.name
+            ?? '';
+        return defaultContextWindowFor(name);
+    }
+
     async evictThread(threadId: string): Promise<void> {
         const entry = this.threads.get(threadId);
         if (!entry) return;
@@ -1187,8 +1265,7 @@ export class TeamHandler implements AgentHandler {
     }
 
     async shutdown(): Promise<void> {
-        const entries = [...this.threads.values()];
-        this.threads.clear();
+        const entries = this.threads.drain();
         await Promise.allSettled(
             entries.map((e) => e.entry.harnessInterceptor?.flush() ?? Promise.resolve()),
         );
@@ -1202,7 +1279,7 @@ export class TeamHandler implements AgentHandler {
             }
         }
         try {
-            await this.mcpManager.closeAll();
+            await this.mcp.close();
         } catch (err) {
             log.warn({ err: redactSecrets(err) }, 'mcp shutdown failed');
         }
@@ -1263,6 +1340,82 @@ export class TeamHandler implements AgentHandler {
         const peerKey = rawKey.split('#')[0] ?? rawKey;
         const active = this.store.getActiveSession(peerKey);
         return active?.sessionId ?? null;
+    }
+
+    /**
+     * Run the session-extractor on the peer's CURRENT (active) session and
+     * write the proposed skill to disk if confidence ≥ AUTO_PROMOTE_CONFIDENCE.
+     * Powers the `/skills propose` slash command — lets the user capture a
+     * skill from the in-flight conversation without waiting for the every-10-turn
+     * automatic trigger.
+     *
+     * Returns the extraction result + the disk path written (or just the
+     * proposal payload when confidence is below the auto-promote threshold,
+     * in which case the file goes to `skills-proposed/` for human review).
+     */
+    async proposeSkillFromCurrentSession(rawKey: string): Promise<{
+        proposed: boolean;
+        reason?: string;
+        name?: string;
+        description?: string;
+        when_to_use?: string;
+        body?: string;
+        confidence?: number;
+        autoActivated?: boolean;
+        writtenPath?: string;
+    }> {
+        if (!this.sessionExtractor) {
+            return { proposed: false, reason: 'session extractor not configured' };
+        }
+        const parts = rawKey.split(':');
+        if (parts.length < 3) {
+            return { proposed: false, reason: 'invalid routing key' };
+        }
+        const [channel, scope, ...rest] = parts;
+        const peerNativeId = rest.join(':');
+        if (!channel || !scope || !peerNativeId) {
+            return { proposed: false, reason: 'invalid routing key' };
+        }
+        const peerKey = `${channel}:${scope}:${peerNativeId}`;
+        const active = this.store.getActiveSession(peerKey);
+        if (!active) {
+            return { proposed: false, reason: 'no active session for this peer' };
+        }
+        const threadId = `${peerKey}#${active.sessionId}`;
+        try {
+            const extraction = await this.runSessionExtraction(threadId, active.sessionId, peerKey);
+            if (!extraction || !extraction.skill_proposal) {
+                return {
+                    proposed: false,
+                    reason: extraction
+                        ? 'no procedural pattern detected in recent conversation'
+                        : 'extraction returned no result (transcript too thin or model failed)',
+                };
+            }
+            const sp = extraction.skill_proposal;
+            const autoActivated = sp.confidence >= AUTO_PROMOTE_CONFIDENCE;
+            return {
+                proposed: true,
+                name: sp.name,
+                description: sp.description,
+                when_to_use: sp.when_to_use,
+                body: sp.body,
+                confidence: sp.confidence,
+                autoActivated,
+                writtenPath: autoActivated
+                    ? `skills/${sp.name}/SKILL.md`
+                    : `skills-proposed/${sp.name}/SKILL.md`,
+            };
+        } catch (err) {
+            log.warn(
+                { err: redactSecrets(err), peerKey, sessionId: active.sessionId },
+                'proposeSkillFromCurrentSession failed',
+            );
+            return {
+                proposed: false,
+                reason: `extraction failed: ${err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200)}`,
+            };
+        }
     }
 
     async forceNewSession(
@@ -1434,34 +1587,14 @@ export class TeamHandler implements AgentHandler {
         return { messageCount: rawMessages.length, summary };
     }
 
-        // Iterates every matching thread because post-/new the OLD thread is the one users want cleared.
+    // Clears every matching thread — after /new it's the OLD thread the user wants cleared.
     cancelPlan(rawKey: string): boolean {
         let cleared = false;
-        for (const [threadId, entry] of this.threads) {
+        for (const [threadId] of this.threads) {
             if (!isThreadForRawKey(threadId, rawKey)) continue;
-            const controller = entry.entry.planningController;
-            if (!controller) continue;
-            if (controller.cancel(threadId)) cleared = true;
+            if (clearPlanForThread(threadId)) cleared = true;
         }
         return cleared;
-    }
-
-    getPlanState(rawKey: string): {
-        mode: 'idle' | 'drafting' | 'approved';
-        hasPlan: boolean;
-        objective?: string;
-    } | null {
-        let best: { threadId: string; lastTouched: number; entry: ThreadEntry } | null = null;
-        for (const [threadId, entry] of this.threads) {
-            if (!isThreadForRawKey(threadId, rawKey)) continue;
-            if (!entry.entry.planningController) continue;
-            const touched = entry.lastUsedAt;
-            if (!best || touched > best.lastTouched) {
-                best = { threadId, lastTouched: touched, entry };
-            }
-        }
-        if (!best) return null;
-        return best.entry.entry.planningController!.getState(best.threadId);
     }
 
     listMcpServers(): ReadonlyArray<{
@@ -1470,37 +1603,7 @@ export class TeamHandler implements AgentHandler {
         reason?: string;
         toolCount?: number;
     }> {
-        const out: Array<{
-            name: string;
-            status: 'connected' | 'skipped' | 'failed' | 'disabled';
-            reason?: string;
-            toolCount?: number;
-        }> = [];
-        const connectedSet = new Set(this.mcpManager.connectedServerNames);
-        const failedMap = this.mcpManager.failedServers;
-        const skippedMap = this.mcpSkipReasons;
-
-        for (const [name, cfg] of Object.entries(this.mcpServersCfg)) {
-            if (cfg.enabled === false) {
-                out.push({ name, status: 'disabled' });
-                continue;
-            }
-            if (connectedSet.has(name)) {
-                const tools = this.mcpToolCounts.get(name);
-                out.push({ name, status: 'connected', ...(tools !== undefined ? { toolCount: tools } : {}) });
-                continue;
-            }
-            if (failedMap[name]) {
-                out.push({ name, status: 'failed', reason: failedMap[name] });
-                continue;
-            }
-            if (skippedMap[name]) {
-                out.push({ name, status: 'skipped', reason: skippedMap[name] });
-                continue;
-            }
-            out.push({ name, status: 'skipped', reason: 'never loaded' });
-        }
-        return out.sort((a, b) => a.name.localeCompare(b.name));
+        return this.mcp.listServers().map((s) => ({ ...s }));
     }
 
     // Without evictCachedThreads, existing conversations keep their stale boot-time tool list.
@@ -1510,34 +1613,10 @@ export class TeamHandler implements AgentHandler {
         failed: Array<{ name: string; reason: string }>;
         evictedCachedThreads: boolean;
     }> {
-        const beforeConnected = new Set(this.mcpManager.connectedServerNames);
-
-        const { servers, skipped } = await loadMcpServers(this.mcpServersCfg);
-
-        this.mcpSkipReasons = { ...skipped };
-
-        if (servers.length > 0) {
-            await this.mcpManager.connect(servers);
-        }
-
-        if (this.mcpManager.connectedServerNames.length > 0) {
-            this.mcpReady = bridgeAllTools(this.mcpManager).then((tools) => {
-                this.mcpToolCounts.clear();
-                for (const t of tools) {
-                    this.mcpToolCounts.set(t.mcpServer, (this.mcpToolCounts.get(t.mcpServer) ?? 0) + 1);
-                }
-                return tools;
-            });
-            await this.mcpReady;
-        }
-
-        const afterConnected = new Set(this.mcpManager.connectedServerNames);
-        const newlyConnected = [...afterConnected].filter((n) => !beforeConnected.has(n)).sort();
-
-        const failedAfter = this.mcpManager.failedServers;
+        const result = await this.mcp.reload();
 
         let evictedCachedThreads = false;
-        if (opts?.evictCachedThreads && newlyConnected.length > 0) {
+        if (opts?.evictCachedThreads && result.connected.length > 0) {
             const victimIds = [...this.threads.keys()];
             await Promise.allSettled(
                 victimIds.map(async (id) => {
@@ -1550,12 +1629,7 @@ export class TeamHandler implements AgentHandler {
             evictedCachedThreads = true;
         }
 
-        return {
-            connected: newlyConnected,
-            skipped: Object.entries(this.mcpSkipReasons).map(([name, reason]) => ({ name, reason })),
-            failed: Object.entries(failedAfter).map(([name, reason]) => ({ name, reason })),
-            evictedCachedThreads,
-        };
+        return { ...result, evictedCachedThreads };
     }
 
     async branchSession(
@@ -1648,136 +1722,24 @@ export class TeamHandler implements AgentHandler {
     }
 
     private evictPeerThreads(peerKey: string): void {
-        for (const k of [...this.threads.keys()]) {
-            if (k === peerKey || k.startsWith(`${peerKey}#`)) {
-                this.threads.delete(k);
-            }
-        }
+        this.threads.evictPeerThreads(peerKey);
     }
 
-    private async runSessionExtraction(
+    private runSessionExtraction(
         closedThreadId: string,
         closedSessionId: string,
         peerId: string,
     ): Promise<ExtractionResult | null> {
-        if (!this.sessionExtractor) return null;
-
-        const skillsPath = workspace.skills();
-        const existingSkills = scanExistingSkills(skillsPath);
-
-        const result = await this.sessionExtractor.extract(
-            closedThreadId,
-            peerId,
-            existingSkills,
+        return runExtractionViaModule(
+            { closedThreadId, closedSessionId, peerId },
+            {
+                ...(this.sessionExtractor ? { sessionExtractor: this.sessionExtractor } : {}),
+                store: this.store,
+                memoryConfig: this.config.memory,
+                getMemoryProvider: () => this.getMemoryProvider(),
+                checkpointer: this.checkpointer,
+            },
         );
-        if (!result) return null;
-
-        // File-backed; safe to instantiate ad-hoc since atomic writes prevent partial reads.
-        const usageStore = new SkillUsageStore(skillsPath);
-
-        try {
-            this.store.setSessionSummary(closedSessionId, result.summary);
-
-            let proposedSkillName: string | null = null;
-            if (result.skill_proposal) {
-                const proposed = result.skill_proposal;
-                const proposedRoot = workspace.skillsProposed();
-                try {
-                    const written = await writeSkillFile(
-                        proposedRoot,
-                        proposed.name,
-                        renderProposedSkillBody(proposed),
-                    );
-                    if (written) {
-                        proposedSkillName = proposed.name;
-                        usageStore.markAgentCreated(proposed.name);
-                    }
-                } catch (err) {
-                    log.warn(
-                        { err: (err as Error).message, name: proposed.name, peerId },
-                        'skill proposal write failed',
-                    );
-                }
-            }
-
-            const skillsImproved: string[] = [];
-            if (result.skill_lessons.length > 0) {
-                for (const entry of result.skill_lessons) {
-                    try {
-                        const ok = await appendLessonsToSkill(
-                            skillsPath,
-                            entry.name,
-                            entry.lessons,
-                        );
-                        if (ok) {
-                            skillsImproved.push(entry.name);
-                            usageStore.patch(entry.name);
-                        }
-                    } catch (err) {
-                        log.warn(
-                            { err: (err as Error).message, skill: entry.name, peerId },
-                            'append lessons failed',
-                        );
-                    }
-                }
-            }
-
-            // After all writes so new skills aren't immediately stale-marked.
-            try {
-                const curated = runSkillCurator(skillsPath, usageStore);
-                if (curated.markedStale.length > 0 || curated.markedArchived.length > 0) {
-                    log.info(
-                        { markedStale: curated.markedStale, markedArchived: curated.markedArchived },
-                        'skill curator swept',
-                    );
-                }
-            } catch (err) {
-                log.debug({ err: (err as Error).message }, 'skill curator failed (non-fatal)');
-            }
-
-            log.info(
-                {
-                    peerId,
-                    closedSessionId,
-                    summaryChars: result.summary.length,
-                    skillProposed: proposedSkillName,
-                    skillsImproved,
-                },
-                'session extraction persisted',
-            );
-        } catch (err) {
-            log.warn(
-                { err: redactSecrets(err), peerId, closedSessionId },
-                'session extraction persisted partially or failed',
-            );
-        }
-
-        // 24h retention matches proactive reaper default.
-        const sweepable = this.checkpointer as {
-            pruneByThreadPrefix?: (prefix: string, olderThanMs: number) => Promise<number>;
-        };
-        if (typeof sweepable.pruneByThreadPrefix === 'function') {
-            const closedThreadId = `${peerId}#${closedSessionId}`;
-            const ONE_DAY_MS = 24 * 60 * 60 * 1000;
-            try {
-                const deleted = await sweepable.pruneByThreadPrefix(
-                    `${closedThreadId}:worker:`,
-                    ONE_DAY_MS,
-                );
-                if (deleted > 0) {
-                    log.debug(
-                        { closedThreadId, deleted },
-                        'pruned stale worker checkpoints for closed session',
-                    );
-                }
-            } catch (err) {
-                log.warn(
-                    { err: redactSecrets(err), closedThreadId },
-                    'worker-checkpoint sweep failed (non-fatal)',
-                );
-            }
-        }
-        return result;
     }
 
     private async getOrCreateThread(
@@ -1792,42 +1754,38 @@ export class TeamHandler implements AgentHandler {
 
         const identity = await this.config.resolveThread(threadId);
 
-        const allMcpTools = await this.mcpReady;
-        const filteredMcpTools = filterToolsForAgent(
+        const allMcpTools = await this.mcp.getReadyTools();
+        const filteredMcpTools = this.mcp.filterForAgent(
             allMcpTools,
             this.entryDef.name,
             this.entryDef.mcpServers,
-            this.mcpAssignToMap,
         );
-        const { staticMcpTools, dynamicMcpTools } = this.partitionMcpToolsByPreload(filteredMcpTools);
+        const { staticMcpTools, dynamicMcpTools } = this.mcp.partitionByPreload(filteredMcpTools);
         const mcpTools = dynamicMcpTools as unknown as BaseTool[];
         const mcpPreloadedTools = staticMcpTools as unknown as BaseTool[];
 
-        // `profile` uses userCharLimit; other namespaces share memoryCharLimit. 0 = free-grow.
         const memoryCharLimits: Record<string, number> = (() => {
             const memCfg = this.config.memory ?? {};
             const memLim = memCfg.memoryCharLimit ?? 2200;
             const usrLim = memCfg.userCharLimit ?? 1375;
-            return {
-                profile: usrLim,
-                memory: memLim,
-                facts: memLim,
-                directives: memLim,
-            };
+            return { user: usrLim, memory: memLim };
         })();
+
+        const memoryStore = await this.getMemoryProvider(identity.userId);
 
         const member = createTeamMember(this.entryDef, {
             model: this.config.model,
             userId: identity.userId,
             userName: identity.userName,
             store: this.store,
-            memoryStore: this.memoryStore,
             memoryCharLimits,
-            extraInterceptors: [this.tokens],
+            ...(memoryStore ? { memoryStore } : {}),
+            extraInterceptors: [this.tokens, ...(await this.buildMemoryPlugins())],
             checkpointer: this.checkpointer,
             extraTools: mcpPreloadedTools.length > 0 ? mcpPreloadedTools : undefined,
             extraDynamicTools: mcpTools,
             teamRoster: this.buildTeamRoster(),
+            mainAgentName: this.entryDef.name,
             personalities: this.personalities,
             // 180s tolerates Ollama cold-start (large models take 30-60s to load).
             modelCallTimeoutMs: 180_000,
@@ -1853,10 +1811,13 @@ export class TeamHandler implements AgentHandler {
             buildSubAgent,
             lastUsedAt: Date.now(),
             activeTurns: 0,
+            turnNumber: 0,
+            accumulatedMessages: [],
         };
 
         this.threads.set(threadId, entry);
         this.evictIfAtCapacity();
+        void fanoutFireSessionStart(entry.entry.interceptors, threadId);
 
         log.info(
             {
@@ -1878,22 +1839,21 @@ export class TeamHandler implements AgentHandler {
             if (!def) return undefined;
 
             return async ({ task, signal, depth, spawnChain }) => {
-                const allMcpTools = await this.mcpReady;
-                const filteredWorkerMcp = filterToolsForAgent(
+                const allMcpTools = await this.mcp.getReadyTools();
+                const filteredWorkerMcp = this.mcp.filterForAgent(
                     allMcpTools,
                     def.name,
                     def.mcpServers,
-                    this.mcpAssignToMap,
                 );
                 const { staticMcpTools: workerStaticMcp, dynamicMcpTools: workerDynamicMcp } =
-                    this.partitionMcpToolsByPreload(filteredWorkerMcp);
+                    this.mcp.partitionByPreload(filteredWorkerMcp);
                 const workerMcpTools = workerDynamicMcp as unknown as BaseTool[];
                 const workerPreloadedMcp = workerStaticMcp as unknown as BaseTool[];
 
                 const workerModel = await resolveWorkerModel(def, this.config.model);
 
                 // Catches "disabled in flopsy.json5 but still delegated" before a doomed run.
-                const rosterMcpNames = this.mcpServersForWorker(def);
+                const rosterMcpNames = this.mcp.serversForWorker(def);
                 if (rosterMcpNames.length > 0 && workerMcpTools.length === 0) {
                     log.warn(
                         {
@@ -1908,18 +1868,21 @@ export class TeamHandler implements AgentHandler {
                 // Deterministic child threadId so a restarted gateway can resume mid-flight.
                 const childThreadId = `${threadId}:worker:${def.name}:${stableHash(task)}`;
 
+                const peerRoster = this.buildTeamRoster().filter((m) => m.name !== def.name);
+                const workerMemoryStore = await this.getMemoryProvider(identity.userId);
                 const worker = createTeamMember(def, {
                     model: workerModel,
                     userId: identity.userId,
                     userName: identity.userName,
                     store: this.store,
-                    // Same (thread, day, model) bucket as the main agent.
-                    extraInterceptors: [this.tokens],
+                    ...(workerMemoryStore ? { memoryStore: workerMemoryStore } : {}),
+                    extraInterceptors: [this.tokens, ...(await this.buildMemoryPlugins())],
                     extraTools: workerPreloadedMcp.length > 0 ? workerPreloadedMcp : undefined,
                     extraDynamicTools: workerMcpTools,
-                    // Matches main agent's 180s (60s false-positives on Ollama cold-start).
                     modelCallTimeoutMs: 180_000,
                     checkpointer: this.checkpointer,
+                    teamRoster: peerRoster,
+                    mainAgentName: this.entryDef.name,
                     ...(this.config.observability ? { observability: this.config.observability } : {}),
                 });
 
@@ -1938,24 +1901,42 @@ export class TeamHandler implements AgentHandler {
                     }
                     initialMessages.push({ role: 'user', content: task });
 
-                    const result = await worker.agent.invoke(
-                        { messages: initialMessages },
-                        {
-                            signal,
-                            threadId: childThreadId,
-                            configurable: {
-                                userId: identity.userId,
+                    let result;
+                    try {
+                        result = await worker.agent.invoke(
+                            { messages: initialMessages },
+                            {
+                                signal,
                                 threadId: childThreadId,
-                                parentThreadId: threadId,
-                                depth: depth ?? 1,
-                                spawnChain: spawnChain ?? [],
-                                registry,
-                                agentName: def.name,
-                                runStore: this.store,
-                                ...(parentBrief ? { parentBrief } : {}),
+                                configurable: {
+                                    userId: identity.userId,
+                                    threadId: childThreadId,
+                                    parentThreadId: threadId,
+                                    depth: depth ?? 1,
+                                    spawnChain: spawnChain ?? [],
+                                    registry,
+                                    agentName: def.name,
+                                    runStore: this.store,
+                                    ...(parentBrief ? { parentBrief } : {}),
+                                },
                             },
-                        },
-                    );
+                        );
+                    } catch (invokeErr) {
+                        // Best-effort partial-result capture: the executor saves
+                        // a checkpoint after every node transition, so by the
+                        // time invoke() throws (timeout, abort, network), the
+                        // latest checkpoint usually holds the worker's most
+                        // recent assistant message. Surface it as a
+                        // PartialResultError — spawn's catch block reads
+                        // `.partialResult` and forwards it on task_error, so
+                        // the parent agent sees what was achieved before the
+                        // failure instead of just an opaque error string.
+                        const partial = await extractCheckpointPartialResult(
+                            this.checkpointer,
+                            childThreadId,
+                        );
+                        throw new PartialResultError(invokeErr, partial);
+                    }
 
                     const messages =
                         (result.messages as unknown as Array<{
@@ -1996,19 +1977,10 @@ export class TeamHandler implements AgentHandler {
             name: def.name,
             type: def.type,
             ...(def.domain !== undefined ? { domain: def.domain } : {}),
+            ...(def.whenToUse !== undefined ? { whenToUse: def.whenToUse } : {}),
             toolsets: def.toolsets ?? [],
-            mcpServers: this.mcpServersForWorker(def),
+            mcpServers: this.mcp.serversForWorker(def),
         }));
-    }
-
-    private mcpServersForWorker(def: AgentDefinition): string[] {
-        const pull = def.mcpServers;
-        if (pull && pull.length > 0) return [...pull];
-        return Object.entries(this.mcpAssignToMap)
-            .filter(([, assigned]) =>
-                assigned.includes(def.name) || assigned.includes('*'),
-            )
-            .map(([name]) => name);
     }
 
     private async foldWorkerReply(
@@ -2022,7 +1994,7 @@ export class TeamHandler implements AgentHandler {
 
         const fs = await import('node:fs');
         const path = await import('node:path');
-        const dir = resolveWorkspacePath('worker', 'worker-outputs');
+        const dir = workspace.work('worker-outputs');
         try {
             fs.mkdirSync(dir, { recursive: true });
         } catch (err) {
@@ -2042,7 +2014,7 @@ export class TeamHandler implements AgentHandler {
             .replace(/[^a-z0-9]+/g, '-')
             .replace(/^-+|-+$/g, '')
             .slice(0, 40) || 'task';
-        const fileName = `${ts}-${workerName}-${slug}.md`;
+        const fileName = `${workerName}__${slug}__${ts}.md`;
         const fullPath = path.join(dir, fileName);
 
         try {
@@ -2073,21 +2045,6 @@ export class TeamHandler implements AgentHandler {
         ].join('\n');
     }
 
-    private partitionMcpToolsByPreload(
-        tools: readonly BridgedTool[],
-    ): { staticMcpTools: BridgedTool[]; dynamicMcpTools: BridgedTool[] } {
-        const staticMcpTools: BridgedTool[] = [];
-        const dynamicMcpTools: BridgedTool[] = [];
-        for (const t of tools) {
-            const cfg = this.mcpServersCfg[t.mcpServer];
-            if (cfg && cfg.preload === true) {
-                staticMcpTools.push(t);
-            } else {
-                dynamicMcpTools.push(t);
-            }
-        }
-        return { staticMcpTools, dynamicMcpTools };
-    }
 
     private get allowedWorkers(): ReadonlyArray<AgentDefinition> {
         if (this._allowedWorkersCache) return this._allowedWorkersCache;
@@ -2104,31 +2061,7 @@ export class TeamHandler implements AgentHandler {
     private _allowedWorkersCache?: ReadonlyArray<AgentDefinition>;
 
     private evictIfAtCapacity(): void {
-        if (this.threads.size <= this.maxThreads) return;
-
-        let oldestId: string | undefined;
-        let oldestTime = Infinity;
-        for (const [id, e] of this.threads) {
-            if (e.activeTurns > 0) continue;
-            if (e.lastUsedAt < oldestTime) {
-                oldestTime = e.lastUsedAt;
-                oldestId = id;
-            }
-        }
-        if (oldestId === undefined) {
-            log.warn(
-                { size: this.threads.size, cap: this.maxThreads },
-                'thread cache at capacity but every entry is active; skipping eviction',
-            );
-            return;
-        }
-        const victim = this.threads.get(oldestId);
-        this.threads.delete(oldestId);
-        const evictedId = oldestId;
-        victim?.entry.harnessInterceptor?.flush().catch((err: unknown) => {
-            log.warn({ threadId: evictedId, err: redactSecrets(err) }, 'eviction flush failed');
-        });
-        log.debug({ evicted: oldestId, size: this.threads.size }, 'thread evicted (LRU)');
+        this.threads.evictIfAtCapacity();
     }
 }
 
@@ -2216,6 +2149,46 @@ function extractMessageText(content: unknown): string {
     return '';
 }
 
+/**
+ * Pull the last assistant text from the most recent checkpoint for a
+ * thread — used by makeSubAgentFactory to recover partial work when the
+ * sub-agent's `invoke()` throws (timeout, abort, network). Best-effort:
+ * any failure here returns `undefined` so the outer flow falls back to
+ * an error-only `task_error` event.
+ *
+ * Mirrors claude-code's `extractPartialResult` (agentToolUtils.ts:488-500)
+ * but reads from the checkpoint store rather than an in-memory message
+ * array — flopsygraph doesn't expose mid-flight messages to the caller,
+ * so the checkpoint is the only surface that has them.
+ */
+async function extractCheckpointPartialResult(
+    checkpointer: CheckpointStore,
+    threadId: string,
+): Promise<string | undefined> {
+    try {
+        const checkpoints = await checkpointer.listByThread<{
+            messages?: Array<{ role: string; content: unknown }>;
+        }>(threadId);
+        const latest = checkpoints[0];
+        if (!latest) return undefined;
+        const messages = latest.state.messages;
+        if (!Array.isArray(messages) || messages.length === 0) return undefined;
+        for (let i = messages.length - 1; i >= 0; i--) {
+            const m = messages[i];
+            if (!m || m.role !== 'assistant') continue;
+            const text = extractMessageText(m.content).trim();
+            if (text.length > 0) return text;
+        }
+        return undefined;
+    } catch (err) {
+        log.warn(
+            { err: redactSecrets(err), threadId },
+            'partial-result extraction from checkpoint failed — proceeding with error-only event',
+        );
+        return undefined;
+    }
+}
+
 const WORKER_REPLY_OFFLOAD_THRESHOLD_CHARS = 1500;
 const WORKER_REPLY_PREVIEW_CHARS = 800;
 
@@ -2234,37 +2207,39 @@ function buildContent(
 
     const imageBlocks: ContentBlock[] = [];
     const fallbackLines: string[] = [];
+    const documentBlocks: string[] = [];
 
     for (const m of media) {
-        if (m.type !== 'image') continue;
-
-        if (m.data) {
-            imageBlocks.push({ type: 'image', mediaType: m.mimeType ?? 'image/jpeg', data: m.data });
-        } else if (m.url) {
-            imageBlocks.push({ type: 'image_url', url: m.url });
-        } else {
-            fallbackLines.push('[Image: content unavailable]');
+        if (m.type === 'image') {
+            if (m.data) {
+                imageBlocks.push({ type: 'image', mediaType: m.mimeType ?? 'image/jpeg', data: m.data });
+            } else if (m.url) {
+                imageBlocks.push({ type: 'image_url', url: m.url });
+            } else {
+                fallbackLines.push('[Image: content unavailable]');
+            }
+        } else if (m.type === 'document' && typeof m.text === 'string') {
+            const label = m.fileName ?? m.mimeType ?? 'attached file';
+            const fence = m.fileName?.split('.').pop()?.toLowerCase() ?? '';
+            documentBlocks.push(`\n[file: ${label}]\n\`\`\`${fence}\n${m.text}\n\`\`\``);
+        } else if (m.type === 'document') {
+            const label = m.fileName ?? m.mimeType ?? 'file';
+            const sizeNote = m.url ? ` at ${m.url}` : '';
+            fallbackLines.push(`[Document not inlined: ${label}${sizeNote}]`);
         }
     }
 
-    const bodyText = fallbackLines.length > 0
-        ? `${text}\n${fallbackLines.join('\n')}`.trim()
-        : text;
+    let bodyText = text;
+    if (documentBlocks.length > 0) {
+        bodyText = `${bodyText}${documentBlocks.join('')}`.trim();
+    }
+    if (fallbackLines.length > 0) {
+        bodyText = `${bodyText}\n${fallbackLines.join('\n')}`.trim();
+    }
 
     if (imageBlocks.length === 0) return bodyText;
 
     return [...imageBlocks, { type: 'text', text: bodyText }];
-}
-
-function redactSecrets(err: unknown): { name?: string; message: string; stack?: string } {
-    if (err instanceof Error) {
-        return {
-            name: err.name,
-            message: scrubPii(err.message),
-            stack: err.stack ? scrubPii(err.stack) : undefined,
-        };
-    }
-    return { message: scrubPii(String(err)) };
 }
 
 function staticConfigFields(def: AgentDefinition): Partial<import('@flopsy/gateway').TeamMemberStatus> {
@@ -2290,20 +2265,3 @@ function staticConfigFields(def: AgentDefinition): Partial<import('@flopsy/gatew
 }
 
 
-// Frontmatter `name` MUST match the directory name or skills() silently drops it.
-function renderProposedSkillBody(p: SkillProposal): string {
-    const cleanBody = p.body.replace(/^---[\s\S]*?\n---\n?/, '').trim();
-    const today = new Date().toISOString().slice(0, 10);
-    return [
-        '---',
-        `name: ${p.name}`,
-        `description: ${p.description.replace(/\n/g, ' ').trim()}`,
-        `when-to-use: ${p.when_to_use.replace(/\n/g, ' ').trim()}`,
-        'source: extractor',
-        `proposed-on: ${today}`,
-        '---',
-        '',
-        cleanBody,
-        '',
-    ].join('\n');
-}

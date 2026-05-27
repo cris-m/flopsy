@@ -26,14 +26,12 @@ export interface ReactConfigurable {
 export const reactTool = defineTool({
     name: 'react',
     description: [
-        'Drop an emoji reaction on the user\'s last message. Fast, cheap, expressive.',
-        'Use when:',
-        '  - Acknowledgement is enough (👀 = "I see you", ✅ = "got it", 🫡 = "done")',
-        '  - You want to show emotion without writing a sentence (🔥 = "that\'s cool", 😬 = "oof")',
-        '  - Alongside a text reply when one reaction isn\'t enough',
-        'Use ANY emoji that fits — not just defaults. Match the energy of the moment.',
-        'This is NOT a substitute for answering a real question — use it for acknowledgement, not as an excuse to stay silent.',
-        'Only supported on platforms that allow reactions (Telegram, Discord, Slack, WhatsApp). No-ops silently elsewhere.',
+        'Drop an emoji reaction on the user\'s last message. Use for acknowledgement, agreement, or mood — alone or alongside a text reply. Not a substitute for answering a real question.',
+        '',
+        'Args:',
+        '  emoji — any single emoji string, 1-16 chars.',
+        '',
+        'Supported on Telegram, Discord, Slack, WhatsApp. No-ops silently on platforms without reaction support (iMessage, Line).',
     ].join('\n'),
     schema: z.object({
         emoji: z

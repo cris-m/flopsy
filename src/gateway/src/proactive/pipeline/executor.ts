@@ -1,4 +1,5 @@
-import { createLogger } from '@flopsy/shared';
+import { createLogger, channelCapabilityHint } from '@flopsy/shared';
+import { detectPromptInjection, hasUnicodeContamination } from 'flopsygraph';
 import type { ChannelRouter } from '../delivery/router';
 import type { StateStore } from '../state/store';
 import { getDefaultJobState, STALE_LOCK_MS } from '../state/store';
@@ -31,6 +32,18 @@ interface DecisionContext {
     deliveryText?: string;
 }
 
+// Conversation-role tags. A proactive fire is entirely first-party (operator
+// prompt + curated skills + the agent's own recycled context), so one of these
+// appearing in that content is never an injection attack — but the scanner's
+// `fake-conversation-tag` rule would match and suppress every fire. We neutralize
+// them to inert brackets before scanning so legit content can't trip the gate,
+// while real injection patterns (ignore-previous, etc.) are still caught.
+const ROLE_TAG_RE = /<\s*(\/?)\s*(system|tool_result|tool_use|assistant|human|user)\s*>/i;
+const ROLE_TAG_RE_G = new RegExp(ROLE_TAG_RE.source, 'gi');
+function neutralizeRoleTags(s: string): string {
+    return s.replace(ROLE_TAG_RE_G, '[$1$2]');
+}
+
 /** Build a `<fire_context>` block with current date/time/timezone. */
 function buildDateContext(): string {
     const now = new Date();
@@ -42,6 +55,206 @@ function buildDateContext(): string {
         hour: '2-digit', minute: '2-digit', hour12: false, timeZone: tz,
     });
     return `<fire_context>\ndate: ${date}\ntime: ${time}\ntimezone: ${tz}\n</fire_context>\n\n`;
+}
+
+function fmtAgoMins(tsMs: number, now: number): string {
+    const mins = Math.max(0, Math.floor((now - tsMs) / 60000));
+    if (mins < 60) return `${mins}m ago`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours}h ago`;
+    return `${Math.floor(hours / 24)}d ago`;
+}
+
+function clip(text: string, max: number): string {
+    const t = (text ?? '').replace(/\s+/g, ' ').trim();
+    return t.length > max ? t.slice(0, max - 1) + '…' : t;
+}
+
+function buildAntiRepetition(store: StateStore): string {
+    const now = Date.now();
+    const deliveries = store.getRecentDeliveries().slice(0, 5);
+    const suppressions = (store.getRecentSuppressions() ?? []).slice(0, 5);
+    if (deliveries.length === 0 && suppressions.length === 0) return '';
+    const lines = [
+        '<anti_repetition>',
+        'You have already delivered or considered+rejected the following recently. Use this to decide whether THIS fire adds new value — not to mechanically suppress.',
+    ];
+    if (deliveries.length > 0) {
+        lines.push('', 'Recently delivered:');
+        for (const d of deliveries) {
+            lines.push(`  - ${fmtAgoMins((d as { deliveredAt?: number }).deliveredAt ?? now, now)} [${(d as { source?: string }).source ?? '?'}]: ${clip((d as { content?: string }).content ?? '', 120)}`);
+        }
+    }
+    if (suppressions.length > 0) {
+        lines.push('', 'Recently considered + suppressed (don\'t re-propose the same item):');
+        for (const s of suppressions) {
+            const reason = (s as { reason?: string }).reason;
+            lines.push(`  - ${fmtAgoMins((s as { suppressedAt?: number }).suppressedAt ?? now, now)} [${(s as { source?: string }).source ?? '?'}${reason ? ` · ${reason}` : ''}]: ${clip((s as { content?: string }).content ?? '', 120)}`);
+        }
+    }
+    lines.push('</anti_repetition>');
+    return lines.join('\n') + '\n\n';
+}
+
+function buildToolQuirks(peerId: string | undefined): string {
+    if (!peerId) return '';
+    try {
+        const quirks = getSharedLearningStore().listRecentToolFailures(peerId, { limit: 5, windowMs: 7 * 24 * 60 * 60 * 1000 });
+        if (quirks.length === 0) return '';
+        const lines = [
+            '<tool_quirks>',
+            'Tools that have been failing recently for this peer. Before calling one of these, consider whether a different approach works — if you call it anyway and it fails the same way, do not retry blindly; pivot or surface the obstacle.',
+        ];
+        for (const q of quirks) {
+            const ageH = Math.max(1, Math.round((Date.now() - q.lastSeen) / 3_600_000));
+            lines.push(`  - ${q.toolName}: "${clip(q.errorPattern, 80)}" (×${q.count}, last ${ageH}h ago)`);
+        }
+        lines.push('</tool_quirks>');
+        return lines.join('\n') + '\n\n';
+    } catch {
+        return '';
+    }
+}
+
+function buildMyRecentFires(jobId: string, peerId: string | undefined): string {
+    if (!peerId) return '';
+    try {
+        const rows = getSharedLearningStore().getRecentProactiveDecisions(peerId, 7 * 24 * 60 * 60 * 1000, 30);
+        const mine = rows.filter((r) => r.jobId === jobId).slice(0, 8);
+        if (mine.length === 0) return '';
+        const now = Date.now();
+        const lines = ['<my_recent_fires>'];
+        lines.push(`Your last ${mine.length} fires for this job (most recent first):`);
+        let delivered = 0, suppressed = 0, errored = 0, responded = 0;
+        for (const r of mine) {
+            if (r.delivered === 1) delivered++;
+            else if (r.delivered === 2) errored++;
+            else suppressed++;
+            if (r.userResponded === 1) responded++;
+            const status = r.delivered === 1 ? 'delivered' : r.delivered === 2 ? 'error' : 'silent';
+            const reason = r.silenceReason ? ` · ${r.silenceReason}` : '';
+            const preview = r.messagePreview ? ` · "${clip(r.messagePreview, 80)}"` : '';
+            lines.push(`  - ${fmtAgoMins(r.firedAt, now)} ${status}${reason}${preview}`);
+        }
+        const respRate = delivered > 0 ? Math.round((responded / delivered) * 100) : null;
+        lines.push('');
+        lines.push(`Totals (7d): ${delivered} delivered, ${suppressed} suppressed${errored > 0 ? `, ${errored} errored` : ''}${respRate !== null ? `, ${respRate}% user reply rate` : ''}`);
+        if (suppressed >= 5 && delivered === 0) {
+            lines.push('Pattern: you have suppressed many times without delivering. If THIS fire has a real anchor, prefer to deliver — silence is not free.');
+        }
+        lines.push('</my_recent_fires>');
+        return lines.join('\n') + '\n\n';
+    } catch {
+        return '';
+    }
+}
+
+const ENGAGEMENT_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
+const ENGAGEMENT_MIN_SAMPLE = 5;
+const ENGAGEMENT_MAX_BYTES = 1200;
+
+function engagementLabel(rate: number): string {
+    return rate < 0.2 ? 'low' : rate < 0.5 ? 'mixed' : 'high';
+}
+
+// A deliver:true message that is a single whitespace-free token (e.g. "draft:gmail-stripe-reply")
+// is a model misfire — it emitted an intent slug instead of real prose (and usually skipped the
+// actual tool call). Ship nothing rather than a placeholder.
+function isPlaceholderProactiveMessage(message: string): boolean {
+    const t = message.trim();
+    return t.length > 0 && !/\s/.test(t);
+}
+
+// The model captures sources in `citations` but often doesn't inline them in `message`;
+// deliver only ships `message`, so append any citation whose URL isn't already in the text.
+// Without this, news/factual claims go out with no link (e.g. the GitVenom Kaspersky item).
+function appendCitations(
+    message: string,
+    citations?: ReadonlyArray<{ title: string; url: string; source?: string }>,
+): string {
+    if (!citations || citations.length === 0) return message;
+    const missing = citations.filter((c) => c.url && !message.includes(c.url));
+    if (missing.length === 0) return message;
+    const lines = missing.map((c) => `• [${c.title}](${c.url})`);
+    return `${message.trimEnd()}\n\nSources:\n${lines.join('\n')}`;
+}
+
+function engagementDaypart(hour: number): string {
+    if (hour >= 5 && hour < 11) return 'morning';
+    if (hour >= 11 && hour < 15) return 'midday';
+    if (hour >= 15 && hour < 19) return 'afternoon';
+    return 'evening';
+}
+
+// Measured reply-rate per category+daypart so the agent calibrates its bar. Coarse buckets + min-sample gate avoid sparsity; the block never says "suppress" — that lever is the prompt's.
+function buildEngagementStats(
+    peerId: string | undefined,
+    triggerKind: 'cron' | 'heartbeat',
+    deliveryMode: 'always' | 'conditional' | 'silent',
+): string {
+    if (!peerId) return '';
+    try {
+        const rows = getSharedLearningStore()
+            .getRecentProactiveDecisions(peerId, ENGAGEMENT_WINDOW_MS, 300)
+            .filter((r) => r.delivered === 1);
+        if (rows.length < ENGAGEMENT_MIN_SAMPLE) return '';
+
+        const byCat = new Map<string, { n: number; r: number }>();
+        const byPart = new Map<string, { n: number; r: number }>();
+        let total = 0;
+        let replied = 0;
+        for (const row of rows) {
+            total++;
+            const got = row.userResponded === 1 ? 1 : 0;
+            replied += got;
+            const cat = row.category ?? 'uncategorized';
+            const c = byCat.get(cat) ?? { n: 0, r: 0 };
+            c.n++;
+            c.r += got;
+            byCat.set(cat, c);
+            const part = engagementDaypart(new Date(row.firedAt).getHours());
+            const p = byPart.get(part) ?? { n: 0, r: 0 };
+            p.n++;
+            p.r += got;
+            byPart.set(part, p);
+        }
+
+        const fmtBuckets = (m: Map<string, { n: number; r: number }>): string[] =>
+            [...m.entries()]
+                .filter(([, v]) => v.n >= ENGAGEMENT_MIN_SAMPLE)
+                .sort((a, b) => b[1].n - a[1].n)
+                .map(([k, v]) => {
+                    const rate = v.r / v.n;
+                    return `${k} ${Math.round(rate * 100)}% (n=${v.n}) ${engagementLabel(rate)}`;
+                });
+
+        const catLines = fmtBuckets(byCat);
+        const partLines = fmtBuckets(byPart);
+        if (catLines.length === 0 && partLines.length === 0) return '';
+
+        const lines = [
+            `<engagement_stats window="14d" trigger="${triggerKind}">`,
+            'Measured reply rate (user replied within 60min of delivery). Calibrate your bar; do NOT mechanically suppress. Buckets <5 samples are omitted (unknown → explore).',
+            `overall: ${total > 0 ? Math.round((replied / total) * 100) : 0}% (n=${total})`,
+        ];
+        if (catLines.length > 0) lines.push(`by category: ${catLines.join(' · ')}`);
+        if (partLines.length > 0) lines.push(`by daypart: ${partLines.join(' · ')}`);
+        if (deliveryMode === 'always') {
+            lines.push(
+                'note: delivery:always — engagement tunes CONTENT EMPHASIS only, never whether to send.',
+            );
+        }
+        lines.push('</engagement_stats>');
+        const out = lines.join('\n') + '\n\n';
+        return out.length > ENGAGEMENT_MAX_BYTES ? out.slice(0, ENGAGEMENT_MAX_BYTES) : out;
+    } catch {
+        return '';
+    }
+}
+
+function buildDeliveryTargetHint(channelName: string | undefined): string {
+    if (!channelName) return '';
+    return `<delivery_target>\nchannel: ${channelName}. ${channelCapabilityHint(channelName)}\n</delivery_target>\n\n`;
 }
 
 /** Build an `<output_quality>` block with anti-patterns and recent topics. */
@@ -83,6 +296,22 @@ function buildQualityGuidance(store: StateStore): string {
 
 // ProactiveDecisionSchema is enforced by the React planner; result.structured is guaranteed valid.
 type ProactiveOutput = ProactiveDecision;
+
+/**
+ * The `[SILENT]` text-token contract: when the agent emits exactly `[SILENT]`
+ * (after trim) as its entire reply, the runtime suppresses delivery. This is
+ * an additive, provider-agnostic alternative to `ProactiveDecisionSchema` —
+ * structured-output / prefill is fragile on many providers under streaming,
+ * but a plain text-token check works everywhere. Documented in
+ * `src/team/templates/roles/main/proactive.md`.
+ *
+ * Predicate: trimmed reply, case-sensitive, exact match. `"[SILENT] follow-up"`
+ * is NOT a sentinel — only the bare token counts.
+ */
+export function isSilentSentinel(reply: string | null | undefined): boolean {
+    if (typeof reply !== 'string') return false;
+    return reply.trim() === '[SILENT]';
+}
 
 export interface JobExecutorOptions {
     embedder?: ProactiveEmbedder;
@@ -134,18 +363,13 @@ export class JobExecutor {
     }
 
     async execute(job: ExecutionJob): Promise<ExecutionResult> {
-        // Track the fire so engine.stop() can drain before closing the stores.
-        let executePromise!: Promise<ExecutionResult>;
-        const runtime = (async () => {
-            try {
-                return await executePromise;
-            } finally {
-                this.inFlight.delete(executePromise as Promise<unknown>);
-            }
-        })();
-        executePromise = this.executeImpl(job);
+        const executePromise = this.executeImpl(job);
         this.inFlight.add(executePromise as Promise<unknown>);
-        return runtime;
+        try {
+            return await executePromise;
+        } finally {
+            this.inFlight.delete(executePromise as Promise<unknown>);
+        }
     }
 
     private async executeImpl(job: ExecutionJob): Promise<ExecutionResult> {
@@ -198,6 +422,52 @@ export class JobExecutor {
                 return this.finalize(job, jobState, startedAt, 'suppressed');
             }
 
+            if (typeof job.cooldownAfterSilences === 'number' && job.cooldownAfterSilences > 0) {
+                const peerIdForCooldown = job.delivery?.peer?.id;
+                if (peerIdForCooldown) {
+                    try {
+                        const store = getSharedLearningStore();
+                        const lookback = Math.max(10, job.cooldownAfterSilences + 5);
+                        const rows = store
+                            .getRecentProactiveDecisions(
+                                peerIdForCooldown,
+                                7 * 24 * 60 * 60 * 1000,
+                                lookback,
+                            )
+                            .filter((r) => r.jobId === job.id);
+                        let consecutive = 0;
+                        for (const r of rows) {
+                            if (r.delivered === 0) consecutive++;
+                            else break;
+                        }
+                        if (consecutive >= job.cooldownAfterSilences) {
+                            log.info(
+                                {
+                                    jobId: job.id,
+                                    peerId: peerIdForCooldown,
+                                    consecutive,
+                                    threshold: job.cooldownAfterSilences,
+                                },
+                                'cooldown: consecutive deliver:false threshold reached, suppressing',
+                            );
+                            return this.finalize(job, jobState, startedAt, 'suppressed', {
+                                structured: {
+                                    deliver: false,
+                                    silenceReason: 'cooldown',
+                                    reason: `${consecutive} consecutive silent fires (threshold ${job.cooldownAfterSilences})`,
+                                    confidence: 1.0,
+                                },
+                            });
+                        }
+                    } catch (err) {
+                        log.warn(
+                            { jobId: job.id, err: (err as Error).message },
+                            'cooldown check failed — proceeding with fire',
+                        );
+                    }
+                }
+            }
+
             // Pre-check script gates the agent: `{"wakeAgent": false}` suppresses;
             // otherwise stdout becomes a `<pre_check>` block prepended to the prompt.
             let preCheckBlock = '';
@@ -239,9 +509,13 @@ export class JobExecutor {
             // the `<active_skills>` framing block and inject system authority.
             const sanitizeForPromptBlock = (s: string): string =>
                 s.replace(/<\/active_skills>/gi, '[/active_skills_LITERAL]')
-                 .replace(/<\/commitments_due_now>/gi, '[/commitments_due_now_LITERAL]')
                  .replace(/<\/pre_check>/gi, '[/pre_check_LITERAL]')
-                 .replace(/<\/fire_context>/gi, '[/fire_context_LITERAL]');
+                 .replace(/<\/fire_context>/gi, '[/fire_context_LITERAL]')
+                 .replace(/<\/anti_repetition>/gi, '[/anti_repetition_LITERAL]')
+                 .replace(/<\/engagement_stats>/gi, '[/engagement_stats_LITERAL]')
+                 .replace(/<\/my_recent_fires>/gi, '[/my_recent_fires_LITERAL]')
+                 .replace(/<\/delivery_target>/gi, '[/delivery_target_LITERAL]')
+                 .replace(/<\/tool_quirks>/gi, '[/tool_quirks_LITERAL]');
             const skillsBlock =
                 preloadedSkills.length > 0
                     ? '<active_skills>\n' +
@@ -252,12 +526,63 @@ export class JobExecutor {
                       '\n</active_skills>\n\n'
                     : '';
 
-            const augmentedPrompt =
+            const antiRepBlock = buildAntiRepetition(this.store);
+            const engagementBlock = buildEngagementStats(
+                peerId,
+                job.trigger as 'cron' | 'heartbeat',
+                job.deliveryMode as 'always' | 'conditional' | 'silent',
+            );
+            const recentFiresBlock = buildMyRecentFires(job.id, peerId);
+            const deliveryTargetBlock = buildDeliveryTargetHint(job.delivery?.channelName);
+            const toolQuirksBlock = buildToolQuirks(peerId);
+            const assembledPrompt =
                 skillsBlock +
                 dateContext +
+                deliveryTargetBlock +
                 qualityBlock +
+                antiRepBlock +
+                engagementBlock +
+                recentFiresBlock +
+                toolQuirksBlock +
                 preCheckBlock +
                 job.prompt;
+
+            // Neutralize first-party conversation-role tags before the injection
+            // scan so recycled context (skills, recent fires, tool results) can't
+            // false-positive the fake-conversation-tag rule and silently suppress
+            // every fire. Log the first hit so the offending tag is traceable.
+            const roleTagHit = assembledPrompt.match(ROLE_TAG_RE);
+            if (roleTagHit) {
+                log.debug(
+                    { jobId: job.id, tag: roleTagHit[0] },
+                    'neutralized conversation-role tag in assembled cron prompt',
+                );
+            }
+            const augmentedPrompt = neutralizeRoleTags(assembledPrompt);
+
+            const injectionPattern = detectPromptInjection(augmentedPrompt);
+            const unicodeBad = hasUnicodeContamination(augmentedPrompt);
+            if (injectionPattern || unicodeBad) {
+                log.warn(
+                    {
+                        jobId: job.id,
+                        peerId,
+                        injectionPattern,
+                        unicodeContaminated: unicodeBad,
+                        promptLength: augmentedPrompt.length,
+                    },
+                    'assembled cron prompt tripped injection scanner — suppressing fire',
+                );
+                return this.finalize(job, jobState, startedAt, 'suppressed', {
+                    structured: {
+                        deliver: false,
+                        silenceReason: 'injection_blocked',
+                        reason: injectionPattern ?? 'unicode-contamination',
+                        confidence: 1.0,
+                    },
+                });
+            }
+
             let response: string;
             // `structured` is enforced by the React planner via __respond__ — guaranteed valid.
             let structured: ProactiveOutput | undefined;
@@ -284,11 +609,10 @@ export class JobExecutor {
                             : structured?.deliver === false
                                 ? structured.silenceReason
                                 : null,
-                        structuredMessagePreview: structured?.deliver === true
-                            ? structured.message?.slice(0, 200) ?? null
-                            : null,
+                        structuredMessageLength: structured?.deliver === true
+                            ? structured.message?.length ?? 0
+                            : 0,
                         structuredConfidence: structured?.confidence ?? null,
-                        responsePreview: response?.slice(0, 200) ?? '',
                         responseLength: response?.length ?? 0,
                     },
                     'agent returned (primary call)',
@@ -306,6 +630,34 @@ export class JobExecutor {
                         );
                     });
                 }
+            }
+
+            // [SILENT] sentinel: fast-path text-token suppression. Runs BEFORE the
+            // structured/Zod path so a model that emits the sentinel never has to
+            // also satisfy the schema. Additive — models that don't know about
+            // [SILENT] keep working via the existing structured/always paths.
+            if (isSilentSentinel(response)) {
+                log.info(
+                    {
+                        jobId: job.id,
+                        name: job.name,
+                        deliveryMode: job.deliveryMode,
+                    },
+                    'suppressed via [SILENT] sentinel',
+                );
+                const sentinelStructured: ProactiveOutput = {
+                    deliver: false,
+                    silenceReason: 'silent_sentinel',
+                    reason: 'agent emitted [SILENT] sentinel',
+                    confidence: 1.0,
+                };
+                return this.finalize(
+                    job,
+                    jobState,
+                    startedAt,
+                    'suppressed',
+                    { structured: sentinelStructured },
+                );
             }
 
             // Track REPORTED: IDs regardless of mode — agent emits them even in `always`.
@@ -343,13 +695,33 @@ export class JobExecutor {
                 // Conditional/silent: suppress + record empty_agent_response for ops visibility.
                 const reason = job.preCheckScript
                     ? 'Agent returned empty after pre-check ran. Investigate: model timeout, worker abort cascade, or structured-output schema rejection.'
-                    : 'Agent returned empty response. Likely cause: worker abort cascade, model timeout (modelCallTimeoutMs / parent envelope), or structured-output schema rejection.';
+                    : 'Agent returned empty response (likely model bypassed __respond__). Cause candidates: weak meta-tool compliance on the configured model, worker abort cascade, model timeout (modelCallTimeoutMs / parent envelope), or structured-output schema rejection.';
                 const syntheticStructured: ProactiveOutput = {
                     deliver: false,
                     silenceReason: 'empty_agent_response',
                     reason,
                     confidence: 0.0,
                 };
+                // Mirror the regular deliver:false path: write the suppression to
+                // BOTH the persistent store and the dedup sidecar so /status,
+                // proactive.json's recentSuppressions, and the agent's "recent
+                // suppression history" prompt actually see this entry. Without
+                // this, empty-response fires inflate suppressedCount silently and
+                // recentSuppressions stops getting new entries — exactly the
+                // bug behind "smart-pulse didn't deliver and I can't see why".
+                try {
+                    await this.store.addSuppression(reason, job.id, { reason });
+                    this.dedupStore.recordSuppression(job.id, reason, {
+                        mode: null,
+                        overlay: null,
+                        reason,
+                    });
+                } catch (recordErr) {
+                    log.warn(
+                        { err: recordErr instanceof Error ? recordErr.message : String(recordErr), jobId: job.id },
+                        'failed to record empty-response suppression (non-fatal)',
+                    );
+                }
                 return this.finalize(
                     job,
                     jobState,
@@ -385,6 +757,14 @@ export class JobExecutor {
                 structured?.deliver === true
                     ? structured.message!
                     : stripReportedLines(response);
+            if (structured?.deliver === true && isPlaceholderProactiveMessage(deliveryText)) {
+                log.warn(
+                    { jobId: job.id, name: job.name, message: deliveryText.trim().slice(0, 80) },
+                    'always-mode: placeholder/slug message — delivering fallback notice instead',
+                );
+                const fallback = `⚠️ ${job.name} composed only a placeholder ("${deliveryText.trim().slice(0, 40)}"). Run \`flopsy cron trigger ${job.id}\` to retry.`;
+                return this.deliverResponse(job, jobState, startedAt, fallback, { structured });
+            }
             log.info(
                 {
                     jobId: job.id,
@@ -397,7 +777,13 @@ export class JobExecutor {
                 },
                 'delivering (always mode)',
             );
-            return this.deliverResponse(job, jobState, startedAt, deliveryText, { structured });
+            return this.deliverResponse(
+                job,
+                jobState,
+                startedAt,
+                appendCitations(deliveryText, structured?.deliver === true ? structured.citations : undefined),
+                { structured },
+            );
         } finally {
             jobState.isExecuting = false;
             jobState.executingSinceMs = undefined;
@@ -501,7 +887,6 @@ export class JobExecutor {
         const safe = clipped
             .replace(/<\/pre_check>/gi, '[/pre_check_LITERAL]')
             .replace(/<\/active_skills>/gi, '[/active_skills_LITERAL]')
-            .replace(/<\/commitments_due_now>/gi, '[/commitments_due_now_LITERAL]')
             .replace(/<\/fire_context>/gi, '[/fire_context_LITERAL]');
         return `<pre_check script="${job.preCheckScript}">\n${safe}\n</pre_check>\n\n`;
     }
@@ -570,6 +955,19 @@ export class JobExecutor {
 
             // Schema's superRefine guarantees message + category exist on deliver:true.
             const message = structured.message!;
+            if (isPlaceholderProactiveMessage(message)) {
+                const reason =
+                    `Suppressed placeholder/slug message ("${message.trim().slice(0, 60)}") — ` +
+                    `model emitted an intent label instead of real content (and likely skipped the actual action). ` +
+                    `actionsTaken=${structured.actionsTaken?.length ?? 0}.`;
+                log.warn(
+                    { jobId: job.id, name: job.name, message: message.trim().slice(0, 80) },
+                    'conditional: placeholder/slug message suppressed (not delivered)',
+                );
+                await this.store.addSuppression(reason, job.id, { reason });
+                this.dedupStore.recordSuppression(job.id, reason, { mode: null, overlay: null, reason });
+                return this.finalize(job, jobState, startedAt, 'suppressed', { structured });
+            }
             if (structured.reportedIds) {
                 await this.recordReportedIds(structured.reportedIds, job.id);
             }
@@ -577,7 +975,7 @@ export class JobExecutor {
                 job,
                 jobState,
                 startedAt,
-                stripReportedLines(message).slice(0, 4000),
+                appendCitations(stripReportedLines(message).slice(0, 4000), structured.citations),
                 { structured },
                 { reason: structured.reason },
             );
@@ -624,24 +1022,6 @@ export class JobExecutor {
                 this.dedupStore.markReported(type, ids, source);
                 for (const id of ids) {
                     await this.store.addReportedItem(type, id);
-                }
-            }
-        }
-        // Mark inferred commitments delivered so they stop appearing on future fires.
-        if (reportedIds.commitments && reportedIds.commitments.length > 0) {
-            const learning = getSharedLearningStore();
-            for (const cid of reportedIds.commitments) {
-                try {
-                    const ok = learning.resolveCommitment(cid, 'delivered');
-                    log.info(
-                        { commitmentId: cid, source, resolved: ok, op: 'commitment:delivered' },
-                        ok ? 'commitment marked delivered' : 'commitment id not found or already resolved',
-                    );
-                } catch (err) {
-                    log.warn(
-                        { commitmentId: cid, err: err instanceof Error ? err.message : String(err) },
-                        'failed to resolve commitment (non-fatal)',
-                    );
                 }
             }
         }

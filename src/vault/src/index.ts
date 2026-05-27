@@ -24,7 +24,8 @@ export {
     type InitBrokerOptions,
 } from './broker';
 export { bootstrapVault, type VaultBootstrap, type BootstrapResult, type SkippedResult, type BootstrapOptions } from './bootstrap';
-export { appendAudit, listAudit, type AuditEntry, type AuditRow, type ListAuditOptions } from './store/audit';
+export { resolveMasterPassword, type ResolvedMasterPassword } from './master-password';
+export { appendAudit, listAudit, pruneAudit, type AuditEntry, type AuditRow, type ListAuditOptions } from './store/audit';
 export {
     mintToken,
     verifyToken,

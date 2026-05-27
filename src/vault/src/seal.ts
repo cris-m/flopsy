@@ -1,4 +1,5 @@
 import type { Database as Db } from 'better-sqlite3';
+import { timingSafeEqual } from 'node:crypto';
 import { newKey, open, seal } from './crypto/cipher';
 import { deriveKek, newSalt, wipe } from './crypto/kdf';
 import { decodeSealed, encodeSealed, getMeta, getVerifierPlaintext, isVaultInitialised, putMeta } from './store/meta';
@@ -36,7 +37,7 @@ export function initVault(db: Db, masterPassword: string): void {
 
 export function unsealVault(db: Db, masterPassword: string): Buffer {
     if (!isVaultInitialised(db)) {
-        throw new VaultSealError('vault not initialised — run `flopsy vault init` first');
+        throw new VaultSealError('vault not initialised — call initVault() first');
     }
     const salt = getMeta(db, 'salt');
     const wrappedRaw = getMeta(db, 'wrapped_dek');
@@ -54,7 +55,8 @@ export function unsealVault(db: Db, masterPassword: string): Buffer {
         }
         try {
             const verified = open(dek, decodeSealed(verifierRaw), Buffer.from('flopsy-vault-verifier', 'utf8'));
-            if (!verified.equals(getVerifierPlaintext())) {
+            const expected = getVerifierPlaintext();
+            if (verified.length !== expected.length || !timingSafeEqual(verified, expected)) {
                 throw new VaultSealError('verifier mismatch — vault corrupt');
             }
         } catch (err) {

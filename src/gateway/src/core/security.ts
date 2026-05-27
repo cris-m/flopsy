@@ -322,6 +322,31 @@ export function isSafeMediaUrl(url?: string): boolean {
     }
 }
 
+/**
+ * Strip web-search citation tokens (`【N†L1-L4】` and similar) before sending
+ * outbound text to a channel. These markers appear in raw web_search /
+ * fetch results when the model relays the source-text-with-citations
+ * verbatim; they render as literal garbage on every channel.
+ *
+ * Patterns covered:
+ *   - 【3†L1-L4】           Anthropic-style citation
+ *   - 【3:1†url.com】        OpenAI-style citation
+ *   - [3]                   minimal bracket-numeric citation when surrounded by superscript-like context
+ *
+ * Returns the input unchanged when no citation patterns match.
+ */
+export function stripCitationTokens(text: string): string {
+    if (!text) return text;
+    // Fullwidth black lenticular brackets: 【 (U+3010) and 】 (U+3011).
+    // Conservative — only strip when content contains '†' (citation marker
+    // glyph) OR matches "<digit><colon><digit>?<dagger>?<...>" pattern.
+    return text
+        .replace(/【[0-9]+(?::[0-9]+)?†[^】]*】/g, '')         // 【3†L1-L4】 / 【3:1†url】
+        .replace(/【[0-9]+:[0-9]+†[^】]*】/g, '')              // 【3:1†url.com】
+        .replace(/\s+/g, (m) => m.length > 1 ? ' ' : m)         // collapse runs of whitespace left behind
+        .trim();
+}
+
 export function sanitizeInbound(msg: {
     id: string;
     channelName: string;

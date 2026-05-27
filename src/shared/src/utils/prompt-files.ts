@@ -1,6 +1,6 @@
 import { copyFile, mkdir, readFile, unlink } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { resolveWorkspacePath } from './workspace';
 
 export type PromptKind = 'heartbeat' | 'cron';
@@ -32,6 +32,12 @@ export function resolvePromptPath(filename: string, kind: PromptKind): string {
  * its copy. The stored filename is `<scheduleId>-<basename>` — each schedule
  * has a unique file, so delete-on-remove is unambiguous.
  *
+ * Short-circuit: when `srcPath` is ALREADY the canonical workspace prompt for
+ * this kind (i.e. it lives in promptDir(kind)), we DON'T copy — we just return
+ * its basename. Copying would produce nonsensical doubled names like
+ * `evening-recap-evening-recap.md` when a schedule id matches the prompt name,
+ * and a redundant duplicate of a file that's already workspace-owned.
+ *
  * Returns the filename (NOT the absolute path) to store in config_json.
  */
 export async function copyPromptFile(
@@ -39,8 +45,12 @@ export async function copyPromptFile(
     scheduleId: string,
     kind: PromptKind,
 ): Promise<string> {
-    const filename = `${scheduleId}-${basename(srcPath)}`;
     const destDir = promptDir(kind);
+    // Already the canonical workspace prompt for this kind → reference, don't copy.
+    if (resolve(srcPath) === join(destDir, basename(srcPath))) {
+        return basename(srcPath);
+    }
+    const filename = `${scheduleId}-${basename(srcPath)}`;
     await mkdir(destDir, { recursive: true });
     await copyFile(srcPath, join(destDir, filename));
     return filename;

@@ -7,7 +7,7 @@
  * which channels actually connected, how many threads are instantiated,
  * today's token totals, etc.
  *
- * Auth: `FLOPSY_MGMT_TOKEN` env var or <FLOPSY_HOME>/mgmt-token file.
+ * Auth: `GATEWAY_TOKEN` env var or <FLOPSY_HOME>/gateway-token file.
  * Both gateway and CLI read the same locations. Gateway binds localhost
  * only so the socket isn't reachable off-box.
  */
@@ -20,7 +20,8 @@ import { managementUrl } from './schedule-client';
 export function registerManagementCommands(root: Command): void {
     const management = root
         .command('management')
-        .description('Live queries against the running gateway (ping / status)');
+        .description('Live queries against the running gateway (ping / status)')
+        .action((_opts: unknown, cmd: Command) => cmd.outputHelp());
 
     management.command('ping')
         .description('Verify the gateway management endpoint is responding')

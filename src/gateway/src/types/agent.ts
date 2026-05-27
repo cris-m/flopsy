@@ -7,7 +7,7 @@ export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cance
  *   task_start    — typing + ⏳ reaction begin
  *   task_progress — refreshes typing only
  *   task_complete — ⏳ → ✅ + agent wake-up turn
- *   task_error    — ⏳ → ❌ + short error push
+ *   task_error    — ⏳ → ❌ + agent wake-up turn (with `error` + optional `partialResult`)
  */
 export interface ChannelEvent {
     readonly type: 'task_start' | 'task_complete' | 'task_error' | 'task_progress';
@@ -24,6 +24,12 @@ export interface ChannelEvent {
     readonly deliveryMode?: 'always' | 'conditional' | 'silent';
     /** Set for spawn_background_task; routes completion via <task-notification>. */
     readonly workerName?: string;
+    /**
+     * Last assistant text the worker produced before failing/timing-out.
+     * Lets the parent agent recover useful work even when a sub-task is
+     * killed mid-flight — mirrors claude-code's extractPartialResult.
+     */
+    readonly partialResult?: string;
 }
 
 export interface BackgroundTask {
@@ -84,6 +90,16 @@ export interface ReplyOptions {
     }>;
     /** Opt-in quote-reply to the user's latest message; default false. */
     readonly quoteUserMessage?: boolean;
+    /**
+     * Multi-message intent. When set (length ≥ 2), the `text` argument is
+     * IGNORED and these parts are sent as N channel messages with pacing,
+     * typing-indicator, and reply-chain only on parts[0]. See
+     * BaseChannel.deliverMessages. Replaces in-band delimiters with a typed,
+     * auditable contract.
+     */
+    readonly parts?: ReadonlyArray<string>;
+    /** Pause (ms) between parts when `parts` is set. Default scales with length. */
+    readonly partsPauseMs?: number;
 }
 
 /** Channels without native polls render a numbered text fallback. */
@@ -166,6 +182,7 @@ export interface AgentResult {
 export interface InboundMedia {
     readonly type: string;
     readonly data?: string;
+    readonly text?: string;
     readonly url?: string;
     readonly mimeType?: string;
     readonly fileName?: string;
@@ -202,6 +219,8 @@ export interface AgentHandler {
     } | undefined;
     /** Cross-thread task list for `flopsy tasks`. */
     queryAllTasks?(filter?: TaskListFilter): AggregateTaskSummary[];
+    /** Model context window in tokens — used by the channel worker for ctx-% UI. */
+    getModelContextWindow?(): number;
     /** Maps a proactive fire to the peer's active session threadId. */
     resolveProactiveThreadId?(
         channelName: string,
@@ -219,16 +238,21 @@ export interface AgentHandler {
         { messageCount: number; summary: string } | undefined
     >;
 
-    /** Drop any active plan across all cached threads for this peer. */
     cancelPlan?(rawKey: string): boolean;
 
     getGoalManager?(): unknown;
     setGoalContinuationCallback?(
         cb: (args: { threadId: string; channelName: string; peerId: string; prompt: string }) => void,
     ): void;
-
-    /** Read-only `/plan` diagnostic. Returns null when no plan exists. */
-    getPlanState?(rawKey: string): { mode: 'idle' | 'drafting' | 'approved'; hasPlan: boolean; objective?: string } | null;
+    setGoalNotificationCallback?(
+        cb: (args: {
+            threadId: string;
+            channelName: string;
+            peerId: string;
+            kind: 'continuing' | 'done' | 'budget' | 'parse_failures';
+            message: string;
+        }) => void,
+    ): void;
 
     listMcpServers?(): ReadonlyArray<{
         readonly name: string;

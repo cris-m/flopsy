@@ -177,7 +177,7 @@ describe('ChannelWorker', () => {
         expect(secondCall[0]).toContain('Background task #bg-1');
     });
 
-    it('should handle task_error events', async () => {
+    it('should handle task_error events by waking the agent (not direct-replying)', async () => {
         worker.start();
         worker.dispatch(createMessage('hello'));
         await sleep(200);
@@ -191,8 +191,9 @@ describe('ChannelWorker', () => {
 
         await sleep(300);
 
-        const errorReplies = replies.filter((r) => r.text.includes('bg-2'));
-        expect(errorReplies).toHaveLength(1);
+        const calls = (handler.invoke as ReturnType<typeof vi.fn>).mock.calls;
+        const wakeCalls = calls.filter((c: unknown[]) => typeof c[0] === 'string' && (c[0] as string).includes('bg-2'));
+        expect(wakeCalls.length).toBeGreaterThanOrEqual(1);
     });
 
     it('should send error message when agent throws', async () => {

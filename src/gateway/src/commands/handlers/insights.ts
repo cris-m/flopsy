@@ -1,3 +1,5 @@
+import { existsSync, readFileSync, statSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import type { CommandContext, CommandDef } from '../types';
 import { getInsightsFacade } from '../insights-facade';
 import type {
@@ -7,7 +9,7 @@ import type {
     InsightsSnapshot,
     InsightsTokenRow,
 } from '../insights-facade';
-import { panel, row, STATE } from '@flopsy/shared';
+import { panel, row, STATE, resolveWorkspacePath, workspace } from '@flopsy/shared';
 
 const DEFAULT_WINDOW_DAYS = 30;
 const MAX_WINDOW_DAYS = 365;
@@ -79,12 +81,128 @@ function parseWindow(rawArgs: string): number | null {
 function render(s: InsightsSnapshot): string {
     const sections = [
         renderActivity(s.windowDays, s.activity),
+        renderProactive(),                        // NEW — surfaces dormancy at a glance
         renderTokens(s.tokens),
         renderLongest(s.longestSessions),
         renderRecent(s.recentSessions),
     ].filter((sec) => sec !== null) as Array<{ title: string; lines: string[] }>;
 
     return panel(sections, { header: 'INSIGHTS' });
+}
+
+/**
+ * Proactive activity dashboard — makes dormancy IMPOSSIBLE TO MISS.
+ *
+ * For each heartbeat / cron job, shows runs / delivered / suppressed +
+ * timestamp of the last fire. Highlights jobs with 0 deliveries despite
+ * runs > 0 (DORMANT). Also surfaces the last lesson/memory write times so
+ * silent failure of the learning loop becomes a visible status row.
+ *
+ * Data sources (no DB dependency — read directly):
+ *   - .flopsy/state/proactive.json   (jobs.* + recentDeliveries[] + recentSuppressions[])
+ *   - .flopsy/state/memory/USER.md   (mtime → last memory write)
+ *   - .flopsy/state/memory/MEMORY.md (mtime)
+ *   - .flopsy/content/skills/<cat>/<name>/SKILL.md (mtime of newest → last skill write)
+ */
+function renderProactive(): { title: string; lines: string[] } | null {
+    let stateJson: {
+        jobs?: Record<string, {
+            runCount?: number;
+            deliveredCount?: number;
+            suppressedCount?: number;
+            lastAction?: string;
+            lastRunAt?: number;
+            lastStatus?: string;
+        }>;
+    };
+    try {
+        const p = resolveWorkspacePath('state', 'proactive.json');
+        if (!existsSync(p)) return null;
+        stateJson = JSON.parse(readFileSync(p, 'utf-8'));
+    } catch {
+        return null;
+    }
+    const jobs = stateJson.jobs ?? {};
+    const jobNames = Object.keys(jobs).filter((n) => !n.startsWith('runtime-cron-') && !n.startsWith('test-'));
+    if (jobNames.length === 0) return null;
+
+    // Sort by activity (highest runCount first), built-in jobs prioritized.
+    const PRIORITY = ['morning-briefing', 'evening-recap', 'weekly-review', 'smart-pulse', 'self-improve', 'dreaming'];
+    jobNames.sort((a, b) => {
+        const pa = PRIORITY.indexOf(a), pb = PRIORITY.indexOf(b);
+        if (pa !== -1 && pb !== -1) return pa - pb;
+        if (pa !== -1) return -1;
+        if (pb !== -1) return 1;
+        return (jobs[b]?.runCount ?? 0) - (jobs[a]?.runCount ?? 0);
+    });
+
+    const lines: string[] = [];
+    let dormantCount = 0;
+
+    for (const name of jobNames) {
+        const j = jobs[name]!;
+        const runs = j.runCount ?? 0;
+        const delivered = j.deliveredCount ?? 0;
+        const suppressed = j.suppressedCount ?? 0;
+        const lastAt = j.lastRunAt ?? 0;
+        const lastAction = j.lastAction ?? 'never';
+
+        const dormant = runs > 0 && delivered === 0;
+        if (dormant) dormantCount++;
+
+        const symbol = dormant ? STATE.fail : delivered > 0 ? STATE.ok : STATE.warn;
+        const ratio = runs > 0 ? `${delivered}/${runs}` : '—';
+        const pct = runs > 0 ? ` (${Math.round((delivered / runs) * 100)}%)` : '';
+        const tag = dormant ? ' DORMANT' : '';
+        const when = lastAt > 0 ? fmtRel(lastAt) : 'never';
+        lines.push(row(name, `${symbol} ${ratio}${pct}${tag}  ${lastAction} · ${when}`, 20));
+    }
+
+    // Learning-loop write activity — surfaces "is anything actually changing?"
+    try {
+        const userMd = resolveWorkspacePath('state', 'memory', 'USER.md');
+        const memMd  = resolveWorkspacePath('state', 'memory', 'MEMORY.md');
+        const userM  = existsSync(userMd) ? statSync(userMd).mtimeMs : 0;
+        const memM   = existsSync(memMd) ? statSync(memMd).mtimeMs : 0;
+        lines.push(row('—', '', 20));
+        lines.push(row('USER.md write',   userM > 0 ? fmtRel(userM) : 'never',  20));
+        lines.push(row('MEMORY.md write', memM  > 0 ? fmtRel(memM)  : 'never',  20));
+
+        // Newest SKILL.md write across all categories
+        const skillsRoot = workspace.skills();
+        let newestSkill = { path: '', mtime: 0 };
+        if (existsSync(skillsRoot)) {
+            for (const cat of readdirSync(skillsRoot, { withFileTypes: true })) {
+                if (!cat.isDirectory()) continue;
+                const catDir = join(skillsRoot, cat.name);
+                for (const sk of readdirSync(catDir, { withFileTypes: true })) {
+                    if (!sk.isDirectory()) continue;
+                    const sf = join(catDir, sk.name, 'SKILL.md');
+                    if (!existsSync(sf)) continue;
+                    const m = statSync(sf).mtimeMs;
+                    if (m > newestSkill.mtime) newestSkill = { path: `${cat.name}/${sk.name}`, mtime: m };
+                }
+            }
+        }
+        lines.push(row(
+            'last skill write',
+            newestSkill.mtime > 0 ? `${newestSkill.path} · ${fmtRel(newestSkill.mtime)}` : 'never',
+            20,
+        ));
+    } catch {
+        // best-effort; missing files just skip
+    }
+
+    if (dormantCount > 0) {
+        lines.push(row('—', '', 20));
+        lines.push(row(
+            'ALERT',
+            `${STATE.fail}  ${dormantCount} job${dormantCount === 1 ? '' : 's'} dormant (runs > 0, deliveries = 0). Check model/chain.`,
+            20,
+        ));
+    }
+
+    return { title: 'proactive', lines };
 }
 
 function renderActivity(

@@ -1,6 +1,7 @@
 import type { CommandDef, CommandContext } from '../types';
 import { getSessionFacade } from '../session-facade';
 import { panel, row, STATE } from '@flopsy/shared';
+import { clearSessionTodos } from 'flopsygraph';
 
 export const newCommand: CommandDef = {
     name: 'new',
@@ -24,6 +25,8 @@ export const newCommand: CommandDef = {
                 ),
             };
         }
+
+        clearSessionTodos(ctx.threadId);
 
         const lines = [
             row('status', `${STATE.ok}  new session started`, 12),

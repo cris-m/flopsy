@@ -16,12 +16,13 @@ export const notifyTeammateTool = defineTool({
         '',
         'Rules:',
         '  - One paragraph max — include only what they need to act.',
-        '  - Prefer notifying over returning to gandalf when the finding is actionable for the target.',
+        '  - Prefer notifying over returning to the main agent when the finding is actionable for the target.',
         '  - Do NOT use for social chat or status updates — only cross-domain handoffs.',
         '  - Max 3 calls per turn; exceeding this returns an error.',
+        '  - Target name must come from your team roster (see the "Your Team" table in your system prompt).',
     ].join('\n'),
     schema: z.object({
-        teammate: z.string().describe('Target worker name (e.g. "aragorn", "legolas", "gimli").'),
+        teammate: z.string().describe('Target worker name from the team roster in your system prompt.'),
         message: z.string().describe('Brief message — one paragraph max. What they need to know and why.'),
         urgency: z.enum(['normal', 'blocking']).optional().describe('blocking = they should see this before anything else.'),
     }),
@@ -35,7 +36,7 @@ export const notifyTeammateTool = defineTool({
         // Rate limit: max 3 notifications per worker per turn
         const notifyCount = (ctx.configurable as Record<string, unknown>)?.__notifyCount as number | undefined ?? 0;
         if (notifyCount >= 3) {
-            return 'notify_teammate: rate limit reached (max 3 per turn). Return findings to gandalf instead.';
+            return 'notify_teammate: rate limit reached (max 3 per turn). Return findings to the main agent instead.';
         }
         (ctx.configurable as Record<string, unknown>).__notifyCount = notifyCount + 1;
 

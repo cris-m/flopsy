@@ -327,8 +327,9 @@ describe('Worker checkpointing — child-threadId pattern is wired', () => {
         const src = read('src/team/src/handler.ts');
         // Inside makeSubAgentFactory the worker createTeamMember call must
         // pass `checkpointer: this.checkpointer` — without it, child threadId
-        // is wasted because no persistence happens.
-        expect(src).toMatch(/checkpointer: this\.checkpointer,\s*\n\s*\.\.\.\(this\.config\.observability/);
+        // is wasted because no persistence happens. Tolerates other named
+        // options (e.g. teamRoster) between checkpointer and observability.
+        expect(src).toMatch(/checkpointer: this\.checkpointer,[\s\S]{0,200}\.\.\.\(this\.config\.observability/);
     });
 
     it('worker invoke uses childThreadId, not parent threadId', () => {
@@ -356,10 +357,10 @@ describe('Worker checkpointing — child-threadId pattern is wired', () => {
     });
 
     it('session-close sweeps child-worker checkpoints under the closed thread prefix', () => {
-        const src = read('src/team/src/handler.ts');
-        // Without this sweep, the checkpoint DB would grow unbounded as
-        // every delegated task accumulates 30 rows (keepLatestPerThread).
-        expect(src).toMatch(/pruneByThreadPrefix\(\s*`\$\{closedThreadId\}:worker:`/);
+        // The sweep was extracted into handler/extraction-runner.ts during the
+        // god-class refactor; behavior preserved, location moved.
+        const src = read('src/team/src/handler/extraction-runner.ts');
+        expect(src).toMatch(/pruneByThreadPrefix\(\s*[\s\S]{0,80}:worker:/);
     });
 
     it('stableHash is deterministic and string-safe', () => {

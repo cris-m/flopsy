@@ -172,9 +172,12 @@ export function createShodanMcpServer() {
     server.registerTool(
         'shodan_search',
         {
-            title: 'Device Search',
+            title: 'Device Search (costs 1 query credit per call)',
             description:
-                'Search Shodan for devices matching a query. Examples: "apache country:JP", "port:22 os:linux", "nginx city:Berlin". Consumes 1 query credit per call.',
+                'Return individual host records (IP, port, banner, vulns, geo) for a Shodan query. Costs 1 query credit per call; narrow the result set with shodan_host_count (free) first.\n\n' +
+                'Args:\n' +
+                '  query — Shodan search syntax. Examples: "apache country:JP", "port:22 os:linux", "product:nginx city:Berlin".\n' +
+                '  page  — results page, 100 records each. Defaults to 1.',
             inputSchema: {
                 query: z.string().describe('Shodan search query'),
                 page: z
@@ -258,16 +261,28 @@ export function createShodanMcpServer() {
     server.registerTool(
         'shodan_host_count',
         {
-            title: 'Host Count',
+            title: 'Host Count (free reconnaissance)',
             description:
-                'Count the number of devices matching a Shodan query without consuming search credits. Useful for gauging result volume before running a full search.',
+                'Count devices matching a query, optionally aggregated by facet. Costs zero query credits — use before any paid shodan_search.\n\n' +
+                'Args:\n' +
+                '  query  — Shodan search syntax (e.g. "apache country:JP", "product:nginx").\n' +
+                '  facets — optional comma list. Each facet returns top-N values + counts. Examples: "port", "country", "org", "product", "http.title", "ssl.cert.issuer". Append ":N" for a custom limit ("port:10,country:5").\n\n' +
+                'Methodology lives in /skills/security/recon-discipline/SKILL.md and /skills/security/shodan/SKILL.md.',
             inputSchema: {
-                query: z.string().describe('Shodan search query'),
+                query: z.string().describe('Shodan search query (e.g., "apache", "product:nginx country:JP")'),
+                facets: z
+                    .string()
+                    .optional()
+                    .describe(
+                        'Comma-separated facet list (e.g., "port,country" or "port:10,country:5" with per-facet result limits). Each facet returns top-N values + counts. Free, no credit cost.',
+                    ),
             },
         },
-        async ({ query }) => {
+        async ({ query, facets }) => {
+            const params = new URLSearchParams({ query });
+            if (facets) params.set('facets', facets);
             const result = await fetchApi<{ total: number; facets?: Record<string, unknown> }>(
-                `/shodan/host/count?query=${encodeURIComponent(query)}`,
+                `/shodan/host/count?${params.toString()}`,
             );
             return formatResult(result);
         },

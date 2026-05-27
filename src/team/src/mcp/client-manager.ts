@@ -82,7 +82,7 @@ export class McpClientManager {
             throw new Error(`MCP server "${server.name}" has no command`);
         }
 
-        // Scoped env (default-deny). Inheriting `process.env` would leak FLOPSY_MGMT_TOKEN,
+        // Scoped env (default-deny). Inheriting `process.env` would leak GATEWAY_TOKEN,
         // OAuth refresh tokens, and API keys into every MCP child. Allowlist below covers
         // safe shell vars; server-specific `env` is layered on top.
         const ENV_ALLOWLIST = [

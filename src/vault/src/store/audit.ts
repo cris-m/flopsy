@@ -64,16 +64,35 @@ export function listAudit(db: Db, opts: ListAuditOptions = {}): AuditRow[] {
     return db.prepare(sql).all(...params) as AuditRow[];
 }
 
+function encodeField(value: string | number): Buffer {
+    const buf = typeof value === 'number'
+        ? Buffer.from(String(value), 'utf8')
+        : Buffer.from(value, 'utf8');
+    const len = Buffer.alloc(4);
+    len.writeUInt32LE(buf.length, 0);
+    return Buffer.concat([len, buf]);
+}
+
+export function pruneAudit(db: Db, retentionMs: number): number {
+    const cutoff = Date.now() - retentionMs;
+    const info = db.prepare('DELETE FROM vault_audit WHERE ts_ms < ?').run(cutoff);
+    return info.changes;
+}
+
 export function appendAudit(db: Db, dek: Buffer, entry: AuditEntry): void {
     const key = chainKey(dek);
     const prev = lastChainHmac(db);
     const ts = Date.now();
     const meta = entry.metadata ? JSON.stringify(entry.metadata) : null;
-    const fields = Buffer.from(
-        [ts, entry.actorToken, entry.action, entry.resource ?? '', entry.outcome, meta ?? ''].join(''),
-        'utf8',
-    );
-    const mac = createHmac('sha256', key).update(prev).update(fields).digest();
+    const mac = createHmac('sha256', key)
+        .update(prev)
+        .update(encodeField(ts))
+        .update(encodeField(entry.actorToken))
+        .update(encodeField(entry.action))
+        .update(encodeField(entry.resource ?? ''))
+        .update(encodeField(entry.outcome))
+        .update(encodeField(meta ?? ''))
+        .digest();
     key.fill(0);
     db.prepare(
         `INSERT INTO vault_audit(ts_ms, actor_token, action, resource, outcome, metadata, chain_hmac)

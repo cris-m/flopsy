@@ -14,7 +14,8 @@ dist/
 # Environment
 .env
 .env.local
-.env.*.local
+.env.*
+!.env.example
 
 # Workspace data (runtime, user-specific)
 .flopsy/
@@ -65,3 +66,6 @@ tmp/
 flopsy-server/
 test-project/
 prompts/
+
+# Vault-managed env (real secrets — never commit; see .env.example)
+vault.env

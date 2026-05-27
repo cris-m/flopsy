@@ -22,7 +22,7 @@ import {
     workspace,
 } from '@flopsy/shared';
 import { teamTemplatesDir } from '@flopsy/team';
-import { bootstrapVault } from '@flopsy/vault';
+import { bootstrapVault, resolveMasterPassword } from '@flopsy/vault';
 
 // Node 18+'s global `fetch` is powered by undici. Defaults are:
 //   bodyTimeout:    5 min (between chunks — OK to tighten for SSE stalls)
@@ -47,14 +47,16 @@ dotenv({ path: resolve(projectRoot, '.env') });
 // CLI's config-reader calls the same helper with its own configDir.
 primeFlopsyHome(projectRoot);
 
-const _masterPw = process.env.FLOPSY_VAULT_MASTER_PASSWORD;
-if (_masterPw) delete process.env.FLOPSY_VAULT_MASTER_PASSWORD;
+const _pw = resolveMasterPassword();
+if (_pw.source === 'env') {
+    process.stderr.write('[vault] warning: master password from FLOPSY_VAULT_MASTER_PASSWORD env. Prefer macOS Keychain (`flopsy vault keychain-set`) or FLOPSY_VAULT_MASTER_PASSWORD_FILE.\n');
+}
 const _vault = bootstrapVault({
     vaultDbPath: resolveWorkspacePath('state', 'vault.db'),
-    masterPassword: _masterPw,
+    masterPassword: _pw.value,
 });
 if (_vault.kind === 'unsealed') {
-    process.stderr.write(`[vault] unsealed; hydrated ${_vault.hydrated.length} credential${_vault.hydrated.length === 1 ? '' : 's'} into process.env\n`);
+    process.stderr.write(`[vault] unsealed (source=${_pw.source}); hydrated ${_vault.hydrated.length} credential${_vault.hydrated.length === 1 ? '' : 's'} into process.env\n`);
 } else {
     process.stderr.write(`[vault] skipped: ${_vault.reason}\n`);
 }

@@ -10,22 +10,31 @@ import type {
     InteractiveCapability,
     ButtonStyle as OurButtonStyle,
 } from '@gateway/types';
+import { isTextDocument } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
 import { resolveMediaSource } from '@gateway/core/media-resolver';
 import { isSafeMediaUrl } from '@gateway/core/security';
 import type { DiscordChannelConfig } from './types';
+import { buildDiscordCommands } from './native-commands';
+import { COMMANDS } from '@gateway/commands/registry';
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_TEXT_DOCUMENT_BYTES = 256 * 1024;
+
+async function downloadTextDocument(url: string): Promise<string | null> {
+    if (!isSafeMediaUrl(url)) return null;
+    try {
+        const res = await fetch(url);
+        if (!res.ok) return null;
+        const buffer = await res.arrayBuffer();
+        if (buffer.byteLength > MAX_TEXT_DOCUMENT_BYTES) return null;
+        return new TextDecoder('utf-8', { fatal: false }).decode(buffer);
+    } catch {
+        return null;
+    }
+}
 
 async function downloadAsBase64(url: string): Promise<{ data: string; mimeType: string } | null> {
-    // SSRF gate. Discord attachment URLs are usually CDN paths
-    // (cdn.discordapp.com), but the URL comes from user-controlled
-    // content if a future Discord feature ever lets users specify
-    // attachment paths (already exists for proxies/embeds). Without
-    // this check, an attacker can post a "Discord attachment" pointing
-    // at http://169.254.169.254/ (AWS instance metadata),
-    // http://localhost:<internal-port>/, or file:// URLs and have the
-    // gateway fetch the secret + base64-relay it.
     if (!isSafeMediaUrl(url)) {
         return null;
     }
@@ -41,8 +50,6 @@ async function downloadAsBase64(url: string): Promise<{ data: string; mimeType: 
     }
 }
 
-// Discord ButtonStyle: Primary=1, Secondary=2, Success=3, Danger=4.
-// Returning the numeric value avoids a build-time dependency.
 function mapDiscordButtonStyle(style: OurButtonStyle | undefined): number {
     switch (style) {
         case 'success': return 3;
@@ -53,7 +60,6 @@ function mapDiscordButtonStyle(style: OurButtonStyle | undefined): number {
     }
 }
 
-// Discord caps: 5 buttons/row, 5 rows/message, custom_id ≤ 100 chars.
 function buildDiscordComponents(
     interactive: InteractiveReply,
 ): Array<{ type: 1; components: Array<{ type: 2; style: number; label: string; custom_id: string }> }> | undefined {
@@ -95,15 +101,7 @@ function buildDiscordComponents(
 
 const INTERACTION_TTL_MS = 14 * 60_000;
 const INTERACTION_SWEEP_MS = 60_000;
-/** Global ceiling on outstanding Discord interactions across all users.
- *  Prevents memory from growing unbounded if interactions never get
- *  resolved (bot crashed mid-task, etc.). */
 const MAX_PENDING_INTERACTIONS = 500;
-/** Per-user ceiling. Without this, a single user firing slash commands
- *  in a loop could fill the entire global queue and lock out every
- *  other user with "Too many pending requests." 10 is generous — a
- *  user with 10 simultaneously-pending slash commands is already in
- *  an unusual state. */
 const MAX_PENDING_PER_USER = 10;
 const MAX_DISCORD_LENGTH = 2000;
 
@@ -111,9 +109,6 @@ export class DiscordChannel extends BaseChannel {
     readonly name = 'discord';
     readonly authType = 'token';
     readonly streaming: StreamingCapability = { editBased: true, minEditIntervalMs: 500 };
-    // Discord renders all of: action-row buttons, select menus, native polls,
-    // rich components (cards/embeds). See runtime block wiring in
-    // src/team/src/factory.ts — the agent reads this to pick tools.
     readonly capabilities: readonly InteractiveCapability[] = [
         'buttons',
         'select',
@@ -151,7 +146,6 @@ export class DiscordChannel extends BaseChannel {
                     GatewayIntentBits.DirectMessages,
                     GatewayIntentBits.MessageContent,
                     GatewayIntentBits.GuildMessageReactions,
-                    // Required for MessagePollVoteAdd to fire.
                     GatewayIntentBits.GuildMessagePolls,
                     GatewayIntentBits.DirectMessagePolls,
                 ],
@@ -193,6 +187,12 @@ export class DiscordChannel extends BaseChannel {
                         );
                     } else if (ct.startsWith('video/')) {
                         media.push({ type: 'video', url: att.url, mimeType: ct, fileName: att.name, fileSize: att.size });
+                    } else if (isTextDocument(ct, att.name) && att.size <= MAX_TEXT_DOCUMENT_BYTES) {
+                        const text = await downloadTextDocument(att.url);
+                        media.push(text !== null
+                            ? { type: 'document', url: att.url, mimeType: ct || undefined, fileName: att.name, fileSize: att.size, text }
+                            : { type: 'document', url: att.url, mimeType: ct || undefined, fileName: att.name, fileSize: att.size },
+                        );
                     } else {
                         media.push({ type: 'document', url: att.url, mimeType: ct || undefined, fileName: att.name, fileSize: att.size });
                     }
@@ -224,8 +224,6 @@ export class DiscordChannel extends BaseChannel {
                 await this.emit('onMessage', normalized);
             });
 
-            // Poll votes round-trip as synthesized user messages so the
-            // agent reads vote signals via the normal pipeline.
             this.client.on(Events.MessagePollVoteAdd, async (pollAnswer, userId) => {
                 try {
                     const answerText =
@@ -235,13 +233,11 @@ export class DiscordChannel extends BaseChannel {
                     const channelId = pollMsg?.channelId;
                     if (!channelId) return;
 
-                    // Try to resolve voter username — best effort.
                     let voterName: string | undefined;
                     try {
                         const user = await this.client!.users.fetch(userId);
                         voterName = user.username;
                     } catch {
-                        /* fall through without name */
                     }
 
                     const fetched = await this.client!.channels.fetch(channelId).catch(() => null);
@@ -282,7 +278,6 @@ export class DiscordChannel extends BaseChannel {
                         return;
                     }
 
-                    // Silent ack — agent's reply carries the response.
                     await interaction.deferUpdate().catch(() => {});
 
                     const callback: InteractionCallback = {
@@ -339,10 +334,6 @@ export class DiscordChannel extends BaseChannel {
                     });
                     return;
                 }
-                // Per-user quota: count entries owned by this senderId
-                // so one chatty user can't lock out the rest of the
-                // guild. O(n) scan is fine — n is bounded by the
-                // global cap above.
                 let userPending = 0;
                 for (const e of this.pendingInteractions.values()) {
                     const i = e.interaction as { user?: { id?: string } };
@@ -421,7 +412,6 @@ export class DiscordChannel extends BaseChannel {
             return sent.id;
         }
 
-        // Reply-threading is clutter in DMs (single counterparty).
         const isDM = message.peer.type === 'user';
         const sent = await channel.send({
             content: (message.body ?? '').slice(0, MAX_DISCORD_LENGTH),
@@ -431,11 +421,6 @@ export class DiscordChannel extends BaseChannel {
         return sent.id;
     }
 
-    /**
-     * Native Discord poll using discord.js's `PollData` shape (camelCase, flat
-     * answers — NOT the raw API schema). Caps: question ≤ 300, 2-10 options
-     * ≤ 55 each, duration 1-768 hours.
-     */
     async sendPoll(args: {
         peer: Peer;
         question: string;
@@ -473,6 +458,35 @@ export class DiscordChannel extends BaseChannel {
         } catch {}
     }
 
+    /**
+     * Delete a Discord message by ID. Used by channel-worker's reasoning
+     * auto-cleanup (and any other "remove preview / orphan" path). Failures
+     * are swallowed — caller is best-effort.
+     */
+    async deleteMessage(messageId: string, peer: Peer): Promise<void> {
+        if (!this.client) return;
+        try {
+            const channel = await this.resolveTextChannel(peer);
+            const msg = await channel.messages.fetch(messageId);
+            await msg.delete();
+        } catch {
+            /* best-effort; ignore if already gone or permission-denied */
+        }
+    }
+
+    /**
+     * Discord-native collapsible reasoning: spoiler tags. Header line is
+     * visible; body sits inside `||...||` which renders as a click-to-reveal
+     * blurred block. Pipe chars inside content are escaped so they can't
+     * close the spoiler early.
+     */
+    override formatReasoning(content: string): string {
+        const trimmed = content.trim();
+        if (!trimmed) return '';
+        const safe = trimmed.replace(/\|/g, '\\|');
+        return `💭 **Reasoning** (tap to reveal)\n||${safe}||`;
+    }
+
     async react(options: ReactionOptions): Promise<void> {
         if (!this.client) throw new Error('Discord not connected');
 
@@ -495,8 +509,12 @@ export class DiscordChannel extends BaseChannel {
     }
 
     private async registerSlashCommands(): Promise<void> {
-        const commands = this.channelConfig.slashCommands;
-        if (!commands?.length || !this.client?.application) return;
+        if (!this.client?.application) return;
+        const commands = buildDiscordCommands(
+            COMMANDS,
+            this.channelConfig.slashCommands ?? [],
+        );
+        if (commands.length === 0) return;
 
         const { SlashCommandBuilder } = await import('discord.js');
 
@@ -567,9 +585,6 @@ export class DiscordChannel extends BaseChannel {
                 );
                 continue;
             }
-            // discord.js's AttachmentBuilder accepts a URL string, a local
-            // filesystem path string, or a Buffer. We map each resolved
-            // kind to the appropriate input.
             const name = media.fileName ?? defaultDiscordAttachmentName(resolved.source, media.type);
             switch (resolved.source.kind) {
                 case 'remote-url':
@@ -626,11 +641,6 @@ export class DiscordChannel extends BaseChannel {
     }
 }
 
-/**
- * Pick a friendly filename for Discord attachments when the agent didn't
- * supply one. Discord uses the name in the UI ("Open jane.png"), so a
- * generic "file" or random hash is hostile UX.
- */
 function defaultDiscordAttachmentName(
     source: import('@gateway/core/media-resolver').MediaSource,
     type: 'image' | 'video' | 'audio' | 'document' | 'sticker',

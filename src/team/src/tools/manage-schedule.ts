@@ -1,5 +1,6 @@
 // Flat schema — OpenAI rejects discriminatedUnion's oneOf at top level; per-op validation in execute().
 
+import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
 import { defineTool } from 'flopsygraph';
 import {
@@ -12,8 +13,8 @@ import { getScheduleFacade, type ScheduleFacade } from './schedule-registry';
 
 const schema = z.object({
     operation: z
-        .enum(['create', 'list', 'update', 'delete', 'disable', 'enable'])
-        .describe('Which operation to perform'),
+        .enum(['create', 'list', 'get', 'update', 'delete', 'disable', 'enable'])
+        .describe('Which operation to perform. `list` shows every schedule with its full settings; `get` returns one schedule by id including raw config.'),
 
     // create-only
     scheduleType: z
@@ -88,7 +89,7 @@ const schema = z.object({
     id: z
         .string()
         .optional()
-        .describe('(update/delete/disable/enable) The schedule id returned by `list` or `create`'),
+        .describe('(get/update/delete/disable/enable) The schedule id returned by `list` or `create`'),
 });
 
 export const manageScheduleTool = defineTool({
@@ -114,11 +115,15 @@ See docs/proactive.md.
 
 Operations:
   create    — add a new schedule (persists to state, registers immediately)
-  list      — show all runtime-created schedules
+  list      — show ALL schedules with full settings (schedule, delivery, skills, prompt, enabled)
+  get       — full detail for one schedule by id (includes raw config JSON)
   update    — patch fields of an existing schedule (preserves run stats and prompt file)
   delete    — remove a runtime schedule by id
   disable   — pause (takes effect on next restart)
   enable    — resume a previously disabled schedule
+
+To answer "what are my schedules / what's their config", call list (or get <id>) —
+schedules live in the proactive DB, NOT in workspace files; never search the filesystem for them.
 
 For update, pass id + only the fields you want to change. Fields not
 supplied are kept as-is. Schedule kind cannot change (heartbeat ↔ cron
@@ -154,18 +159,15 @@ requires delete+create).`,
             case 'list': {
                 const all = facade.listSchedules();
                 if (all.length === 0) return 'No runtime schedules. Use operation:"create" to add one.';
-                const lines = all.map((r) => {
-                    let cfg: { name?: string; enabled?: boolean; prompt?: string; promptFile?: string } = {};
-                    try {
-                        cfg = JSON.parse(r.configJson) as typeof cfg;
-                    } catch {
-                        /* ignore */
-                    }
-                    const state = r.enabled ? 'enabled' : 'disabled';
-                    const label = cfg.name ?? '(no name)';
-                    return `- [${r.kind}] ${r.id} — "${label}" (${state}, created ${new Date(r.createdAt).toISOString()})`;
-                });
-                return `Runtime schedules (${all.length}):\n${lines.join('\n')}`;
+                const blocks = all.map((r) => formatSchedule(r, false));
+                return `Runtime schedules (${all.length}):\n\n${blocks.join('\n\n')}`;
+            }
+
+            case 'get': {
+                if (!args.id) return 'Missing required field: id';
+                const row = facade.listSchedules().find((s) => s.id === args.id);
+                if (!row) return `No runtime schedule with id "${args.id}". Use operation:"list" to see ids.`;
+                return formatSchedule(row, true);
             }
 
             case 'delete': {
@@ -195,7 +197,7 @@ requires delete+create).`,
                 const scheduleId =
                     args.scheduleType === 'heartbeat'
                         ? (args.id ?? `runtime-hb-${args.name ?? Date.now()}`)
-                        : (args.id ?? `runtime-cron-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+                        : (args.id ?? `runtime-cron-${Date.now()}-${randomBytes(3).toString('hex')}`);
 
                 // Copy absolute promptFile paths into the workspace.
                 let resolvedPromptFile = args.promptFile;
@@ -258,6 +260,51 @@ requires delete+create).`,
 type Args = z.infer<typeof schema>;
 type CreatedBy = { threadId?: string; agentName?: string };
 
+type ScheduleRow = ReturnType<ScheduleFacade['listSchedules']>[number];
+
+function formatSchedule(row: ScheduleRow, verbose: boolean): string {
+    let cfg: Record<string, unknown> = {};
+    try {
+        cfg = JSON.parse(row.configJson) as Record<string, unknown>;
+    } catch {
+        return `[${row.kind}] ${row.id} — (config unparseable; raw: ${row.configJson})`;
+    }
+    const payload = (row.kind === 'cron' ? (cfg.payload as Record<string, unknown>) : cfg) ?? {};
+    const name = typeof cfg.name === 'string' ? cfg.name : '(no name)';
+    const lines = [`[${row.kind}] ${row.id} — "${name}" (${row.enabled ? 'enabled' : 'disabled'})`];
+
+    if (row.kind === 'heartbeat') {
+        lines.push(`  schedule: every ${String(cfg.interval ?? '?')}`);
+        const ah = cfg.activeHours as { start?: number; end?: number } | undefined;
+        if (ah && typeof ah.start === 'number') lines.push(`  activeHours: ${ah.start}:00–${ah.end}:00`);
+    } else if (row.kind === 'cron') {
+        const s = (cfg.schedule ?? {}) as { kind?: string; expr?: string; tz?: string; everyMs?: number; atMs?: number };
+        if (s.kind === 'cron') lines.push(`  schedule: cron "${s.expr}"${s.tz ? ` (${s.tz})` : ''}`);
+        else if (s.kind === 'every') lines.push(`  schedule: every ${s.everyMs}ms`);
+        else if (s.kind === 'at') lines.push(`  schedule: once at ${new Date(s.atMs ?? 0).toISOString()}`);
+    }
+
+    lines.push(`  delivery: ${String(payload.deliveryMode ?? 'always')}`);
+    if (payload.oneshot) lines.push('  oneshot: true');
+    const promptFile = payload.promptFile ?? cfg.promptFile;
+    const inline = payload.message ?? cfg.prompt;
+    lines.push(`  prompt: ${promptFile ? `file ${String(promptFile)}` : inline ? 'inline' : '(none)'}`);
+    const skills = (cfg.skills ?? payload.skills) as string[] | undefined;
+    lines.push(`  skills: ${Array.isArray(skills) && skills.length ? skills.join(', ') : '(none)'}`);
+    if (typeof cfg.cooldownAfterSilences === 'number') {
+        lines.push(`  cooldownAfterSilences: ${cfg.cooldownAfterSilences}`);
+    }
+    const script = (payload.script ?? cfg.script) as string | undefined;
+    if (script) lines.push(`  script: ${script}${payload.noAgent || cfg.noAgent ? ' (no-agent: stdout is delivered)' : ''}`);
+    const preCheck = (payload.preCheckScript ?? cfg.preCheckScript) as string | undefined;
+    if (preCheck) lines.push(`  preCheckScript: ${preCheck}`);
+    lines.push(
+        `  created: ${new Date(row.createdAt).toISOString()}${row.createdByAgent ? ` by ${row.createdByAgent}` : ''}${row.createdByThread ? ` (thread ${row.createdByThread})` : ''}`,
+    );
+    if (verbose) lines.push(`  rawConfig: ${row.configJson}`);
+    return lines.join('\n');
+}
+
 function createHeartbeat(args: Args, facade: NonNullable<ReturnType<typeof getScheduleFacade>>, createdBy: CreatedBy): string {
     if (!args.name) return 'Missing required field: name';
     if (!args.interval) return 'Missing required field: interval (e.g. "30m", "1h", "1d")';
@@ -302,7 +349,7 @@ function createCronJob(args: Args, facade: NonNullable<ReturnType<typeof getSche
     }
 
     // Reuse args.id so id and copied promptFile path stay in sync.
-    const id = args.id ?? `runtime-cron-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const id = args.id ?? `runtime-cron-${Date.now()}-${randomBytes(3).toString('hex')}`;
     const job: JobDefinitionConfig = {
         id,
         name: args.name ?? id,

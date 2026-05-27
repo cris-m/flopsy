@@ -10,6 +10,7 @@ A personal AI gateway that lives on your machine. One config file (`flopsy.json5
 - **Tool-using**: MCP servers plug in calendar, drive, spotify, obsidian, terminal, and anything else that speaks MCP.
 - **Learns over time**: a SQLite-backed harness records what worked, what failed, and which skills the agent has written for itself — reused across future turns.
 - **Local-first**: models run on Ollama by default. Cloud models (Anthropic, OpenAI, NVIDIA, etc.) are opt-in per-agent.
+- **Built-in credential vault**: real API keys encrypted at rest (AES-256-GCM, Argon2id-derived KEK), brokered to the daemon at unseal time and to external agents through a local MITM proxy that substitutes placeholder strings at egress. Inspired by Infisical's Agent Vault, smaller surface, one-command setup. See [Vault](./docs/vault.md).
 
 ## Prerequisites
 
@@ -60,6 +61,12 @@ npm run flopsy env reload      # re-read .env and restart gateway
 npm run flopsy config get      # dump active config
 npm run flopsy gateway start   # alias for npm start
 npm run flopsy gateway stop
+
+# Credential vault
+npm run flopsy vault setup     # one-shot wizard: init + import .env + token mint + server
+npm run flopsy vault doctor    # 6-check health probe
+npm run flopsy vault add KEY   # store secret + auto-create substitution rule + emit placeholder
+npm run flopsy vault run -- claude    # exec a child with proxy + CA + per-run token wired up
 ```
 
 See `docs/cli.md` for the full command reference.
@@ -103,6 +110,7 @@ Per-channel credentials (bot tokens, OAuth secrets) are resolved from `flopsy.js
 - `docs/memory.md` — semantic memory + the learning harness
 - `docs/cli.md` — every CLI subcommand
 - `docs/channels.md` — per-platform setup notes
+- `docs/vault.md` — credential vault: MITM proxy, scoped tokens, cross-language usage
 
 ## Status
 

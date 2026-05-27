@@ -1,22 +1,3 @@
-/**
- * SkillUsageStore — sidecar provenance + lifecycle tracker for SKILL.md files.
- *
- * Persists to <skillsPath>/.skill-state.json — a flat JSON map keyed by skill
- * name. Atomic writes (tmp → rename) prevent partial reads. All mutations are
- * best-effort: failures log at debug and never break skill tool calls.
- *
- * Schema per entry:
- *   state            — 'proposed' | 'active' | 'stale' | 'archived'
- *   pinned           — curator skips auto-transitions when true
- *   is_agent_created — true when written via skill_manage(create)
- *   view_count       — bumped when agent reads SKILL.md via read_file
- *   patch_count      — bumped on skill_manage(append_lessons | bump_version)
- *   created_at       — ISO timestamp set on first write
- *   last_viewed_at   — ISO timestamp set on view()
- *   last_patched_at  — ISO timestamp set on patch()
- *   archived_at      — ISO timestamp set when state → archived
- */
-
 import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { createLogger } from '@flopsy/shared';
@@ -24,6 +5,15 @@ import { createLogger } from '@flopsy/shared';
 const log = createLogger('skill-usage-store');
 
 export type SkillLifecycleState = 'proposed' | 'active' | 'stale' | 'archived';
+
+export interface PendingSkillEdit {
+    // Per-bullet keys appendLessonsToSkill filters on, so reverted bullets can't re-apply.
+    fingerprints: string[];
+    bullets: string[];
+    appliedAt: number;
+    baselineRate: number;
+    baselineN: number;
+}
 
 export interface SkillUsageRecord {
     state: SkillLifecycleState;
@@ -35,6 +25,15 @@ export interface SkillUsageRecord {
     last_viewed_at: string | null;
     last_patched_at: string | null;
     archived_at: string | null;
+    pending_edit?: PendingSkillEdit | null;
+    // Fingerprints of reverted edits — never re-apply.
+    rejected_edits?: string[];
+}
+
+const MAX_REJECTED_EDITS = 50;
+
+export function lessonFingerprint(text: string): string {
+    return text.toLowerCase().replace(/\s+/g, ' ').replace(/[`*_]/g, '').trim();
 }
 
 type UsageMap = Record<string, SkillUsageRecord>;
@@ -64,8 +63,6 @@ export class SkillUsageStore {
         this.filePath = join(skillsPath, '.skill-state.json');
     }
 
-    // ── Read ─────────────────────────────────────────────────────────────────
-
     loadAll(): UsageMap {
         if (!existsSync(this.filePath)) return {};
         try {
@@ -80,8 +77,6 @@ export class SkillUsageStore {
     get(name: string): SkillUsageRecord | null {
         return this.loadAll()[name] ?? null;
     }
-
-    // ── Mutations ─────────────────────────────────────────────────────────────
 
     private mutate(name: string, fn: (rec: SkillUsageRecord) => void): void {
         try {
@@ -102,19 +97,14 @@ export class SkillUsageStore {
         renameSync(tmp, this.filePath);
     }
 
-    // ── Public API ────────────────────────────────────────────────────────────
-
-    /** Called when the agent reads a SKILL.md via read_file. */
     view(name: string): void {
         this.mutate(name, (rec) => {
             rec.view_count += 1;
             rec.last_viewed_at = nowIso();
-            // Re-activate stale skills the agent is actively viewing.
             if (rec.state === 'stale') rec.state = 'active';
         });
     }
 
-    /** Called on skill_manage(append_lessons | bump_version). */
     patch(name: string): void {
         this.mutate(name, (rec) => {
             rec.patch_count += 1;
@@ -123,7 +113,6 @@ export class SkillUsageStore {
         });
     }
 
-    /** Called on skill_manage(create) — opts the skill into curator management. */
     markAgentCreated(name: string): void {
         this.mutate(name, (rec) => {
             rec.is_agent_created = true;
@@ -143,7 +132,41 @@ export class SkillUsageStore {
         this.mutate(name, (rec) => { rec.pinned = pinned; });
     }
 
-    /** Remove telemetry for a deleted skill. */
+    recordPendingEdit(name: string, edit: PendingSkillEdit): boolean {
+        let started = false;
+        this.mutate(name, (rec) => {
+            if (rec.pending_edit) return; // serialize — one trial at a time
+            rec.pending_edit = edit;
+            started = true;
+        });
+        return started;
+    }
+
+    getPendingEdit(name: string): PendingSkillEdit | null {
+        return this.get(name)?.pending_edit ?? null;
+    }
+
+    clearPendingEdit(name: string): void {
+        this.mutate(name, (rec) => { rec.pending_edit = null; });
+    }
+
+    // Capped, newest-wins.
+    addRejectedEdit(name: string, fingerprint: string): void {
+        this.mutate(name, (rec) => {
+            const list = (rec.rejected_edits ?? []).filter((f) => f !== fingerprint);
+            list.push(fingerprint);
+            rec.rejected_edits = list.slice(-MAX_REJECTED_EDITS);
+        });
+    }
+
+    getRejectedEdits(name: string): string[] {
+        return this.get(name)?.rejected_edits ?? [];
+    }
+
+    isRejected(name: string, fingerprint: string): boolean {
+        return this.getRejectedEdits(name).includes(fingerprint);
+    }
+
     forget(name: string): void {
         try {
             const map = this.loadAll();

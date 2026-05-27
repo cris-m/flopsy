@@ -5,11 +5,31 @@
  */
 
 import type { AuthProvider } from '../types';
-import { googleProvider } from './google';
+import {
+    googleProvider,
+    gmailProvider,
+    driveProvider,
+    calendarProvider,
+    youtubeProvider,
+    contactsProvider,
+} from './google';
 import { spotifyProvider } from './spotify';
 import { twitterProvider } from './twitter';
 
-export const PROVIDERS: readonly AuthProvider[] = [googleProvider, spotifyProvider, twitterProvider];
+// Per-service Google providers come first so `flopsy auth list` shows them
+// as the recommended entry points. `googleProvider` (the legacy all-scopes
+// flow) stays for backward-compat — re-running it overwrites only `google.json`,
+// not the per-service files.
+export const PROVIDERS: readonly AuthProvider[] = [
+    gmailProvider,
+    driveProvider,
+    calendarProvider,
+    youtubeProvider,
+    contactsProvider,
+    googleProvider,
+    spotifyProvider,
+    twitterProvider,
+];
 
 export function getProvider(name: string): AuthProvider | undefined {
     const normalized = name.trim().toLowerCase();

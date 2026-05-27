@@ -27,7 +27,6 @@ Running `flopsy` with no arguments shows a welcome panel with `Tips for getting 
 | `flopsy env reload` | Re-read `.env` and restart the gateway if any key changed | — | optional |
 | `flopsy memory ...` | Inspect the harness learning store (skills, lessons, facts) | — | no |
 | `flopsy goal ...` | Inspect + manage `/goal` Ralph-loop sessions | `learning.db` | no |
-| `flopsy commitments ...` | Inspect + dismiss inferred follow-up commitments | `learning.db` | no |
 | `flopsy faq` | Surface recurring questions from session summaries | — | no |
 | `flopsy skill proposed ...` | Review agent-authored skills awaiting promotion | `skills-proposed/` | no |
 | `flopsy hooks list` | Inspect loaded event hooks (`.flopsy/content/hooks/*.yaml`) | — | optional |
@@ -343,18 +342,6 @@ flopsy goal clear <threadId>              # delete the goal entirely
 ```
 
 See [goal.md](./goal.md) for the loop semantics.
-
-### `flopsy commitments ...`
-
-Inferred follow-ups extracted from chat turns and surfaced by proactive
-fires when their `due_at_ms` elapses.
-
-```bash
-flopsy commitments                        # list pending (default)
-flopsy commitments --all                  # include delivered / dismissed / expired
-flopsy commitments --peer <id>            # filter to one peer
-flopsy commitments dismiss <id>           # mark as dismissed (stops surfacing)
-```
 
 ### `flopsy faq`
 

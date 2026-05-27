@@ -6,11 +6,24 @@ import type {
     OutboundMessage,
     ReactionOptions,
     Message,
+    Media,
     WebhookChannel,
     InteractiveCapability,
 } from '@gateway/types';
+import { isTextDocument } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
 import type { GoogleChatChannelConfig, ServiceAccountKey, GoogleChatEvent } from './types';
+
+const MAX_TEXT_DOCUMENT_BYTES = 256 * 1024;
+
+interface GChatAttachment {
+    name?: string;
+    contentName?: string;
+    contentType?: string;
+    downloadUri?: string;
+    attachmentDataRef?: { resourceName?: string; attachmentUploadToken?: string };
+    driveDataRef?: { driveFileId?: string };
+}
 
 const CHAT_API = 'https://chat.googleapis.com/v1';
 const TOKEN_URI = 'https://oauth2.googleapis.com/token';
@@ -41,11 +54,12 @@ export class GoogleChatChannel extends BaseChannel implements WebhookChannel {
         this.webhookPath = config.webhookPath ?? '/webhook/googlechat';
     }
 
-    verifyWebhook(_req: IncomingMessage, body: string): boolean {
+    verifyWebhook(_req: IncomingMessage, body: string | Buffer): boolean {
         const expected = this.channelConfig.verificationToken;
         if (!expected) return true;
         try {
-            const parsed = JSON.parse(body) as { token?: string };
+            const bodyStr = typeof body === 'string' ? body : body.toString('utf8');
+            const parsed = JSON.parse(bodyStr) as { token?: string };
             const provided = parsed.token ?? '';
             // Compare via timingSafeEqual on equal-length buffers (zero-pad the
             // shorter input) so length differences don't short-circuit and leak
@@ -90,8 +104,11 @@ export class GoogleChatChannel extends BaseChannel implements WebhookChannel {
     async handleWebhookEvent(event: GoogleChatEvent): Promise<void> {
         if (event.type !== 'MESSAGE') return;
 
-        const msg = event.message;
-        if (!msg?.text) return;
+        const msg = event.message as (typeof event.message) & { attachment?: GChatAttachment[] };
+        const attachments = Array.isArray(msg?.attachment) ? msg.attachment : undefined;
+        const hasText = !!msg?.text;
+        const hasAttachment = !!attachments?.length;
+        if (!msg || (!hasText && !hasAttachment)) return;
 
         const space = event.space;
         const sender = event.user;
@@ -109,7 +126,36 @@ export class GoogleChatChannel extends BaseChannel implements WebhookChannel {
             if (!hasAnnotation && !msg.argumentText) return;
         }
 
-        const body = msg.argumentText?.trim() || msg.text;
+        const media: Media[] = [];
+        if (attachments) {
+            for (const a of attachments) {
+                const fileName = a.contentName;
+                const mimeType = a.contentType;
+                const downloadUri = a.downloadUri;
+                const isText = isTextDocument(mimeType, fileName);
+                if (downloadUri && isText) {
+                    try {
+                        const token = await this.getAccessToken();
+                        const res = await fetch(downloadUri, {
+                            headers: { Authorization: `Bearer ${token}` },
+                        });
+                        if (res.ok) {
+                            const buffer = await res.arrayBuffer();
+                            if (buffer.byteLength <= MAX_TEXT_DOCUMENT_BYTES) {
+                                const text = new TextDecoder('utf-8', { fatal: false }).decode(buffer);
+                                media.push({ type: 'document', fileName, mimeType, text });
+                                continue;
+                            }
+                        }
+                    } catch {
+                        /* fall through */
+                    }
+                }
+                media.push({ type: 'document', fileName, mimeType });
+            }
+        }
+
+        const body = msg.argumentText?.trim() || msg.text || (media.length > 0 ? `[${media[0]!.fileName ?? 'file'}]` : '');
 
         const normalized: Message = {
             id: msg.name ?? randomUUID(),
@@ -117,7 +163,9 @@ export class GoogleChatChannel extends BaseChannel implements WebhookChannel {
             peer: { id: peerId, type: peerType, name: space?.displayName },
             sender: { id: senderId, name: sender?.displayName },
             body,
+            synthetic: !hasText && media.length > 0 ? true : undefined,
             timestamp: msg.createTime ?? new Date().toISOString(),
+            ...(media.length > 0 && { media }),
         };
 
         await this.emit('onMessage', normalized);

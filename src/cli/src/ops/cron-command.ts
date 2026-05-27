@@ -7,6 +7,7 @@
  * or `--cron "<expr>" --tz <IANA>` (5-field cron expression).
  */
 
+import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
 import { Command } from 'commander';
@@ -118,7 +119,7 @@ export function registerCronCommands(root: Command): void {
             const skills = mergeSkills(frontmatterSkills, opts.skill);
             const scheduleId: string =
                 opts.id ??
-                `runtime-cron-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+                `runtime-cron-${Date.now()}-${randomBytes(3).toString('hex')}`;
             await managementCreate({
                 kind: 'cron',
                 id: scheduleId,

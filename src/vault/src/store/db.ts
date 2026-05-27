@@ -35,6 +35,8 @@ export function openVaultDb(opts: OpenDbOptions): Db {
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
     db.pragma('synchronous = FULL');
+    db.pragma('wal_autocheckpoint = 1000');
+    db.pragma('journal_size_limit = 67108864');
 
     if (!opts.readOnly) {
         const ddl = readFileSync(SCHEMA_PATH, 'utf8');

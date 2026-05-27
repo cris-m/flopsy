@@ -14,6 +14,7 @@ export type RouteHandler = (
     req: IncomingMessage,
     body: string,
     res: ServerResponse,
+    raw?: Buffer,
 ) => Promise<void>;
 
 // 2 MB covers every webhook platform we integrate; channels override via maxBodyBytes.
@@ -215,7 +216,7 @@ export class WebhookServer {
         const url = req.url ?? '/';
         for (const [prefix, handler] of this.routes) {
             if (url.startsWith(prefix)) {
-                await handler(req, body, res);
+                await handler(req, body, res, raw);
                 return;
             }
         }

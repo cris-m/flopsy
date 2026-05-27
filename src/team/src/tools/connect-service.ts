@@ -1,17 +1,31 @@
 import { z } from 'zod';
 import { defineTool } from 'flopsygraph';
-import { googleDeviceFlow, type StoredCredential } from '@flopsy/cli';
+import {
+    googleDeviceFlow,
+    DEVICE_FLOW_SUPPORTED_SCOPES,
+    type StoredCredential,
+} from '@flopsy/cli';
 import type { IEventQueue } from '@flopsy/gateway';
 import { startDevicePolling, type DevicePollerHandle } from '../auth/device-poller';
 import type { TaskRegistry } from '../state/task-registry';
 import { createBackgroundJobTask, toTerminal, toRunning } from '../state/task-state';
 
-// Per-(provider, threadId) lock prevents concurrent pollers double-firing task_complete.
 const ACTIVE_DEVICE_POLLS = new Map<string, DevicePollerHandle>();
 
 function pollKey(provider: string, threadId: string): string {
     return `${provider}:${threadId}`;
 }
+
+const PER_SERVICE_PROVIDERS = ['gmail', 'drive', 'calendar', 'youtube', 'contacts'] as const;
+type PerServiceProvider = (typeof PER_SERVICE_PROVIDERS)[number];
+
+const DEVICE_FLOW_BLOCKED_REASON: Readonly<Record<PerServiceProvider, string | null>> = {
+    gmail: 'Google blocks Gmail scopes from the device-flow client type',
+    drive: 'Google device flow only grants narrow drive.file scope (would lose full drive access)',
+    contacts: 'Google does not allow contacts scopes via device flow',
+    youtube: null,
+    calendar: null,
+};
 
 interface ConnectServiceConfigurable {
     readonly onReply?: (
@@ -21,60 +35,40 @@ interface ConnectServiceConfigurable {
     readonly threadId?: string;
     readonly eventQueue?: IEventQueue;
     readonly registry?: TaskRegistry;
-    /** Restart MCP servers that requiresAuth for the given provider. */
     readonly onAuthSuccess?: (provider: string) => Promise<void>;
 }
 
 export const connectServiceTool = defineTool({
     name: 'connect_service',
     description: [
-        'ONE-TIME OAUTH SETUP. Starts a Google device-code flow: the user',
-        'gets a URL + short code, signs in on whatever device they have',
-        '(phone is fine), and a success notification arrives in a later turn.',
-        'The URL + code are sent to the user automatically — you do not need',
-        'to format anything; just invoke the tool.',
+        'One-time per-service Google OAuth setup. Each provider writes its own credential file; there is no "google" catch-all.',
         '',
-        'WHEN TO CALL:',
-        '- User asks to authenticate / sign in / connect / link / authorize',
-        '  a Google account, OR to switch accounts.',
-        '- A worker reports `invalid_grant`, `revoked`, or "credential',
-        '  missing" for a Google MCP tool.',
+        'Providers:',
+        '  gmail    — email/inbox',
+        '  calendar — schedule/meetings',
+        '  drive    — documents/files',
+        '  youtube  — subscriptions/videos',
+        '  contacts — address book',
         '',
-        'DO NOT CALL when the user just wants to read/send email, list',
-        'calendar events, search drive, etc. — those tools are already',
-        'authorized; delegate to the worker that owns the relevant MCP',
-        'server instead. Calling connect_service for a read-an-email request',
-        'will trigger a duplicate OAuth consent — never what the user wants.',
+        'Behaviour (set by Google policy):',
+        '  - youtube, calendar — device flow works. User receives URL + code, authorises on another device, success arrives in a later turn.',
+        '  - gmail, drive, contacts — device flow blocked by Google. Tool returns instructions to run `flopsy auth <service>` in a terminal and starts no OAuth flow.',
         '',
-        'SCOPE COVERAGE (Google policy, not Flopsy config):',
-        '- Calendar, Drive (file-scope), YouTube → authorized by this tool.',
-        '- Gmail → NOT authorized by this tool. Google policy blocks Gmail',
-        '  scopes from the device flow regardless of consent-screen setup.',
-        '  If the user specifically asked for Gmail / "link my gmail" /',
-        '  "email access", tell them: run `flopsy auth google` in a terminal',
-        '  on the machine running the gateway — that uses a browser flow',
-        '  Google does allow for Gmail. After that, gmail_* tools work here.',
-        '  Do NOT call connect_service for Gmail-only asks; it will succeed',
-        '  for the other scopes but Gmail will still be missing.',
+        'Call when the user asks to authenticate/connect/link a specific service, or a worker reports invalid_grant / revoked / "credential missing" for that service.',
+        '',
+        'Style:',
+        '  - if the user says "connect google" generically, ask which service first.',
+        '  - for plain use requests ("read my email"), delegate to the owning worker. Don\'t trigger a duplicate consent.',
     ].join('\n'),
     schema: z.object({
         provider: z
-            .enum(['google'])
-            .describe('Service to authorize. Today: only "google".'),
-        scopes: z
-            .array(z.string())
-            .nullable()
-            .optional()
+            .enum(PER_SERVICE_PROVIDERS)
             .describe(
-                'Optional. OMIT THIS FIELD — the default scope set is correct. ' +
-                'Defaults to device-flow-safe set: openid, email, profile, ' +
-                'calendar, drive.file, youtube, youtube.readonly. ' +
-                'Note: Gmail scopes are NOT in the default set — Google blocks ' +
-                'them from device flow. Gmail auth uses a separate web-flow path.',
+                'Which Google service to authorize. Pick the specific one the ' +
+                    'user named or implied. There is no "google" catch-all.',
             ),
     }),
-    execute: async ({ provider, scopes: rawScopes }, ctx) => {
-        const scopes = rawScopes ?? undefined;
+    execute: async ({ provider }, ctx) => {
         const cfg = (ctx.configurable ?? {}) as ConnectServiceConfigurable;
         const onReply = cfg.onReply;
         const threadId = cfg.threadId;
@@ -85,8 +79,31 @@ export const connectServiceTool = defineTool({
         if (!onReply || !threadId || !eventQueue) {
             return 'connect_service: not wired (missing onReply/threadId/eventQueue in configurable).';
         }
-        if (provider !== 'google') {
-            return `connect_service: provider "${provider}" not supported yet.`;
+
+        const blockedReason = DEVICE_FLOW_BLOCKED_REASON[provider];
+        if (blockedReason) {
+            const message = [
+                `I can't connect ${provider} from here — ${blockedReason}.`,
+                ``,
+                `To authorize ${provider}, run this in a terminal on the machine running Flopsy:`,
+                ``,
+                `  flopsy auth ${provider}`,
+                ``,
+                `That opens a browser for the OAuth consent (which Google allows for ${provider} scopes),`,
+                `saves the credential to .flopsy/auth/${provider}.json, and the ${provider} MCP will`,
+                `pick it up on the next request.`,
+            ].join('\n');
+            try {
+                await onReply(message);
+            } catch (err) {
+                return `connect_service: failed to send instructions: ${err instanceof Error ? err.message : String(err)}`;
+            }
+            return `Told user to run \`flopsy auth ${provider}\` in a terminal (device flow not available for ${provider}).`;
+        }
+
+        const deviceScopes = DEVICE_FLOW_SUPPORTED_SCOPES[provider];
+        if (!deviceScopes) {
+            return `connect_service: internal error — no device-flow scope set for "${provider}".`;
         }
 
         const key = pollKey(provider, threadId);
@@ -100,18 +117,18 @@ export const connectServiceTool = defineTool({
 
         let start: Awaited<ReturnType<typeof googleDeviceFlow.start>>;
         try {
-            start = await googleDeviceFlow.start(scopes);
+            start = await googleDeviceFlow.start(deviceScopes);
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             if (msg.includes('invalid_scope')) {
                 return [
-                    'connect_service: Google rejected the scope request (invalid_scope).',
-                    'This is a one-time setup issue — the OAuth consent screen needs the API scopes added.',
-                    'Fix: Google Cloud Console → OAuth consent screen → "Add or Remove Scopes" → add:',
-                    '  • Gmail API (gmail.readonly, gmail.send)',
-                    '  • Google Calendar API',
-                    '  • Google Drive API (drive.file)',
-                    'Then retry. Do NOT ask the user which scopes to use — the defaults are correct.',
+                    `connect_service: Google rejected the scope request for ${provider} (invalid_scope).`,
+                    `This usually means the OAuth consent screen is missing the API scopes for ${provider}.`,
+                    `Fix: Google Cloud Console → OAuth consent screen → Add or Remove Scopes →`,
+                    provider === 'youtube'
+                        ? `add YouTube Data API v3 scopes (youtube, youtube.readonly).`
+                        : `add Google Calendar API scope (auth/calendar).`,
+                    `Then retry.`,
                 ].join('\n');
             }
             return `connect_service: ${msg}`;
@@ -148,11 +165,11 @@ export const connectServiceTool = defineTool({
         }
 
         const handle = startDevicePolling({
-            provider: 'google',
+            provider,
             deviceCode: start.deviceCode,
             intervalSeconds: start.intervalSeconds,
             expiresAt: start.expiresAt,
-            ...(scopes ? { scopes } : {}),
+            scopes: deviceScopes,
             onSuccess: async (cred: StoredCredential) => {
                 ACTIVE_DEVICE_POLLS.delete(key);
                 if (registry) {
@@ -173,7 +190,7 @@ export const connectServiceTool = defineTool({
                     result: [
                         `Authorized ${provider} as ${cred.email ?? '(account)'}.`,
                         `Scopes granted: ${cred.scopes.join(', ')}`,
-                        `MCP servers for ${provider} (gmail, calendar, drive, youtube) have been restarted with the new credentials — tools are ready immediately.`,
+                        `The ${provider} MCP has been restarted with the new credential — its tools are ready immediately.`,
                     ].join('\n'),
                     completedAt: Date.now(),
                 });
@@ -198,6 +215,6 @@ export const connectServiceTool = defineTool({
 
         ACTIVE_DEVICE_POLLS.set(key, handle);
 
-        return `Sent device-flow instructions to user (task ${taskId}). Poller running; no further action this turn.`;
+        return `Sent device-flow instructions to user for ${provider} (task ${taskId}). Poller running; no further action this turn.`;
     },
 });

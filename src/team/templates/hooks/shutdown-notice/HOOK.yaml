@@ -1,0 +1,10 @@
+name: shutdown-notice
+description: |
+  Warns the last-active user when the gateway is shutting down, so an in-flight
+  task doesn't just vanish. Deterministic (no LLM). The gateway passes the last
+  peer + a bound `send()` in the gateway.shutdown context; edit the message in
+  handler.ts freely.
+enabled: true
+events:
+  - gateway.shutdown
+handler: handler.ts

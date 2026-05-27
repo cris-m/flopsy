@@ -1,32 +1,21 @@
-/**
- * Single-call "give me a usable access token" helper.
- *
- * Used by the MCP loader (to inject up-to-date tokens into child
- * process envs before spawning) and by any runtime tool that needs a
- * live Bearer token. Refreshes transparently when expiry is near.
- *
- * Contract:
- *   - If no credential stored → throws (caller should tell user to run
- *     `flopsy auth <provider>`).
- *   - If token expires in > REFRESH_BUFFER_MS → return current, no-op.
- *   - If expires sooner → refresh via provider.refresh(), persist, return.
- *   - If refresh fails → throws with diagnostic. Caller decides whether
- *     to proceed without MCP server or surface to user.
- */
-
 import { loadCredential } from './credential-store';
 import { getProvider } from './providers/registry';
+import { withCredentialLock } from './refresh-lock';
 import type { StoredCredential } from './types';
 
-/**
- * Refresh `REFRESH_BUFFER_MS` before expiry so no tool call lands on a
- * just-expired token. 5 minutes matches Google's typical clock-skew
- * tolerance and leaves headroom for a slow network.
- */
+// Refresh this far before expiry so no tool call lands on a just-expired token (clock skew + slow net).
 const REFRESH_BUFFER_MS = 5 * 60 * 1000;
 
+const GOOGLE_SERVICE_PROVIDERS = new Set(['gmail', 'drive', 'calendar', 'youtube', 'contacts']);
+
+function loadWithLegacyFallback(providerName: string): StoredCredential | null {
+    const direct = loadCredential(providerName);
+    if (direct) return direct;
+    if (GOOGLE_SERVICE_PROVIDERS.has(providerName)) return loadCredential('google');
+    return null;
+}
+
 export interface GetValidCredentialOptions {
-    /** Skip the refresh check — return whatever is on disk, expired or not. */
     readonly skipRefresh?: boolean;
 }
 
@@ -34,7 +23,7 @@ export async function getValidCredential(
     providerName: string,
     opts: GetValidCredentialOptions = {},
 ): Promise<StoredCredential> {
-    const current = loadCredential(providerName);
+    const current = loadWithLegacyFallback(providerName);
     if (!current) {
         throw new Error(
             `No credential for "${providerName}". Run \`flopsy auth ${providerName}\` to connect.`,
@@ -42,19 +31,22 @@ export async function getValidCredential(
     }
     if (opts.skipRefresh) return current;
 
-    const remaining = current.expiresAt - Date.now();
-    if (remaining > REFRESH_BUFFER_MS) return current;
+    if (current.expiresAt - Date.now() > REFRESH_BUFFER_MS) return current;
 
-    const provider = getProvider(providerName);
+    const provider = getProvider(current.provider) ?? getProvider(providerName);
     if (!provider) {
-        // Credential exists but the provider module isn't registered —
-        // hand back what we have and let the caller fail fast with the
-        // 401 from the service.
+        // Provider module not registered — hand back the stale cred and let the 401 surface.
         return current;
     }
 
     try {
-        return await provider.refresh(current);
+        // Lock on the credential's real provider (e.g. 'google'), not the requested alias, so all
+        // writers to one file serialize; re-load inside in case a concurrent holder just refreshed.
+        return await withCredentialLock(current.provider, async () => {
+            const latest = loadCredential(current.provider) ?? current;
+            if (latest.expiresAt - Date.now() > REFRESH_BUFFER_MS) return latest;
+            return provider.refresh(latest);
+        });
     } catch (err) {
         throw new Error(
             `Credential for "${providerName}" is expired and refresh failed: ${
@@ -64,10 +56,44 @@ export async function getValidCredential(
     }
 }
 
-/**
- * Return just the Bearer token. Convenience for code that doesn't need
- * the full credential (scopes, email, etc.).
- */
+export interface RefreshNowOptions {
+    // Skip if a concurrent holder already refreshed within this much runway; omit to force.
+    readonly skipIfFresherThanMs?: number;
+}
+
+export async function refreshCredentialNow(
+    providerName: string,
+    opts: RefreshNowOptions = {},
+): Promise<StoredCredential> {
+    const current = loadWithLegacyFallback(providerName);
+    if (!current) {
+        throw new Error(
+            `No credential for "${providerName}". Run \`flopsy auth ${providerName}\` to connect.`,
+        );
+    }
+    const provider = getProvider(current.provider) ?? getProvider(providerName);
+    if (!provider) {
+        throw new Error(`No auth provider registered for "${providerName}".`);
+    }
+    return withCredentialLock(current.provider, async () => {
+        const latest = loadCredential(current.provider) ?? current;
+        if (
+            opts.skipIfFresherThanMs != null &&
+            latest.expiresAt - Date.now() > opts.skipIfFresherThanMs
+        ) {
+            return latest;
+        }
+        return provider.refresh(latest);
+    });
+}
+
+export function isInvalidGrant(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message : String(err);
+    return /invalid_grant|invalid_token|unauthorized_client|token (has been expired or )?revoked|refresh token[^.]*(expired|revoked|invalid)/i.test(
+        msg,
+    );
+}
+
 export async function getValidAccessToken(providerName: string): Promise<string> {
     const cred = await getValidCredential(providerName);
     return cred.accessToken;

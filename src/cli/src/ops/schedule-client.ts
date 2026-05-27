@@ -23,10 +23,12 @@ export interface RuntimeScheduleRow {
     createdByAgent: string | null;
 }
 
-/** Open proactive.db read-only. Returns null when the file doesn't exist
- * yet (gateway never ran with proactive enabled). */
+/** Open the harness DB read-only. Proactive schedules/deliveries now live in
+ * `learning.db` alongside the learning store (consolidated from the old
+ * separate proactive.db). Returns null when the file doesn't exist yet
+ * (gateway never ran with proactive enabled). */
 export function openProactiveDbReadonly(): Database.Database | null {
-    const path = resolveWorkspacePath('state', 'proactive.db');
+    const path = resolveWorkspacePath('state', 'learning.db');
     if (!existsSync(path)) return null;
     const db = new Database(path, { readonly: true });
     db.pragma('busy_timeout = 2000');
@@ -96,10 +98,10 @@ export function managementUrl(path: string): string {
 }
 
 function authHeaders(): Record<string, string> {
-    // Read from env first, then from the gateway-generated <HOME>/mgmt-token
+    // Read from env first, then from the gateway-generated <HOME>/gateway-token
     // file. The CLI is a separate process from the gateway so env-var
     // inheritance can't be assumed; the file is the steady-state path on
-    // fresh installs where the operator never sets FLOPSY_MGMT_TOKEN.
+    // fresh installs where the operator never sets GATEWAY_TOKEN.
     const token = loadMgmtToken();
     return token ? { Authorization: `Bearer ${token}` } : {};
 }

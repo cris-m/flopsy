@@ -4,14 +4,17 @@ import {
     workspace,
     copyPromptFile,
     resolveOrCreateMgmtToken,
+    resolveWorkspaceConfigPath,
     validateExternalPromptFile,
     validatePathIdentifier,
     validateScriptPath,
+    RELOAD_RULES_META,
 } from '@flopsy/shared';
 
 import { setDndFacade } from './commands/dnd-facade';
 import { setScheduleFacade } from './commands/schedule-facade';
-import { HookRegistry, discoverAndLoadHooks, emitHook, getHookRegistry, setHookRegistry } from './hooks';
+import { HookRegistry, discoverAndLoadHooks, emitHook, emitHookAwait, getHookRegistry, setHookRegistry } from './hooks';
+import { peerFromKey } from './core/routing-key';
 import { setMcpFacade } from './commands/mcp-facade';
 import { setPlanFacade } from './commands/plan-facade';
 import { setSessionFacade } from './commands/session-facade';
@@ -28,11 +31,12 @@ import { WebhookRouter, type ExternalWebhookConfig } from '@gateway/core/webhook
 import type { AgentHandler } from '@gateway/types/agent';
 import { ProactiveEngine, type ProactiveEmbedder } from './proactive';
 import { buildAgentCaller } from './proactive/agent-bridge';
-import { getSharedLearningStore } from '@flopsy/team';
-import { OllamaEmbedder, type BaseChatModel } from 'flopsygraph';
+import { getSharedLearningStore, getSharedPairingStore } from '@flopsy/team';
+import { OllamaEmbedder, invalidateSkillCatalogs, type BaseChatModel } from 'flopsygraph';
 import { ManagementServer } from './management/server';
 import { ChatHandler } from './management/chat-handler';
 import { ConfigReloader, type ReloadRule, type ReloadHandlerContext } from './config-reload';
+import { CredentialRefreshScheduler } from './auth/credential-refresh-scheduler';
 import { getConfigPath } from '@flopsy/shared';
 import { WhatsAppChannel } from '@gateway/channels/whatsapp';
 import { TelegramChannel } from '@gateway/channels/telegram';
@@ -51,6 +55,7 @@ export class FlopsyGateway extends BaseGateway {
     private proactiveEngine: ProactiveEngine | null = null;
     private mgmtServer: ManagementServer | null = null;
     private configReloader: ConfigReloader | null = null;
+    private credentialRefresher: CredentialRefreshScheduler | null = null;
     private agentHandler: AgentHandler | null = null;
     private chatChannel: ChatChannel | null = null;
     /** When the gateway booted (ms epoch). Used for uptime in hook contexts. */
@@ -72,21 +77,11 @@ export class FlopsyGateway extends BaseGateway {
         this.cfg = cfg;
         this.registerChannels(cfg);
 
-        // Always construct WebhookRouter when webhook server is enabled, even with
-        // empty webhooks — runtime adds and persisted routes need a router to register on.
+        // Always construct WebhookRouter when webhook server is enabled — runtime
+        // adds and persisted routes need a router to register on.
         if (cfg.webhook?.enabled) {
-            this.registerExternalWebhooks(cfg.proactive.webhooks);
-            if (cfg.proactive.webhooks.length > 0) {
-                this.log.info(
-                    {
-                        count: cfg.proactive.webhooks.length,
-                        names: cfg.proactive.webhooks.map((w) => w.name),
-                    },
-                    'external webhooks registered',
-                );
-            } else {
-                this.log.info('webhook router ready (no config-defined routes; runtime adds welcome)');
-            }
+            this.registerExternalWebhooks([]);
+            this.log.info('webhook router ready (runtime adds welcome)');
         }
 
         this.logConfigSummary(cfg);
@@ -98,9 +93,6 @@ export class FlopsyGateway extends BaseGateway {
             .map(([name]) => name);
 
         const { proactive } = cfg;
-
-        const enabledNames = <T extends { enabled: boolean; name: string }>(items: T[]) =>
-            items.filter((i) => i.enabled).map((i) => i.name);
 
         this.log.debug(
             {
@@ -116,25 +108,8 @@ export class FlopsyGateway extends BaseGateway {
                 },
                 proactive: {
                     enabled: proactive.enabled,
-                    heartbeats: proactive.heartbeats.enabled
-                        ? {
-                              count: proactive.heartbeats.heartbeats.length,
-                              names: enabledNames(proactive.heartbeats.heartbeats),
-                          }
-                        : false,
-                    scheduler: proactive.scheduler.enabled
-                        ? {
-                              count: proactive.scheduler.jobs.length,
-                              names: enabledNames(proactive.scheduler.jobs),
-                          }
-                        : false,
-                    webhooks:
-                        proactive.webhooks.length > 0
-                            ? {
-                                  count: proactive.webhooks.length,
-                                  names: proactive.webhooks.map((w) => w.name),
-                              }
-                            : false,
+                    heartbeats: proactive.heartbeats.enabled,
+                    scheduler: proactive.scheduler.enabled,
                     healthMonitor: proactive.healthMonitor.enabled,
                 },
                 timezone: cfg.timezone,
@@ -151,18 +126,28 @@ export class FlopsyGateway extends BaseGateway {
     setAgentHandler(handler: AgentHandler): void {
         this.agentHandler = handler;
 
-        // Wire /new session-facade for force-rotating sessions.
+        // Wire /new session-facade for force-rotating sessions and
+        // /skills propose for manual skill capture from the current session.
         if (handler.forceNewSession) {
+            const h = handler as typeof handler & {
+                proposeSkillFromCurrentSession?: (rawKey: string) => Promise<{
+                    proposed: boolean; reason?: string; name?: string; description?: string;
+                    when_to_use?: string; body?: string; confidence?: number;
+                    autoActivated?: boolean; writtenPath?: string;
+                }>;
+            };
             setSessionFacade({
                 forceNewSession: (rawKey) => handler.forceNewSession!(rawKey),
+                ...(h.proposeSkillFromCurrentSession
+                    ? { proposeSkillFromCurrentSession: (rawKey: string) => h.proposeSkillFromCurrentSession!(rawKey) }
+                    : {}),
             });
         }
 
-        // Wire /plan cancel facade — escape hatch for stuck plan state.
-        if (handler.cancelPlan && handler.getPlanState) {
+        // Wire /plan cancel facade — clears the thread's plan scratchpad.
+        if (handler.cancelPlan) {
             setPlanFacade({
                 cancel: (rawKey) => handler.cancelPlan!(rawKey),
-                getState: (rawKey) => handler.getPlanState!(rawKey),
             });
         }
 
@@ -201,6 +186,30 @@ export class FlopsyGateway extends BaseGateway {
                     timestamp: new Date().toISOString(),
                 };
                 this.router.route(message, channel);
+            });
+        }
+
+        if (handler.setGoalNotificationCallback) {
+            handler.setGoalNotificationCallback(({ threadId, channelName, peerId, kind, message }) => {
+                const channel = this.getChannel(channelName);
+                if (!channel) {
+                    this.log.warn(
+                        { threadId, channelName, peerId, kind },
+                        'goal notification dropped — channel unavailable',
+                    );
+                    return;
+                }
+                void channel
+                    .send({
+                        peer: { id: peerId, type: 'user', name: peerId },
+                        body: message,
+                    })
+                    .catch((err) => {
+                        this.log.warn(
+                            { threadId, channelName, peerId, kind, err },
+                            'goal notification send failed (non-fatal)',
+                        );
+                    });
             });
         }
 
@@ -328,6 +337,7 @@ export class FlopsyGateway extends BaseGateway {
                     blockedFrom: channels.whatsapp.dm.blockedFrom,
                     groupPolicy: channels.whatsapp.group.policy,
                     allowedGroups: channels.whatsapp.group.allowedGroups,
+                    showThinking: channels.whatsapp.showThinking,
                     sessionPath: channels.whatsapp.sessionPath,
                     contextMessages: channels.whatsapp.contextMessages,
                     maxChunkSize: channels.whatsapp.maxChunkSize,
@@ -347,6 +357,7 @@ export class FlopsyGateway extends BaseGateway {
                     blockedFrom: channels.telegram.dm.blockedFrom,
                     groupPolicy: channels.telegram.group.policy,
                     allowedGroups: channels.telegram.group.allowedGroups,
+                    showThinking: channels.telegram.showThinking,
                     token: channels.telegram.token,
                     groupActivation: channels.telegram.group.activation,
                 }),
@@ -363,6 +374,7 @@ export class FlopsyGateway extends BaseGateway {
                     blockedFrom: dc.dm.blockedFrom,
                     groupPolicy: dc.guild.policy,
                     allowedGroups: dc.guild.allowedGuilds,
+                    showThinking: dc.showThinking,
                     token: dc.token,
                     allowedGuilds: dc.guild.allowedGuilds,
                     allowedChannels: dc.guild.allowedChannels,
@@ -382,6 +394,7 @@ export class FlopsyGateway extends BaseGateway {
                     blockedFrom: channels.line.dm.blockedFrom,
                     groupPolicy: channels.line.group.policy,
                     allowedGroups: channels.line.group.allowedGroups,
+                    showThinking: channels.line.showThinking,
                     channelAccessToken: channels.line.channelAccessToken,
                     channelSecret: channels.line.channelSecret,
                     webhookPath: channels.line.webhookPath,
@@ -398,6 +411,7 @@ export class FlopsyGateway extends BaseGateway {
                     blockedFrom: channels.signal.dm.blockedFrom,
                     groupPolicy: channels.signal.group.policy,
                     allowedGroups: channels.signal.group.allowedGroups,
+                    showThinking: channels.signal.showThinking,
                     account: channels.signal.account,
                     cliPath: channels.signal.cliPath,
                     deviceName: channels.signal.deviceName,
@@ -414,6 +428,7 @@ export class FlopsyGateway extends BaseGateway {
                     dmPolicy: channels.imessage.dm.policy,
                     allowFrom: channels.imessage.dm.allowFrom,
                     blockedFrom: channels.imessage.dm.blockedFrom,
+                    showThinking: channels.imessage.showThinking,
                     cliPath: channels.imessage.cliPath,
                     selfChatMode: channels.imessage.selfChatMode,
                 }),
@@ -429,6 +444,7 @@ export class FlopsyGateway extends BaseGateway {
                     blockedFrom: channels.slack.dm.blockedFrom,
                     groupPolicy: channels.slack.group?.policy,
                     allowedGroups: channels.slack.group?.allowedGroups,
+                    showThinking: channels.slack.showThinking,
                     botToken: channels.slack.botToken,
                     appToken: channels.slack.appToken,
                     signingSecret: channels.slack.signingSecret,
@@ -446,6 +462,7 @@ export class FlopsyGateway extends BaseGateway {
                     blockedFrom: channels.googlechat.dm.blockedFrom,
                     groupPolicy: channels.googlechat.group?.policy,
                     allowedGroups: channels.googlechat.group?.allowedGroups,
+                    showThinking: channels.googlechat.showThinking,
                     serviceAccountKeyPath: channels.googlechat.serviceAccountKeyPath,
                     serviceAccountKey: channels.googlechat.serviceAccountKey,
                     verificationToken: channels.googlechat.verificationToken,
@@ -507,7 +524,7 @@ export class FlopsyGateway extends BaseGateway {
         const cron = this.proactiveEngine?.getCronTrigger();
         const heartbeat = this.proactiveEngine?.getHeartbeat();
 
-        const jobSource = cron?.listJobs() ?? proactive.scheduler.jobs;
+        const jobSource = cron?.listJobs() ?? [];
         const jobSummary = jobSource.map((j) => ({
             id: j.id,
             name: j.name,
@@ -523,17 +540,11 @@ export class FlopsyGateway extends BaseGateway {
             heartbeats: {
                 enabled: proactive.heartbeats.enabled,
                 active: !!heartbeat,
-                configured: proactive.heartbeats.heartbeats.filter((h) => h.enabled).length,
             },
             scheduler: {
                 enabled: proactive.scheduler.enabled,
                 active: !!cron,
-                configured: proactive.scheduler.jobs.filter((j) => j.enabled).length,
                 jobs: jobSummary,
-            },
-            webhooks: {
-                configured: proactive.webhooks.length,
-                names: proactive.webhooks.map((w) => w.name),
             },
             healthMonitor: {
                 enabled: proactive.healthMonitor.enabled,
@@ -572,7 +583,7 @@ export class FlopsyGateway extends BaseGateway {
             const mgmtPort =
                 this.cfg.gateway.management?.port ?? this.cfg.gateway.port + 2;
             const mgmtHost = this.cfg.gateway.management?.host ?? '127.0.0.1';
-            // Resolve token from env, then <FLOPSY_HOME>/mgmt-token; generate if missing.
+            // Resolve token from env, then <FLOPSY_HOME>/gateway-token; generate if missing.
             const mgmtToken = resolveOrCreateMgmtToken();
             this.mgmtServer = new ManagementServer({
                 host: mgmtHost,
@@ -671,6 +682,41 @@ export class FlopsyGateway extends BaseGateway {
                     getFires: (id: string, limit: number) =>
                         this.proactiveEngine?.getScheduleFires(id, limit) ?? [],
                 },
+                harnessActivityFn: (windowMs: number) =>
+                    getSharedLearningStore().getHarnessActivity(windowMs),
+                skillReloadFn: () => {
+                    invalidateSkillCatalogs();
+                    this.log.info('skill catalog invalidated via mgmt — next agent turn will re-scan');
+                    return { reloaded: true };
+                },
+                evalRunFn: async ({ prompt, timeoutMs }: { prompt: string; timeoutMs?: number }) => {
+                    const handler = this.agentHandler;
+                    if (!handler?.invokeStateless) {
+                        return { reply: '', durationMs: 0, error: 'agentHandler not wired or lacks invokeStateless' };
+                    }
+                    const threadId = `eval-${randomBytes(8).toString('hex')}`;
+                    const startedAt = Date.now();
+                    try {
+                        const result = await handler.invokeStateless(prompt, threadId, {
+                            deliveryMode: 'silent',
+                            signal: AbortSignal.timeout(timeoutMs ?? 120_000),
+                        });
+                        const durationMs = Date.now() - startedAt;
+                        return {
+                            reply: result.reply ?? '',
+                            durationMs,
+                            ...(result.tokenUsage
+                                ? { tokenUsage: { input: result.tokenUsage.input, output: result.tokenUsage.output } }
+                                : {}),
+                        };
+                    } catch (err) {
+                        return {
+                            reply: '',
+                            durationMs: Date.now() - startedAt,
+                            error: err instanceof Error ? err.message : String(err),
+                        };
+                    }
+                },
                 dndHandlers: {
                     status: async () => (await this.proactiveEngine?.getDndStatus()) ?? { active: false },
                     setDnd: async (body) => {
@@ -716,10 +762,14 @@ export class FlopsyGateway extends BaseGateway {
                 );
             }
 
+            // Path resolution honors flopsy.json5 overrides (bare filenames
+            // auto-resolve under state/). Defaults still produce the same
+            // paths as the hardcoded form below — but a user can now write
+            // `statePath: "proactive-prod.json"` and have it land under state/.
             this.proactiveEngine = new ProactiveEngine({
-                statePath: workspace.state('proactive.json'),
-                retryQueuePath: workspace.state('retry-queue.json'),
-                dedupDbPath: workspace.state('proactive.db'),
+                statePath: resolveWorkspaceConfigPath(proactive.statePath, 'state'),
+                retryQueuePath: resolveWorkspaceConfigPath(proactive.retryQueuePath, 'state'),
+                dedupDbPath: resolveWorkspaceConfigPath(proactive.dedupDbPath, 'state'),
                 promptBaseDir: workspace.root(),
                 // Resolves activeHours / quiet-hours in user's timezone instead of UTC.
                 ...(this.cfg.timezone ? { defaultTimezone: this.cfg.timezone } : {}),
@@ -727,8 +777,12 @@ export class FlopsyGateway extends BaseGateway {
                 // Routes proactive messages to the user's currently active channel.
                 getActivePeer: () => {
                     const live = this.getLastActivePeer();
-                    if (!live) return null;
-                    return { channelName: live.channelName, peer: live.peer };
+                    if (live) return { channelName: live.channelName, peer: live.peer };
+                    const ch = proactive.delivery?.channelName;
+                    const pairing = getSharedPairingStore();
+                    const first = (ch ? pairing.listApproved(ch) : pairing.listApproved())[0];
+                    if (first) return { channelName: first.channel, peer: { id: first.senderId, type: 'user' } };
+                    return null;
                 },
                 similarityThreshold: proactive.similarityThreshold,
                 similarityWindowMs: proactive.similarityWindowMs,
@@ -784,20 +838,16 @@ export class FlopsyGateway extends BaseGateway {
             // Initialize triggers when the subsystem toggle is on, regardless of
             // config array length — runtime schedules require triggers to exist.
             if (proactive.heartbeats.enabled) {
-                await this.proactiveEngine.startHeartbeats(
-                    proactive.heartbeats.heartbeats,
-                    defaultDelivery,
-                );
+                await this.proactiveEngine.startHeartbeats([], defaultDelivery);
             }
 
             if (proactive.scheduler.enabled) {
-                await this.proactiveEngine.startCronJobs(proactive.scheduler.jobs, defaultDelivery);
+                await this.proactiveEngine.startCronJobs([], defaultDelivery);
             }
 
             // Hand WebhookRouter to the engine so addRuntimeWebhook can register routes.
             if (this.webhookRouter) {
                 this.proactiveEngine.setWebhookRouter(this.webhookRouter);
-                this.proactiveEngine.seedConfigWebhooks(this.cfg.proactive.webhooks);
             }
 
             // Wire Schedule facade for /cron + /heartbeat slash commands.
@@ -940,6 +990,9 @@ export class FlopsyGateway extends BaseGateway {
 
         this.startConfigReloader();
 
+        this.credentialRefresher = new CredentialRefreshScheduler();
+        this.credentialRefresher.start();
+
         // Hooks: discover + load at the end of startup so all subsystems
         // are already up and `emitHook(...)` callsites in the proactive
         // engine + command dispatcher can fire as soon as a hook is
@@ -995,24 +1048,71 @@ export class FlopsyGateway extends BaseGateway {
         this.configReloader.start();
     }
 
-    /** Reload rule table — paths matched to hot-apply or restart-required handlers. */
+    /** Reload rule table — pulls patterns/modes/reasons from shared metadata and binds handlers. */
     private buildReloadRules(): readonly ReloadRule[] {
-        return [
-            {
-                pattern: 'channels.*.enabled',
-                mode: 'hot',
-                reason: 'channel on/off toggle',
-                handler: (ctx) => this.handleChannelToggle(ctx),
-            },
-            // Restart-required buckets.
-            { pattern: 'channels.**', mode: 'restart', reason: 'channel config beyond on/off needs rebuild' },
-            { pattern: 'mcp.servers.**', mode: 'restart', reason: 'MCP subprocesses need respawn' },
-            { pattern: 'agents.**', mode: 'restart', reason: 'agents are built once at boot' },
-            { pattern: 'memory.**', mode: 'restart', reason: 'memory store + embedder init on boot' },
-            { pattern: 'proactive.**', mode: 'restart', reason: 'heartbeat/cron/webhook rewire on boot' },
-            { pattern: 'webhook.**', mode: 'restart', reason: 'webhook receiver binds on boot' },
-            { pattern: 'gateway.**', mode: 'restart', reason: 'gateway host/port/token are boot-only' },
-        ];
+        const hotHandlers = new Map<string, (ctx: ReloadHandlerContext) => Promise<void>>([
+            ['channels.*.enabled', (ctx) => this.handleChannelToggle(ctx)],
+            ['logging.level', (ctx) => this.handleLoggingChange(ctx)],
+            ['logging.pretty', (ctx) => this.handleLoggingChange(ctx)],
+            ['proactive.heartbeats.heartbeats.*.enabled', (ctx) => this.handleScheduleToggle(ctx, 'heartbeat')],
+            ['proactive.scheduler.jobs.*.enabled', (ctx) => this.handleScheduleToggle(ctx, 'cron')],
+        ]);
+        return RELOAD_RULES_META.map((m): ReloadRule => {
+            const handler = hotHandlers.get(m.pattern);
+            const base: ReloadRule = { pattern: m.pattern, mode: m.mode, reason: m.reason };
+            return handler ? { ...base, handler } : base;
+        });
+    }
+
+    /**
+     * Apply logging.level / logging.pretty changes in-process. Pino's
+     * setLogConfig flips the level on the root logger; child loggers inherit
+     * automatically. Cheap, safe to call repeatedly.
+     */
+    private async handleLoggingChange(ctx: ReloadHandlerContext): Promise<void> {
+        const newLogging = (ctx.newConfig as { logging?: { level?: string; pretty?: boolean; file?: string } }).logging ?? {};
+        const opts: { level?: string; pretty?: boolean; file?: string } = {};
+        if (typeof newLogging.level === 'string') opts.level = newLogging.level;
+        if (typeof newLogging.pretty === 'boolean') opts.pretty = newLogging.pretty;
+        if (typeof newLogging.file === 'string') opts.file = newLogging.file;
+        const { setLogConfig } = await import('@flopsy/shared');
+        setLogConfig(opts);
+        this.log.info({ path: ctx.changedPath, level: opts.level }, 'logging config hot-applied');
+    }
+
+    /**
+     * Apply per-schedule enabled toggles without engine restart. The schedule
+     * MUST already exist in proactive.db (i.e. it was seeded on a previous
+     * boot) — adding a brand-new schedule via config still requires restart.
+     */
+    private async handleScheduleToggle(
+        ctx: ReloadHandlerContext,
+        kind: 'heartbeat' | 'cron',
+    ): Promise<void> {
+        if (!this.proactiveEngine) {
+            this.log.warn('proactive engine not running — cannot apply schedule toggle');
+            return;
+        }
+        const enabled = ctx.newValue === true;
+        const match = ctx.changedPath.match(/\.(\d+)\.enabled$/);
+        if (!match) return;
+        const idx = Number(match[1]);
+        const list = kind === 'heartbeat'
+            ? ((ctx.newConfig as { proactive?: { heartbeats?: { heartbeats?: Array<{ id?: string; name?: string }> } } }).proactive?.heartbeats?.heartbeats ?? [])
+            : ((ctx.newConfig as { proactive?: { scheduler?: { jobs?: Array<{ id?: string; name?: string }> } } }).proactive?.scheduler?.jobs ?? []);
+        const entry = list[idx];
+        if (!entry) return;
+        const id = entry.id ?? (kind === 'heartbeat' && entry.name ? `config-hb-${entry.name}` : null);
+        if (!id) {
+            this.log.warn({ idx, kind }, 'schedule toggle: could not resolve schedule id');
+            return;
+        }
+        const ok = this.proactiveEngine.setRuntimeScheduleEnabled(id, enabled);
+        if (ok) {
+            this.log.info({ id, kind, enabled }, 'schedule toggle hot-applied');
+        } else {
+            this.log.warn({ id, kind }, 'schedule toggle: id not found in proactive.db (was it seeded?)');
+        }
     }
 
     /** Hot handler for `channels.*.enabled` — spawns/stops one adapter, leaves others. */
@@ -1041,9 +1141,12 @@ export class FlopsyGateway extends BaseGateway {
         }
     }
 
-    protected async onStop(): Promise<void> {
-        // Emit shutdown hook BEFORE cleanup so handlers can reach subsystems.
-        emitHook('gateway.shutdown', {
+    protected async onBeforeStop(): Promise<void> {
+        // Runs while channels are still connected — base stop() disconnects them
+        // AFTER this. Emit gateway.shutdown with the last-active peer + a bound
+        // `send` so the shutdown-notice hook can warn the user before their turn
+        // is interrupted. Awaited with a cap so a slow send can't stall shutdown.
+        const shutdownCtx: Record<string, unknown> = {
             platform: process.platform,
             arch: process.arch,
             nodeVersion: process.version,
@@ -1052,16 +1155,46 @@ export class FlopsyGateway extends BaseGateway {
             stoppedAt: new Date().toISOString(),
             channels: Array.from(this.channels.keys()),
             channelsConnected: Array.from(this.channels.keys()),
-        });
+        };
+        try {
+            const recent = getSharedLearningStore().getMostRecentPeer();
+            const peer = recent ? peerFromKey(recent.peerId) : undefined;
+            if (recent && peer) {
+                shutdownCtx.lastPeer = { channel: recent.channel, peer };
+                shutdownCtx.send = async (
+                    channel: string,
+                    p: { id: string; type: 'user' | 'group' | 'channel' },
+                    body: string,
+                ): Promise<void> => {
+                    await this.channels.get(channel)?.send({ peer: p, body });
+                };
+            }
+        } catch (err) {
+            this.log.debug({ err }, 'shutdown notice: could not resolve last peer');
+        }
+        this.log.info(
+            {
+                hasLastPeer: !!shutdownCtx.lastPeer,
+                hasSend: typeof shutdownCtx.send === 'function',
+                lastPeer: shutdownCtx.lastPeer,
+                channels: Array.from(this.channels.keys()),
+            },
+            'onBeforeStop: emitting gateway.shutdown notice (channels still live)',
+        );
+        await Promise.race([
+            emitHookAwait('gateway.shutdown', shutdownCtx),
+            new Promise<void>((resolve) => setTimeout(resolve, 3000)),
+        ]).catch((err) => this.log.warn({ err }, 'gateway.shutdown hook error (non-fatal)'));
+    }
 
-        // Run all registered cleanup handlers in parallel first.
-        await runCleanup().catch((err: unknown) => {
-            this.log.warn({ err }, 'one or more cleanup handlers failed');
-        });
-
+    protected async onStop(): Promise<void> {
         if (this.configReloader) {
             this.configReloader.stop();
             this.configReloader = null;
+        }
+        if (this.credentialRefresher) {
+            this.credentialRefresher.stop();
+            this.credentialRefresher = null;
         }
         if (this.proactiveEngine) {
             this.log.info('stopping proactive engine');
@@ -1089,6 +1222,10 @@ export class FlopsyGateway extends BaseGateway {
             await this.mgmtServer.stop();
             this.mgmtServer = null;
         }
+
+        await runCleanup().catch((err: unknown) => {
+            this.log.warn({ err }, 'one or more cleanup handlers failed');
+        });
     }
 
     private registerWebhookRoutes(): void {
@@ -1102,8 +1239,8 @@ export class FlopsyGateway extends BaseGateway {
     }
 
     private registerWebhookChannel(channel: Channel & WebhookChannel): void {
-        this.webhookServer!.registerRoute(channel.webhookPath, async (req, body, res) => {
-            if (!channel.verifyWebhook(req, body)) {
+        this.webhookServer!.registerRoute(channel.webhookPath, async (req, body, res, raw) => {
+            if (!channel.verifyWebhook(req, raw ?? body)) {
                 this.webhookServer!.respond(res, 401, {
                     error: `Invalid ${channel.name} webhook signature`,
                 });

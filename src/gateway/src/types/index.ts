@@ -30,6 +30,8 @@ export type {
     Media,
     Message,
     OutboundMessage,
+    DeliverMessagesOptions,
+    DeliverMessagesResult,
     ReactionOptions,
     PairingRequest,
     PairingRequestHandler,
@@ -54,4 +56,4 @@ export type {
     InteractionCallback,
 } from './channel';
 
-export { isWebhookChannel } from './channel';
+export { isWebhookChannel, isTextDocument, DOCUMENT_TEXT_MIMES, DOCUMENT_TEXT_EXTENSIONS } from './channel';

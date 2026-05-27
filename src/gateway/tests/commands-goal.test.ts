@@ -41,6 +41,7 @@ function makeFakeFacade(): GoalFacade & { setCalls: unknown[]; pauseCalls: numbe
                 lastReason: null,
                 channelName: args.channelName,
                 peerId: args.peerId,
+                subgoals: [],
             };
             return row!;
         },
@@ -62,6 +63,10 @@ function makeFakeFacade(): GoalFacade & { setCalls: unknown[]; pauseCalls: numbe
             return had;
         },
         async maybeContinue() { return null; },
+        addSubgoal(_t, _text) { throw new Error('unused in goal tests'); },
+        removeSubgoal(_t, _i) { throw new Error('unused in goal tests'); },
+        clearSubgoals(_t) { return 0; },
+        renderSubgoals(_t) { return '(no active goal)'; },
     };
     return facade;
 }

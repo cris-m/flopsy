@@ -154,4 +154,60 @@ describe('sendMessageTool / degraded wiring', () => {
         expect(result.output).toBe('sent');
         expect(replies).toEqual(['hi']);
     });
+
+    it('parts: forwards array to onReply via options.parts and passes "" as text', async () => {
+        const seen: Array<{ text: string; options: unknown }> = [];
+        const ctx: ToolRunContext = {
+            configurable: {
+                onReply: async (text: string, options?: unknown) => {
+                    seen.push({ text, options: options ?? null });
+                },
+                setDidSendViaTool: () => {},
+            },
+        };
+        const result = await sendMessageTool.run(
+            { text: 'IGNORED', parts: ['msg 1', 'msg 2', 'msg 3'] },
+            'c',
+            ctx,
+        );
+        expect(result.isError).toBe(false);
+        expect(result.output).toBe('sent');
+        expect(seen).toHaveLength(1);
+        expect(seen[0]!.text).toBe('');
+        expect((seen[0]!.options as { parts?: string[] }).parts).toEqual(['msg 1', 'msg 2', 'msg 3']);
+    });
+
+    it('parts with partsPauseMs: forwards pause to options', async () => {
+        const seen: Array<{ text: string; options: unknown }> = [];
+        const ctx: ToolRunContext = {
+            configurable: {
+                onReply: async (text: string, options?: unknown) => {
+                    seen.push({ text, options: options ?? null });
+                },
+                setDidSendViaTool: () => {},
+            },
+        };
+        await sendMessageTool.run(
+            { text: 'ignored', parts: ['a', 'b'], partsPauseMs: 700 },
+            'c',
+            ctx,
+        );
+        expect((seen[0]!.options as { partsPauseMs?: number }).partsPauseMs).toBe(700);
+    });
+
+    it('parts with only 1 element: rejected by schema (min 2)', async () => {
+        const ctx: ToolRunContext = {
+            configurable: {
+                onReply: async () => {},
+                setDidSendViaTool: () => {},
+            },
+        };
+        const result = await sendMessageTool.run(
+            { text: 'fallback', parts: ['only one'] },
+            'c',
+            ctx,
+        );
+        // Schema-rejected → defineTool surfaces the validation error
+        expect(result.isError).toBe(true);
+    });
 });

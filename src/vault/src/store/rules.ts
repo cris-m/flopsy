@@ -5,7 +5,8 @@ export type InjectInto =
     | { kind: 'header'; name: string }
     | { kind: 'any-header' }
     | { kind: 'body' }
-    | { kind: 'query'; name: string };
+    | { kind: 'query'; name: string }
+    | { kind: 'any-query' };
 
 export interface RuleRow {
     id: string;
@@ -31,7 +32,7 @@ export function addRule(db: Db, input: AddRuleInput): string {
         throw new Error('placeholder too short (use something like __anthropic_api_key__)');
     }
     if (!parseInjectInto(input.injectInto)) {
-        throw new Error('injectInto must be "header:<name>" | "body" | "query:<name>"');
+        throw new Error('injectInto must be "header:<name>" | "any-header" | "body" | "query:<name>" | "any-query"');
     }
     const id = randomBytes(8).toString('hex');
     db.prepare(
@@ -74,6 +75,7 @@ export function hostMatches(host: string, pattern: string): boolean {
 export function parseInjectInto(s: string): InjectInto | undefined {
     if (s === 'body') return { kind: 'body' };
     if (s === 'any' || s === 'any-header' || s === 'header:*') return { kind: 'any-header' };
+    if (s === 'any-query' || s === 'query:*') return { kind: 'any-query' };
     const headerMatch = s.match(/^header:(.+)$/);
     if (headerMatch) return { kind: 'header', name: headerMatch[1]!.trim() };
     const queryMatch = s.match(/^query:(.+)$/);

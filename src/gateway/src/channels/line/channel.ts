@@ -7,16 +7,19 @@ import type {
     Media,
     WebhookChannel,
 } from '@gateway/types';
+import { isTextDocument } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
 import { verifyWebhookSignature } from '@gateway/core/security';
 import { resolveMediaSource } from '@gateway/core/media-resolver';
 import type { LineChannelConfig } from './types';
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_TEXT_DOCUMENT_BYTES = 256 * 1024;
 
 export class LineChannel extends BaseChannel implements WebhookChannel {
     readonly name = 'line';
     readonly authType = 'token';
+    readonly rendersCodeBlocks = false;
     readonly webhookPath: string;
 
     private client: import('@line/bot-sdk').messagingApi.MessagingApiClient | null = null;
@@ -29,7 +32,7 @@ export class LineChannel extends BaseChannel implements WebhookChannel {
         this.webhookPath = config.webhookPath ?? '/webhook/line';
     }
 
-    verifyWebhook(req: IncomingMessage, body: string): boolean {
+    verifyWebhook(req: IncomingMessage, body: string | Buffer): boolean {
         const secret = this.channelConfig.channelSecret;
         if (!secret) return true;
         const sig = req.headers['x-line-signature'] as string | undefined;
@@ -241,6 +244,45 @@ export class LineChannel extends BaseChannel implements WebhookChannel {
         if (msgType === 'sticker') {
             media.push({ type: 'sticker' });
             if (!body) { body = '[Sticker]'; synthetic = true; }
+        }
+
+        if (msgType === 'file' && m.id && this.blobClient) {
+            const fileMsg = m as { id?: string; fileName?: string; fileSize?: number };
+            const fileName = fileMsg.fileName;
+            const fileSize = fileMsg.fileSize;
+            const isText = isTextDocument(undefined, fileName);
+            const withinSize = !fileSize || fileSize <= MAX_TEXT_DOCUMENT_BYTES;
+            if (isText && withinSize) {
+                try {
+                    const stream = await this.blobClient.getMessageContent(m.id);
+                    const chunks: Buffer[] = [];
+                    let total = 0;
+                    let over = false;
+                    for await (const chunk of stream as AsyncIterable<Buffer>) {
+                        total += chunk.length;
+                        if (total > MAX_TEXT_DOCUMENT_BYTES) {
+                            over = true;
+                            chunks.length = 0;
+                            (stream as unknown as { destroy?: (err?: Error) => void }).destroy?.(
+                                new Error('over MAX_TEXT_DOCUMENT_BYTES'),
+                            );
+                            break;
+                        }
+                        chunks.push(chunk);
+                    }
+                    if (over) {
+                        media.push({ type: 'document', fileName, fileSize });
+                    } else {
+                        const text = new TextDecoder('utf-8', { fatal: false }).decode(Buffer.concat(chunks));
+                        media.push({ type: 'document', fileName, fileSize, text });
+                    }
+                } catch {
+                    media.push({ type: 'document', fileName, fileSize });
+                }
+            } else {
+                media.push({ type: 'document', fileName, fileSize });
+            }
+            if (!body) { body = `[File: ${fileName ?? 'attachment'}]`; synthetic = true; }
         }
 
         if (!body && media.length === 0) return;

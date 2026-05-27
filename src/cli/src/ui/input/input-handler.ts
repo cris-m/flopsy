@@ -7,6 +7,8 @@
  */
 
 import { getSlashMatches } from '../components/slash-hints';
+import { KillRing } from './kill-ring';
+import { UndoStack } from './undo-stack';
 
 const ESC = '\x1b';
 const CURSOR_BLOCK = '▍';
@@ -69,6 +71,27 @@ export class InputHandler {
     private quitArmedTimer: ReturnType<typeof setTimeout> | null = null;
     private static readonly QUIT_ARM_WINDOW_MS = 2_000;
 
+    /**
+     * Emacs-style kill ring (Ctrl+K / Ctrl+U / Ctrl+W cuts → Ctrl+Y pastes,
+     * Alt+Y cycles older entries) + undo stack (Ctrl+Z reverses kill/paste/
+     * clear-line). Adapted from earendil-works/pi (MIT). The undo stack
+     * captures snapshots BEFORE destructive ops only; inserts/backspace are
+     * already reversible by ordinary editing.
+     */
+    private killRing = new KillRing();
+    private undoStack = new UndoStack<InputState>();
+    /** True iff the LAST key was a kill — consecutive kills accumulate. */
+    private lastKeyWasKill = false;
+    /** True iff the LAST key was a yank — Alt+Y after Ctrl+Y rotates the ring. */
+    private lastKeyWasYank = false;
+    /** Selection start/end for the most recent yank — used by yank-pop to replace it. */
+    private yankSelStart = -1;
+    private yankSelEnd = -1;
+
+    private snapshotUndo(): void {
+        this.undoStack.push(this.state);
+    }
+
     constructor(private readonly cbs: InputCallbacks) {}
 
     handle(buf: Buffer): void {
@@ -113,6 +136,15 @@ export class InputHandler {
         // resumes typing.
         this.clearQuitArm();
 
+        // Esc (bare) while streaming → interrupt the agent (Claude parity, makes
+        // the "esc to interrupt" hint truthful). Only a lone ESC byte; escape
+        // *sequences* (`\x1b[…` arrows/home/etc.) arrive as longer chunks and
+        // are handled further down, so they're unaffected.
+        if (data === ESC && this.cbs.isStreaming?.()) {
+            this.cbs.onInterrupt?.();
+            return;
+        }
+
         // Bracketed paste
         if (data.includes(`${ESC}[200~`)) {
             this.pasteBuf = '';
@@ -149,14 +181,101 @@ export class InputHandler {
         // Ctrl+D — quit
         if (data === '\x04') { this.cbs.onQuit(); return; }
 
-        // Ctrl+U — clear current logical line
+        // Ctrl+U — kill from cursor backward to BOL (and push to kill ring)
         if (data === '\x15') {
             const before = this.state.buf.slice(0, this.state.pos);
             const after = this.state.buf.slice(this.state.pos);
             const lineStart = before.lastIndexOf('\n') + 1;
+            const killed = before.slice(lineStart);
+            if (killed) {
+                this.snapshotUndo();
+                this.killRing.push(killed, { prepend: true, accumulate: this.lastKeyWasKill });
+            }
             this.state.buf = before.slice(0, lineStart) + after;
             this.state.pos = lineStart;
+            this.state.slashHintIdx = 0;
+            this.lastKeyWasKill = true; this.lastKeyWasYank = false;
             this.cbs.onRedraw();
+            return;
+        }
+
+        // Ctrl+K — kill from cursor forward to EOL (and push to kill ring)
+        if (data === '\x0b') {
+            const before = this.state.buf.slice(0, this.state.pos);
+            const after = this.state.buf.slice(this.state.pos);
+            const nlRel = after.indexOf('\n');
+            const killEnd = nlRel === -1 ? after.length : nlRel;
+            const killed = after.slice(0, killEnd);
+            if (killed) {
+                this.snapshotUndo();
+                this.killRing.push(killed, { prepend: false, accumulate: this.lastKeyWasKill });
+            }
+            this.state.buf = before + after.slice(killEnd);
+            this.lastKeyWasKill = true; this.lastKeyWasYank = false;
+            this.cbs.onRedraw();
+            return;
+        }
+
+        // Ctrl+W — kill word before cursor (and push to kill ring)
+        if (data === '\x17') {
+            const before = this.state.buf.slice(0, this.state.pos);
+            const after = this.state.buf.slice(this.state.pos);
+            const trimmed = before.replace(/\s+$/, '');
+            const lastBreak = Math.max(trimmed.lastIndexOf(' '), trimmed.lastIndexOf('\n'));
+            const newBefore = lastBreak >= 0 ? trimmed.slice(0, lastBreak + 1) : '';
+            const killed = before.slice(newBefore.length);
+            if (killed) {
+                this.snapshotUndo();
+                this.killRing.push(killed, { prepend: true, accumulate: this.lastKeyWasKill });
+            }
+            this.state.buf = newBefore + after;
+            this.state.pos = newBefore.length;
+            this.state.slashHintIdx = 0;
+            this.lastKeyWasKill = true; this.lastKeyWasYank = false;
+            this.cbs.onRedraw();
+            return;
+        }
+
+        // Ctrl+Y — yank (paste most recent kill at cursor)
+        if (data === '\x19') {
+            const entry = this.killRing.peek();
+            if (entry) {
+                this.snapshotUndo();
+                this.yankSelStart = this.state.pos;
+                this.state.buf = this.state.buf.slice(0, this.state.pos) + entry + this.state.buf.slice(this.state.pos);
+                this.state.pos += entry.length;
+                this.yankSelEnd = this.state.pos;
+                this.lastKeyWasYank = true; this.lastKeyWasKill = false;
+                this.state.slashHintIdx = 0;
+                this.cbs.onRedraw();
+            }
+            return;
+        }
+
+        // Alt+Y — yank-pop: replace previous yank with the next ring entry
+        if (data === `${ESC}y` || data === `${ESC}Y`) {
+            if (this.lastKeyWasYank && this.killRing.length > 1
+                && this.yankSelStart >= 0 && this.yankSelEnd >= this.yankSelStart) {
+                this.killRing.rotate();
+                const entry = this.killRing.peek() ?? '';
+                this.state.buf = this.state.buf.slice(0, this.yankSelStart) + entry + this.state.buf.slice(this.yankSelEnd);
+                this.yankSelEnd = this.yankSelStart + entry.length;
+                this.state.pos = this.yankSelEnd;
+                this.cbs.onRedraw();
+            }
+            return;
+        }
+
+        // Ctrl+Z — undo (restore last destructive snapshot)
+        if (data === '\x1a') {
+            const prev = this.undoStack.pop();
+            if (prev) {
+                this.state.buf = prev.buf;
+                this.state.pos = prev.pos;
+                this.state.slashHintIdx = prev.slashHintIdx;
+                this.lastKeyWasKill = false; this.lastKeyWasYank = false;
+                this.cbs.onRedraw();
+            }
             return;
         }
 
@@ -187,6 +306,21 @@ export class InputHandler {
         if (data === '\x0a' || data === `${ESC}\r` || data === `${ESC}\n`) {
             this.insertText('\n');
             return;
+        }
+
+        // Kitty keyboard protocol: CSI keycode;modifiers u
+        //   keycode 13   = Enter
+        //   modifiers    = 1 (none) | 2 (Shift) | 3 (Alt) | 4 (Shift+Alt)
+        //                  5 (Ctrl) | 6 (Shift+Ctrl) | 7 (Alt+Ctrl) | 8 (Shift+Alt+Ctrl)
+        // Any modified Enter → newline; bare modifier-1 (or modifier omitted)
+        // → fall through to the plain-Enter submit handler below.
+        const kittyEnter = data.match(/^\x1b\[13(?:;([0-9]+))?u$/);
+        if (kittyEnter) {
+            const mod = kittyEnter[1] ? parseInt(kittyEnter[1], 10) : 1;
+            if (mod !== 1) {
+                this.insertText('\n');
+                return;
+            }
         }
 
         // Tab — accept slash-hint suggestion
@@ -290,6 +424,10 @@ export class InputHandler {
                          text + this.state.buf.slice(this.state.pos);
         this.state.pos += text.length;
         this.state.slashHintIdx = 0;
+        // Any non-kill/yank input breaks the consecutive-kill chain
+        // (so the next Ctrl+K starts a fresh ring entry, not accumulating).
+        this.lastKeyWasKill = false;
+        this.lastKeyWasYank = false;
         this.cbs.onRedraw();
     }
 
@@ -301,6 +439,15 @@ export class InputHandler {
         const prefix = ' › ';
         const continuationIndent = '   ';
         const innerW = Math.max(20, termWidth - prefix.length - 1);
+
+        // Empty buffer → show a dim placeholder so a fresh prompt isn't a bare
+        // cursor. Hint surfaces the two non-obvious affordances (slash commands
+        // and history). Kept short to fit narrow terminals.
+        if (this.state.buf.length === 0) {
+            const cursorRendered = cyan + '\x1b[7m \x1b[27m' + reset;
+            const hint = dim + 'Send a message — /help, ↑ history' + reset;
+            return [cyan + prefix + reset + cursorRendered + hint];
+        }
 
         // Insert the cursor block in the raw buffer first, then regex-style
         // [Pasted text #N ...] placeholders so they read as collapsed-paste

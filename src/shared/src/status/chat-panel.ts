@@ -93,6 +93,16 @@ export function line(title: string, value: string): string {
     return `${FENCE}\n${title.toUpperCase()}\n  ${value}\n${FENCE}`;
 }
 
+export function plainifyPanel(text: string): string {
+    return text
+        .split('\n')
+        .filter((ln) => ln.trim() !== FENCE)
+        .filter((ln) => !/^─+$/.test(ln.trim()))
+        .join('\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
 /** State glyphs — keep this set MINIMAL. */
 export const STATE = {
     on: '●',

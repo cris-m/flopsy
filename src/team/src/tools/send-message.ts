@@ -23,6 +23,13 @@ export interface SendMessageReplyOptions {
      * disambiguating which question a long answer is replying to.
      */
     readonly quoteUserMessage?: boolean;
+    /**
+     * Multi-message intent — when ≥2 parts, channel sends them as separate
+     * messages with pacing/typing-indicator between. Replaces in-band
+     * delimiters. See BaseChannel.deliverMessages.
+     */
+    readonly parts?: ReadonlyArray<string>;
+    readonly partsPauseMs?: number;
 }
 
 export interface SendMessageConfigurable {
@@ -99,8 +106,31 @@ export const sendMessageTool = defineTool({
             .describe(
                 "Set true to thread this message as a quote-reply to the user's last message (Telegram quote, Discord reply, etc.). Only useful in groups or to disambiguate which question a long answer is replying to. Default false — DMs and short replies look better as plain messages. Channels without reply support ignore this flag silently.",
             ),
+        parts: z
+            .array(z.string().min(1).max(4000))
+            .min(2)
+            .max(6)
+            .optional()
+            .describe(
+                'OPTIONAL: send the reply as 2–6 SEPARATE messages with a natural pause between, ' +
+                'instead of one big message. Use this for messaging channels (Telegram, WhatsApp, ' +
+                'Discord, Signal, iMessage) when the reply has distinct beats — e.g. acknowledgement ' +
+                'then answer, or lead then bullets then source link. The CHANNEL handles pacing and ' +
+                'typing-indicator between parts. Reply-chain (replyTo) applies to parts[0] only. ' +
+                'When `parts` is set, the `text` field is ignored. ' +
+                'Example: { parts: ["Flipper One — quick read:", "• Hardware: ...\\n• Software: ...\\n• Ask: ...", "Source: https://blog.flipper.net/..."] }',
+            ),
+        partsPauseMs: z
+            .number()
+            .int()
+            .min(0)
+            .max(5000)
+            .optional()
+            .describe(
+                'Pause between parts in ms. Default scales with part length (≈30ms/char, clamped 400–1500ms) — usually leave unset.',
+            ),
     }),
-    execute: async ({ text, buttons, media, replyTo }, ctx) => {
+    execute: async ({ text, buttons, media, replyTo, parts, partsPauseMs }, ctx) => {
         const cfg = (ctx.configurable ?? {}) as Partial<SendMessageConfigurable>;
         const onReply = cfg.onReply;
         const setDidSendViaTool = cfg.setDidSendViaTool;
@@ -110,14 +140,20 @@ export const sendMessageTool = defineTool({
         }
 
         try {
-            const options = (buttons || media || replyTo)
+            const hasParts = Array.isArray(parts) && parts.length >= 2;
+            const options = (buttons || media || replyTo || hasParts || partsPauseMs !== undefined)
                 ? {
                     ...(buttons ? { buttons } : {}),
                     ...(media ? { media } : {}),
                     ...(replyTo ? { quoteUserMessage: true } : {}),
+                    ...(hasParts ? { parts } : {}),
+                    ...(partsPauseMs !== undefined ? { partsPauseMs } : {}),
                 }
                 : undefined;
-            await onReply(text, options);
+            // When parts is set, `text` is ignored — pass an empty string so the
+            // downstream contract still has a non-undefined value. Channel-worker
+            // checks `options.parts.length >= 2` first and routes to deliverMessages.
+            await onReply(hasParts ? '' : text, options);
         } catch (err) {
             return `send_message: delivery failed: ${err instanceof Error ? err.message : String(err)}`;
         }

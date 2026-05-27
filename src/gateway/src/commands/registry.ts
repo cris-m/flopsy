@@ -11,18 +11,21 @@ import { branchCommand } from './handlers/branch';
 import { newCommand } from './handlers/new';
 import { compactCommand } from './handlers/compact';
 import { goalCommand } from './handlers/goal';
+import { subgoalCommand } from './handlers/subgoal';
 import { personalityCommand } from './handlers/personality';
 import { planCommand } from './handlers/plan';
 import { mcpCommand } from './handlers/mcp';
 import { skillsCommand } from './handlers/skills';
 import { cronCommand } from './handlers/cron';
 import { heartbeatCommand } from './handlers/heartbeat';
+import { improveCommand } from './handlers/improve';
 import { buildSkillCommands } from './skill-commands';
 
 const BUILTIN_COMMANDS: readonly CommandDef[] = [
     newCommand,
     compactCommand,
     goalCommand,
+    subgoalCommand,
     branchCommand,
     planCommand,
     mcpCommand,
@@ -37,6 +40,7 @@ const BUILTIN_COMMANDS: readonly CommandDef[] = [
     skillsCommand,
     cronCommand,
     heartbeatCommand,
+    improveCommand,
     helpCommand,
 ];
 
@@ -44,10 +48,12 @@ export const COMMANDS: readonly CommandDef[] = BUILTIN_COMMANDS;
 
 /**
  * Built-ins + auto-discovered skills under `<workspace>/skills/<name>/`.
- * Built-ins win on name collisions.
+ * Built-ins win on name collisions. `mainAgentName` (resolved from
+ * `agents.find(a => a.role === 'main').name` by the caller) gates the
+ * self-delegation check inside buildSkillCommands.
  */
-export function buildAllCommands(skillsRoot: string): readonly CommandDef[] {
-    const skillCommands = buildSkillCommands(skillsRoot);
+export function buildAllCommands(skillsRoot: string, mainAgentName?: string): readonly CommandDef[] {
+    const skillCommands = buildSkillCommands(skillsRoot, mainAgentName);
     const builtinNames = new Set<string>(
         BUILTIN_COMMANDS.flatMap((c) => [c.name, ...(c.aliases ?? [])]),
     );

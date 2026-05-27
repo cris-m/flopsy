@@ -1,5 +1,6 @@
 import { type Command } from 'commander';
 import { userInfo } from 'node:os';
+import { execFile } from 'node:child_process';
 import { loadMgmtToken } from '@flopsy/shared';
 import { managementUrl } from './schedule-client';
 import { ChatTUI } from '../ui/chat-tui';
@@ -11,12 +12,33 @@ type AgentChunk =
     | { type: 'tool_start';  toolName: string; args?: string }
     | { type: 'tool_result'; toolName: string; result?: string };
 
+interface DoneUsage {
+    input: number;
+    output: number;
+    reasoning?: number;
+    cached?: number;
+    contextTokens?: number;
+    contextLimit?: number;
+}
+
 type ServerEvent =
     | { type: 'ready';  threadId: string; model?: string }
     | { type: 'chunk';  chunk: AgentChunk }
     | { type: 'task';   event: 'start' | 'progress' | 'complete' | 'error'; taskId: string; description?: string; result?: string; error?: string }
-    | { type: 'done';   text: string | null; usage?: { input: number; output: number } }
+    | { type: 'done';   text: string | null; usage?: DoneUsage }
+    | { type: 'compaction'; threadId: string; tokensBefore: number; tokensAfter: number; threshold: number; strategy: 'clear-tools' | 'summarize' | 'both'; durationMs: number }
     | { type: 'error';  message: string };
+
+/** Resolve the current git branch once (chat cwd is fixed for the session). Empty string when not a repo. */
+function detectGitBranch(cwd: string): Promise<string> {
+    return new Promise((resolve) => {
+        execFile('git', ['branch', '--show-current'], { cwd, timeout: 1000 }, (err, stdout) => {
+            if (err) { resolve(''); return; }
+            const branch = stdout.trim();
+            resolve(branch ? `(${branch})` : '');
+        });
+    });
+}
 
 type ClientMessage =
     | { type: 'message';   text: string }
@@ -45,7 +67,7 @@ export function registerChatCommand(program: Command): void {
         .command('send <text...>')
         .description(
             'send one message non-interactively. streams the reply to stdout, exits on done. ' +
-            'useful for scripting + automation (e.g. verifying commitments extraction).',
+            'useful for scripting + automation.',
         )
         .option('--peer <id>', 'override peer id (default: $USER). routes to a specific chat thread.')
         .option('--quiet', 'suppress streaming output; only print the final reply')
@@ -75,8 +97,7 @@ export function registerChatCommand(program: Command): void {
 
 /**
  * One-shot chat: open the management WebSocket, send one message, stream
- * the reply, exit. Used by automation/scripting and by E1-verify
- * (commitments extraction round-trip). Exit code:
+ * the reply, exit. Used by automation/scripting and by E1-verify. Exit code:
  *   0 — agent emitted `done`
  *   2 — empty input
  *   3 — timed out before `done`
@@ -197,10 +218,25 @@ async function runChat(modelOverride?: string): Promise<void> {
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let everConnected = false;
     let quitting = false;
+    let welcomed = false;
     // Outbound queue for messages typed while WS is closed/reconnecting.
     // Drained on the next 'open' event. Cap protects against unbounded growth
     // if the gateway is gone for a long time.
     const pending: ClientMessage[] = [];
+
+    // Single teardown path. Idempotent so it's safe to call from an explicit
+    // quit, a signal, an uncaught error, AND the `exit` handler. Restores the
+    // terminal (cursor, raw mode, bracketed paste) via tui.stop() — without
+    // this, any non-clean exit leaves the user's shell unusable until `reset`.
+    let cleanedUp = false;
+    function cleanup(): void {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        quitting = true;
+        if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+        try { ws?.close(); } catch { /* */ }
+        try { tui.stop(); } catch { /* */ }
+    }
 
     const send = (msg: ClientMessage): void => {
         if (ws?.readyState === WebSocket.OPEN) {
@@ -221,55 +257,38 @@ async function runChat(modelOverride?: string): Promise<void> {
 
     tui = new ChatTUI({
         onSend({ display, expanded, pastes }) {
-            tui.setCwd(process.cwd());
-            // Detect git branch (lightweight, cached in global)
-            try {
-                const { execSync } = require('child_process');
-                const branch = execSync('git branch --show-current 2>/dev/null', {
-                    cwd: process.cwd(), encoding: 'utf8', timeout: 1000,
-                }).trim();
-                if (branch) (globalThis as any).__flopsyGitBranch = `(${branch})`;
-                else (globalThis as any).__flopsyGitBranch = '';
-            } catch { (globalThis as any).__flopsyGitBranch = ''; }
-
-            // Handle local slash commands. Slash commands don't carry pastes,
-            // so display === expanded — either is fine here.
-            const trimmed = expanded.trim();
-            if (trimmed === '/exit' || trimmed === '/quit') {
-                quitting = true;
-                if (reconnectTimer) clearTimeout(reconnectTimer);
-                ws?.close();
-                tui.stop();
-                process.exit(0);
-                return;
-            }
-            if (trimmed === '/clear') {
-                tui.clear();
-                return;
-            }
-            if (trimmed.startsWith('/status')) {
-                tui.addAssistantText('Fetching gateway status…');
-                send({ type: 'status' });
-                return;
-            }
-            if (trimmed.startsWith('/tasks')) {
-                tui.addAssistantText('Fetching task list…');
-                send({ type: 'tasks' });
-                return;
-            }
-            if (trimmed === '/compact') {
-                send({ type: 'compact' });
-                tui.addAssistantText('Compacting conversation context…');
-                return;
-            }
-            if (trimmed === '/new') {
-                send({ type: 'new' });
-                tui.clear();
-                return;
-            }
-            if (trimmed === '/help') {
-                tui.addAssistantText(`Local slash commands:\n  /exit, /quit — Close the chat\n  /clear      — Clear the screen\n  /status     — Gateway health snapshot\n  /tasks      — Active background tasks\n  /compact    — Summarise + free context\n  /new        — Start a fresh session\n  /help       — Show this list`);
-                return;
+            // Local slash commands. Match on the first token so trailing args
+            // or whitespace never break a command (e.g. "/clear ", "/help me").
+            // Slash commands carry no pastes, so display === expanded.
+            const cmd = expanded.trim().split(/\s+/)[0] ?? '';
+            switch (cmd) {
+                case '/exit':
+                case '/quit':
+                    cleanup();
+                    process.exit(0);
+                    return;
+                case '/clear':
+                    tui.clear();
+                    return;
+                case '/status':
+                    tui.addAssistantText('Fetching gateway status…');
+                    send({ type: 'status' });
+                    return;
+                case '/tasks':
+                    tui.addAssistantText('Fetching task list…');
+                    send({ type: 'tasks' });
+                    return;
+                case '/compact':
+                    send({ type: 'compact' });
+                    tui.addAssistantText('Compacting conversation context…');
+                    return;
+                case '/new':
+                    send({ type: 'new' });
+                    tui.clear();
+                    return;
+                case '/help':
+                    tui.addAssistantText(`Local slash commands:\n  /exit, /quit — Close the chat\n  /clear       — Clear the screen\n  /status      — Gateway health snapshot\n  /tasks       — Active background tasks\n  /compact     — Summarise + free context\n  /new         — Start a fresh session\n  /help        — Show this list`);
+                    return;
             }
             textBuf = '';
             // Display the collapsed form (with `[Pasted text #N]` tags) in
@@ -285,13 +304,15 @@ async function runChat(modelOverride?: string): Promise<void> {
             tui.setStreaming(false);
         },
         onQuit() {
-            quitting = true;
-            if (reconnectTimer) clearTimeout(reconnectTimer);
-            ws?.close();
-            tui.stop();
+            cleanup();
             process.exit(0);
         },
     });
+
+    // cwd + git branch are fixed for the session — resolve once instead of
+    // shelling out on every message. Branch resolves async; setBranch repaints.
+    tui.setCwd(process.cwd());
+    void detectGitBranch(process.cwd()).then((b) => tui.setBranch(b));
 
     function connect(): void {
         try {
@@ -324,7 +345,12 @@ async function runChat(modelOverride?: string): Promise<void> {
 
             switch (event.type) {
                 case 'ready':
-                    tui.showWelcome(event.threadId, modelOverride ?? event.model ?? 'flopsy');
+                    // Only the first ready paints the welcome box — a reconnect
+                    // re-emits ready, and a second box mid-history is noise.
+                    if (!welcomed) {
+                        welcomed = true;
+                        tui.showWelcome(event.threadId, modelOverride ?? event.model ?? 'flopsy');
+                    }
                     break;
 
                 case 'chunk': {
@@ -359,14 +385,26 @@ async function runChat(modelOverride?: string): Promise<void> {
                         tui.addAssistantText(event.text ?? textBuf);
                     }
                     if (event.usage) {
-                        const u = event.usage as any;
-                        tui.setTokens(event.usage.input, event.usage.output, u.reasoning, u.cached);
-                        if (u.contextTokens !== undefined && u.contextLimit !== undefined) {
-                            tui.setContextUsage(u.contextTokens, u.contextLimit);
+                        const u = event.usage;
+                        tui.setTokens(u.input, u.output, u.reasoning, u.cached);
+                        if (u.contextTokens !== undefined) {
+                            const limit = (u.contextLimit !== undefined && u.contextLimit > 0)
+                                ? u.contextLimit
+                                : null;
+                            tui.setContextUsage(u.contextTokens, limit);
                         }
                     }
                     textBuf = '';
                     tui.setStreaming(false);
+                    break;
+
+                case 'compaction':
+                    tui.addCompaction({
+                        tokensBefore: event.tokensBefore,
+                        tokensAfter: event.tokensAfter,
+                        durationMs: event.durationMs,
+                        strategy: event.strategy,
+                    });
                     break;
 
                 case 'error':
@@ -400,6 +438,22 @@ async function runChat(modelOverride?: string): Promise<void> {
     }
 
     connect();
+
+    // Restore the terminal on every exit path. SIGINT is handled in-band by
+    // the raw-mode input handler (Ctrl+C arms-then-quits); these cover the
+    // paths that would otherwise skip teardown — kill, terminal close, and
+    // uncaught errors.
+    const fatal = (label: string, detail: unknown): void => {
+        cleanup();
+        const msg = detail instanceof Error ? (detail.stack ?? detail.message) : String(detail);
+        process.stderr.write(`\n${label}: ${msg}\n`);
+        process.exit(1);
+    };
+    process.on('exit', cleanup);
+    process.on('SIGTERM', () => { cleanup(); process.exit(143); });
+    process.on('SIGHUP', () => { cleanup(); process.exit(129); });
+    process.on('uncaughtException', (err) => fatal('fatal', err));
+    process.on('unhandledRejection', (reason) => fatal('fatal', reason));
 
     // Keep process alive until the TUI exits
     await new Promise<void>((resolve) => {

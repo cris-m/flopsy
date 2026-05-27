@@ -6,7 +6,7 @@
   "scripts": {
     "start": "npm run start --workspace=src/app",
     "dev": "npm run dev --workspace=src/app",
-    "stop": "lsof -ti :18789 | xargs -r kill -9 2>/dev/null; pkill -9 -f 'tsx src/main.ts' 2>/dev/null; pkill -9 -f 'preflight.cjs' 2>/dev/null; pkill -9 -f 'src/main\\.ts' 2>/dev/null; true",
+    "stop": "lsof -ti :18789 | xargs -r kill 2>/dev/null; sleep 4; lsof -ti :18789 | xargs -r kill -9 2>/dev/null; pkill -9 -f 'tsx src/main.ts' 2>/dev/null; pkill -9 -f 'preflight.cjs' 2>/dev/null; pkill -9 -f 'src/main\\.ts' 2>/dev/null; true",
     "restart": "npm run stop && sleep 1 && npm start",
     "build": "tsc --build src/app",
     "build:clean": "tsc --build --clean",
@@ -29,10 +29,12 @@
     "flopsy-server"
   ],
   "devDependencies": {
+    "@agentclientprotocol/sdk": "^0.22.1",
     "prettier": "^3.8.1",
     "typescript": "^5.9.3"
   },
   "dependencies": {
-    "@slack/bolt": "^4.6.0"
+    "@slack/bolt": "^4.6.0",
+    "global-agent": "^4.1.3"
   }
 }

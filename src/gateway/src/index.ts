@@ -4,14 +4,18 @@ export * from './channels';
 export * from './config';
 export { FlopsyGateway } from './gateway';
 export {
+    BLOCK_CAPABLE_EVENTS,
     discoverAndLoadHooks,
     HookRegistry,
     emitHook,
+    emitHookAwait,
     getHookRegistry,
     setHookRegistry,
+    type HookAggregate,
     type HookConfig,
     type HookContext,
     type HookHandler,
+    type HookResult,
     type RegisteredHook,
 } from './hooks';
 export {

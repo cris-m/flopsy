@@ -9,34 +9,35 @@ import type {
     InteractionCallback,
     InteractiveCapability,
 } from '@gateway/types';
+import { isTextDocument } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
 import { resolveMediaSource, type MediaSource } from '@gateway/core/media-resolver';
 import { DEFAULT_PRESENCE_EMOJIS } from '@gateway/core/presence-emojis';
 import { splitForTelegram } from './message-splitter';
+import { markdownToTelegramHtml } from './markdown-html';
+import { buildTelegramCommands } from './native-commands';
+import { COMMANDS } from '@gateway/commands/registry';
 import { isTelegramRateLimitError, getTelegramRetryAfterMs } from './network-errors';
 import { retryTelegram } from './retry';
 import type { TelegramChannelConfig } from './types';
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_TEXT_DOCUMENT_BYTES = 256 * 1024;
 
-/** Telegram caption cap; over-limit bodies are sent as a separate chunked text message. */
 const TELEGRAM_CAPTION_MAX = 1024;
 
-// Telegram callback_data is a 1-64 byte opaque string returned on tap.
 const TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64;
 
 function fitsCallback(s: string): boolean {
     return Buffer.byteLength(s, 'utf8') <= TELEGRAM_CALLBACK_DATA_MAX_BYTES;
 }
 
-/** Strip bot tokens from log strings. Telegram tokens appear in file-download URLs. */
 const BOT_TOKEN_RE = /bot[0-9]+:[A-Za-z0-9_-]+/g;
 function redactBotToken(err: unknown): string {
     const raw = err instanceof Error ? err.message : String(err);
     return raw.replace(BOT_TOKEN_RE, 'bot<redacted>');
 }
 
-/** Build Telegram's inline_keyboard shape from our InteractiveReply. */
 function buildInlineKeyboard(
     interactive: InteractiveReply,
 ): Array<Array<{ text: string; callback_data: string }>> | undefined {
@@ -53,7 +54,6 @@ function buildInlineKeyboard(
                 if (row.length > 0) rows.push(row);
             }
         } else if (block.type === 'select') {
-            // Telegram has no native dropdown — render as buttons.
             for (let i = 0; i < block.options.length; i += ROW_SIZE) {
                 const row = block.options
                     .slice(i, i + ROW_SIZE)
@@ -67,8 +67,7 @@ function buildInlineKeyboard(
     return rows.length > 0 ? rows : undefined;
 }
 
-// Telegram Bot API reaction whitelist. Anything outside returns 400
-// REACTION_INVALID. https://core.telegram.org/bots/api#reactiontypeemoji
+// Anything outside this set returns 400 REACTION_INVALID from Telegram.
 const TELEGRAM_ALLOWED_REACTIONS: ReadonlySet<string> = new Set([
     '👍', '👎', '❤', '🔥', '🥰', '👏', '😁', '🤔', '🤯', '😱', '🤬', '😢',
     '🎉', '🤩', '🤮', '💩', '🙏', '👌', '🕊', '🤡', '🥱', '🥴', '😍', '🐳',
@@ -79,8 +78,6 @@ const TELEGRAM_ALLOWED_REACTIONS: ReadonlySet<string> = new Set([
     '🤷‍♂', '🤷', '🤷‍♀', '😡',
 ]);
 
-// Approximate-match table for agent-emitted emojis outside Telegram's
-// whitelist. Unknown input falls through to 👍.
 const TELEGRAM_REACTION_FALLBACKS: Readonly<Record<string, string>> = {
     [DEFAULT_PRESENCE_EMOJIS.taskRunning]: '🤔',
     [DEFAULT_PRESENCE_EMOJIS.taskOk]:      '👍',
@@ -116,7 +113,6 @@ function mapToTelegramAllowedEmoji(input: string): string {
 export class TelegramChannel extends BaseChannel {
     readonly name = 'telegram';
     readonly authType = 'token';
-    /** Streaming-preview toggle; driven by channels.telegram.streaming config. */
     readonly streaming: StreamingCapability;
     readonly capabilities: readonly InteractiveCapability[] = [
         'buttons',
@@ -130,13 +126,11 @@ export class TelegramChannel extends BaseChannel {
     private botInfo: { id: number; username: string } | null = null;
     private readonly channelConfig: TelegramChannelConfig;
 
-    // Per-chat outbound throttle (~1 msg/sec/chat in groups; cross-chat concurrent).
+    // ~1 msg/sec/chat in groups; cross-chat concurrent.
     private static readonly SEND_THROTTLE_MS = 250;
     private readonly sendChain = new Map<string | number, Promise<void>>();
-    /** Pending throttle-release timers; cleared by disconnect() to free the event loop. */
     private readonly pendingThrottleTimers = new Set<ReturnType<typeof setTimeout>>();
 
-    /** Serialize sends per-chat with a 250ms gap; caller must invoke release in finally. */
     private async acquireChatSlot(chatId: string | number): Promise<() => void> {
         const prior = this.sendChain.get(chatId) ?? Promise.resolve();
         let release!: () => void;
@@ -144,7 +138,6 @@ export class TelegramChannel extends BaseChannel {
         this.sendChain.set(chatId, ours);
         await prior;
         return () => {
-            // Defer release so the next send waits the full throttle window.
             const timer = setTimeout(() => {
                 this.pendingThrottleTimers.delete(timer);
                 release();
@@ -159,7 +152,6 @@ export class TelegramChannel extends BaseChannel {
     constructor(config: TelegramChannelConfig) {
         super(config);
         this.channelConfig = config;
-        // Per-channel streaming toggle; defaults from schema.
         const streamCfg = (config as TelegramChannelConfig & {
             streaming?: { enabled?: boolean; minEditIntervalMs?: number };
         }).streaming;
@@ -197,7 +189,7 @@ export class TelegramChannel extends BaseChannel {
 
                 const rawText = msg.text ?? msg.caption ?? '';
                 if (isGroup && this.channelConfig.groupActivation === 'mention') {
-                    // Word-boundary match so `@news` doesn't match `@newsbot`.
+                    // Word boundary so `@news` doesn't match `@newsbot`.
                     const botUsername = this.botInfo?.username;
                     if (!botUsername) return;
                     const mentionRe = new RegExp(`@${botUsername.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}\\b`, 'i');
@@ -234,7 +226,24 @@ export class TelegramChannel extends BaseChannel {
 
                 if (msg.document) {
                     const doc = msg.document as { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
-                    media.push({ type: 'document', fileName: doc.file_name, mimeType: doc.mime_type, fileSize: doc.file_size });
+                    const isText = isTextDocument(doc.mime_type, doc.file_name);
+                    const withinSize = !doc.file_size || doc.file_size <= MAX_TEXT_DOCUMENT_BYTES;
+                    if (isText && withinSize) {
+                        const text = await this.downloadTelegramTextDocument(doc.file_id);
+                        if (text !== null) {
+                            media.push({
+                                type: 'document',
+                                fileName: doc.file_name,
+                                mimeType: doc.mime_type,
+                                fileSize: doc.file_size,
+                                text,
+                            });
+                        } else {
+                            media.push({ type: 'document', fileName: doc.file_name, mimeType: doc.mime_type, fileSize: doc.file_size });
+                        }
+                    } else {
+                        media.push({ type: 'document', fileName: doc.file_name, mimeType: doc.mime_type, fileSize: doc.file_size });
+                    }
                     if (!body) { body = `[Document: ${doc.file_name ?? doc.mime_type ?? 'file'}]`; synthetic = true; }
                 }
 
@@ -296,7 +305,6 @@ export class TelegramChannel extends BaseChannel {
                             : (chat as { title?: string }).title,
                 };
 
-                // Empty acknowledgement — dismisses the client's loading spinner.
                 await ctx.answerCallbackQuery().catch(() => {});
 
                 const callback: InteractionCallback = {
@@ -309,6 +317,8 @@ export class TelegramChannel extends BaseChannel {
                 await this.emit('onInteraction', callback);
             });
 
+            await this.registerNativeCommands();
+
             this.bot.start({ onStart: () => this.setStatus('connected') }).catch((err) => {
                 this.setStatus('error');
                 this.emitError(toError(err));
@@ -319,9 +329,24 @@ export class TelegramChannel extends BaseChannel {
         }
     }
 
+    private async registerNativeCommands(): Promise<void> {
+        if (!this.bot) return;
+        try {
+            const commands = buildTelegramCommands(COMMANDS);
+            if (commands.length === 0) return;
+            await this.bot.api.setMyCommands(commands);
+            this.log.info({ count: commands.length }, 'telegram: native command menu registered');
+        } catch (err) {
+            this.log.warn(
+                { err: err instanceof Error ? err.message : String(err) },
+                'telegram: setMyCommands failed (menu unavailable, commands still work)',
+            );
+        }
+    }
+
     private async downloadTelegramFile(fileId: string): Promise<{ data: string; mimeType: string } | null> {
         if (!this.bot) return null;
-        // URL contains bot token — never log it; sanitize errors via redactBotToken().
+        // URL embeds bot token — sanitize errors via redactBotToken() before logging.
         let file: Awaited<ReturnType<typeof this.bot.api.getFile>> | null = null;
         try {
             file = await this.bot.api.getFile(fileId);
@@ -380,13 +405,47 @@ export class TelegramChannel extends BaseChannel {
         }
     }
 
+    private async downloadTelegramTextDocument(fileId: string): Promise<string | null> {
+        if (!this.bot) return null;
+        let file: Awaited<ReturnType<typeof this.bot.api.getFile>> | null = null;
+        try {
+            file = await this.bot.api.getFile(fileId);
+        } catch (err) {
+            this.log.warn(
+                { fileId, err: redactBotToken(err), op: 'doc-download:getFile' },
+                'telegram doc getFile failed',
+            );
+            return null;
+        }
+        if (!file?.file_path) return null;
+        const url = `https://api.telegram.org/file/bot${this.channelConfig.token}/${file.file_path}`;
+        try {
+            const res = await fetch(url, { redirect: 'error' });
+            if (!res.ok) return null;
+            const buffer = await res.arrayBuffer();
+            if (buffer.byteLength > MAX_TEXT_DOCUMENT_BYTES) {
+                this.log.warn(
+                    { fileId, bytes: buffer.byteLength, cap: MAX_TEXT_DOCUMENT_BYTES, op: 'doc-download:oversize' },
+                    'telegram text document exceeded cap — agent will get metadata only',
+                );
+                return null;
+            }
+            return new TextDecoder('utf-8', { fatal: false }).decode(buffer);
+        } catch (err) {
+            this.log.warn(
+                { fileId, err: redactBotToken(err), op: 'doc-download:fetch' },
+                'telegram doc fetch threw',
+            );
+            return null;
+        }
+    }
+
     async disconnect(): Promise<void> {
         if (this.bot) {
             await this.bot.stop();
             this.bot = null;
         }
         this.botInfo = null;
-        // Clear throttle timers so the event loop can exit cleanly.
         for (const timer of this.pendingThrottleTimers) clearTimeout(timer);
         this.pendingThrottleTimers.clear();
         this.sendChain.clear();
@@ -397,7 +456,6 @@ export class TelegramChannel extends BaseChannel {
         if (!this.bot) throw new Error('Telegram not connected');
 
         const chatId = message.peer.id;
-
         const _bodyPreview = (message.body ?? '').slice(0, 80);
         this.log.debug(
             { chatId, bodyLen: (message.body ?? '').length, preview: _bodyPreview, hasMedia: !!message.media?.length },
@@ -411,7 +469,6 @@ export class TelegramChannel extends BaseChannel {
             let lastId = 0;
             for (let i = 0; i < message.media.length; i++) {
                 const media = message.media[i]!;
-                // Drop caption when body exceeds Telegram's caption cap — body sent as text.
                 const caption = i === 0 && !captionTooLong ? message.body : undefined;
                 const { InputFile } = await import('grammy');
 
@@ -425,7 +482,6 @@ export class TelegramChannel extends BaseChannel {
                 }
                 const inputFile = mediaSourceToInputFile(resolved.source, InputFile);
 
-                // Throttle each media send so multi-attachment doesn't burst N API calls.
                 const release = await this.acquireChatSlot(chatId);
                 let sent;
                 try {
@@ -466,7 +522,6 @@ export class TelegramChannel extends BaseChannel {
                 }
                 lastId = sent.message_id;
             }
-            // Caption fits → media-only send complete; otherwise body sent as text follow-up.
             if (!captionTooLong) return String(lastId);
         }
 
@@ -478,25 +533,23 @@ export class TelegramChannel extends BaseChannel {
             : undefined;
         const replyMarkup = keyboard ? { inline_keyboard: keyboard } : undefined;
 
-        // Bad replyTo 400s sendMessage; catch retries without it.
         const replyParameters =
             message.replyTo && /^\d+$/.test(message.replyTo)
                 ? { reply_parameters: { message_id: parseInt(message.replyTo, 10) } }
                 : undefined;
 
-        // Fence-aware splitter; reply markup + quote-reply attach to the last chunk.
         const chunks = splitForTelegram(body);
         let lastId = '';
         for (let i = 0; i < chunks.length; i++) {
             const isLast = i === chunks.length - 1;
             const chunkBody = chunks[i]!;
-            // Per-chunk throttle; chunks share the chat rate bucket.
             const release = await this.acquireChatSlot(chatId);
             try {
-            // 429: same-variant retry with retry_after. 400 markdown errors: V2 → legacy → plain.
-            const trySendWith = (parseMode?: 'MarkdownV2' | 'Markdown') =>
+            // 429: same-variant retry with retry_after. 400 format errors fall through HTML → plain.
+            const htmlBody = markdownToTelegramHtml(chunkBody);
+            const trySendWith = (parseMode?: 'HTML') =>
                 retryTelegram(
-                    () => this.bot!.api.sendMessage(chatId, chunkBody, {
+                    () => this.bot!.api.sendMessage(chatId, parseMode ? htmlBody : chunkBody, {
                         ...(parseMode ? { parse_mode: parseMode } : {}),
                         ...(isLast && replyMarkup ? { reply_markup: replyMarkup } : {}),
                         ...(i === 0 ? (replyParameters ?? {}) : {}),
@@ -520,20 +573,13 @@ export class TelegramChannel extends BaseChannel {
                     },
                 );
 
-            const sent = await trySendWith('MarkdownV2').catch((v2Err: unknown) => {
-                if (isTelegramRateLimitError(v2Err)) throw v2Err; // already retried inside
-                this.log.debug(
-                    { chatId, err: v2Err instanceof Error ? v2Err.message : String(v2Err), chunk: i, op: 'send:retry-legacy-markdown' },
-                    'telegram send: MarkdownV2 failed (format), retrying legacy Markdown',
+            const sent = await trySendWith('HTML').catch((htmlErr: unknown) => {
+                if (isTelegramRateLimitError(htmlErr)) throw htmlErr;
+                this.log.warn(
+                    { chatId, err: htmlErr instanceof Error ? htmlErr.message : String(htmlErr), chunk: i, chunks: chunks.length, op: 'send:retry-plain' },
+                    'telegram send: HTML failed (format), retrying plain',
                 );
-                return trySendWith('Markdown').catch((legacyErr: unknown) => {
-                    if (isTelegramRateLimitError(legacyErr)) throw legacyErr;
-                    this.log.warn(
-                        { chatId, err: legacyErr instanceof Error ? legacyErr.message : String(legacyErr), chunk: i, chunks: chunks.length },
-                        'telegram send: both markdown dialects failed (format), retrying plain',
-                    );
-                    return trySendWith(undefined);
-                });
+                return trySendWith(undefined);
             }).catch((finalErr: unknown) => {
                 this.log.error(
                     {
@@ -556,11 +602,6 @@ export class TelegramChannel extends BaseChannel {
         return lastId;
     }
 
-    /**
-     * Native Telegram poll. Telegram caps:
-     *   - question ≤ 300 chars, 2-10 options each ≤ 100 chars
-     *   - open_period in SECONDS, range 5-600
-     */
     async sendPoll(args: {
         peer: Peer;
         question: string;
@@ -576,7 +617,7 @@ export class TelegramChannel extends BaseChannel {
             allows_multiple_answers: args.allowMultiple ?? false,
         };
         if (args.durationHours !== undefined) {
-            // Clamp to Telegram's 5-600 second open_period range.
+            // Telegram open_period range is 5-600 seconds.
             const seconds = Math.min(600, Math.max(5, Math.round(args.durationHours * 3600)));
             pollOpts.open_period = seconds;
         }
@@ -591,13 +632,27 @@ export class TelegramChannel extends BaseChannel {
 
     async sendTyping(peer: Peer): Promise<void> {
         if (!this.bot) return;
-        await this.bot.api.sendChatAction(peer.id, 'typing').catch(() => { /* fire-and-forget */ });
+        await this.bot.api.sendChatAction(peer.id, 'typing').catch(() => {});
+    }
+
+    /**
+     * Telegram-native collapsible reasoning: MarkdownV2 expandable blockquote
+     * (Bot API 7.0+, Jan 2024). Syntax: `**>` opens, `>` continues each line,
+     * `||` at end marks the block as expandable (collapsed by default with a
+     * "Show more" link). First line is a header so the collapsed bubble shows
+     * "💭 Reasoning…" before the user taps.
+     */
+    override formatReasoning(content: string): string {
+        const trimmed = content.trimEnd();
+        if (!trimmed) return '';
+        const escape = (s: string) => s.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
+        const lines = ['💭 Reasoning', ...trimmed.split('\n')].map(escape);
+        return lines.map((l, i) => (i === 0 ? '**>' : '>') + l).join('\n') + '||';
     }
 
     async react(options: ReactionOptions): Promise<void> {
         if (!this.bot) throw new Error('Telegram not connected');
 
-        // Synthetic / queued messages have empty ids; skip rather than 400.
         if (!options.messageId) return;
         const chatId = options.peer.id;
         const messageId = parseInt(options.messageId, 10);
@@ -616,14 +671,14 @@ export class TelegramChannel extends BaseChannel {
 
     async editMessage(messageId: string, peer: Peer, body: string): Promise<void> {
         if (!this.bot) throw new Error('Telegram not connected');
-        // Telegram caps editMessageText at 4096; truncate streaming preview.
+        // Telegram caps editMessageText at 4096; long final replies route through send() instead,
+        // so a truncation marker here reliably means "more is streaming", not data loss.
         const TELEGRAM_EDIT_CAP = 4000;
         const truncated = body.length > TELEGRAM_EDIT_CAP
-            ? body.slice(0, TELEGRAM_EDIT_CAP) + '\n\n_… (truncated preview; full reply incoming)_'
+            ? body.slice(0, TELEGRAM_EDIT_CAP) + '\n\n_…streaming…_'
             : body;
         const msgId = parseInt(messageId, 10);
 
-        // Same split as `send`: 429 → wait retry_after; format error → next variant.
         const tryEditWith = (parseMode?: 'MarkdownV2' | 'Markdown') =>
             retryTelegram(
                 () => this.bot!.api.editMessageText(peer.id, msgId, truncated, {
@@ -632,7 +687,6 @@ export class TelegramChannel extends BaseChannel {
                 {
                     shouldRetry: isTelegramRateLimitError,
                     retryAfterMs: getTelegramRetryAfterMs,
-                    // Streaming edits bounded — worker's circuit breaker handles further protection.
                     attempts: 2,
                 },
             );
@@ -646,18 +700,14 @@ export class TelegramChannel extends BaseChannel {
         });
     }
 
-    /** Best-effort delete for orphan stream previews; errors are swallowed. */
     async deleteMessage(messageId: string, peer: Peer): Promise<void> {
         if (!this.bot) return;
         const id = parseInt(messageId, 10);
         if (!Number.isFinite(id)) return;
-        await this.bot.api.deleteMessage(peer.id, id).catch(() => {
-            /* swallow — best-effort cleanup */
-        });
+        await this.bot.api.deleteMessage(peer.id, id).catch(() => {});
     }
 }
 
-/** Convert resolver's MediaSource into grammy's InputFile (lazy-imported). */
 function mediaSourceToInputFile(
     source: MediaSource,
     InputFileCtor: typeof import('grammy').InputFile,
@@ -666,7 +716,6 @@ function mediaSourceToInputFile(
         case 'remote-url':
             return new InputFileCtor(source.url);
         case 'local-path':
-            // Grammy streams the file at send time — no in-memory buffer.
             return new InputFileCtor(source.absPath, source.fileName);
         case 'buffer':
             return new InputFileCtor(source.data, source.fileName);

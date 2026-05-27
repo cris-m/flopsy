@@ -44,13 +44,17 @@ export function mintLeafCert(rootCertPem: string, rootKeyPem: string, hostname: 
     cert.validity.notAfter = new Date(Date.now() + 24 * 60 * 60 * 1000);
     cert.setSubject([{ name: 'commonName', value: hostname }]);
     cert.setIssuer(rootCert.subject.attributes);
+    const isIp = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname);
+    const altNames = isIp
+        ? [{ type: 7, ip: hostname }, { type: 2, value: 'localhost' }]
+        : [{ type: 2, value: hostname }];
     cert.setExtensions([
         { name: 'basicConstraints', cA: false },
         { name: 'keyUsage', digitalSignature: true, keyEncipherment: true, critical: true },
         { name: 'extKeyUsage', serverAuth: true, clientAuth: true },
         {
             name: 'subjectAltName',
-            altNames: [{ type: 2, value: hostname }],
+            altNames,
         },
     ]);
     cert.sign(rootKey, forge.md.sha256.create());

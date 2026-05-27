@@ -1,5 +1,6 @@
 export { loadConfig, clearConfigCache, getConfigPath } from './loader';
-export { flopsyConfigSchema } from './schema';
+export { flopsyConfigSchema, heartbeatDefinitionSchema, jobDefinitionSchema } from './schema';
+export { RELOAD_RULES_META, ruleForPath, type ReloadMode, type ReloadRuleMeta } from './reload-rules';
 export type {
     FlopsyConfig,
     ChannelsConfig,
@@ -12,7 +13,6 @@ export type {
     IMessageConfig,
     SlackConfig,
     GoogleChatConfig,
-    ExternalWebhookConfigSchema,
     LoggingConfig,
     WebhookSection,
     ProactiveConfig,
@@ -25,7 +25,6 @@ export type {
     ModelRef,
     ModelRouting,
     ModelSource,
-    ModelsConfig,
     MemoryConfig,
     McpConfig,
     McpServerConfig,

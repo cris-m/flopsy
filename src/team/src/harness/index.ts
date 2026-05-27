@@ -5,7 +5,7 @@
  * `src/gateway/src/proactive/`; the harness no longer re-exports them.
  */
 
-export { HarnessInterceptor, toolLoopDedup, sanitizeToolCallNoise, reflectionNudge } from './hooks';
+export { HarnessInterceptor, toolLoopDedup, sanitizeToolCallNoise, reflectionNudge, userLearningNudge } from './hooks';
 export { detectDirective } from './learning';
 export { LearningStore, getSharedLearningStore, closeSharedLearningStore } from './storage';
 export {
@@ -21,13 +21,11 @@ export type { PairingPending, PairingApproved, RequestCodeResult } from './stora
 export { AgentStateTracker, getAgentStateTracker } from './state';
 
 export type { HarnessInterceptorConfig } from './hooks';
-export { CorrectionInterceptor, setCorrectionStore, getCorrectionStore } from './hooks/correction-interceptor';
 export type { AgentState, AgentStatus, ToolActivity, AgentMetrics } from './state';
 export type {
     SessionRow,
     ToolFailureRow,
     ProactiveDecisionRow,
-    ProactiveCommitmentRow,
     SessionGoalRow,
     GoalStatus,
 } from './storage';

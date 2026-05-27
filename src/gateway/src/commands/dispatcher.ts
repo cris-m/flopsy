@@ -1,4 +1,4 @@
-import { createLogger } from '@flopsy/shared';
+import { createLogger, loadConfig } from '@flopsy/shared';
 import type { CommandContext, CommandDef, CommandResult } from './types';
 import type { ParsedCommand } from './parser';
 import { COMMANDS, buildAllCommands, buildLookup } from './registry';
@@ -160,16 +160,35 @@ export function getSharedDispatcher(): CommandDispatcher {
         // Built-ins + one command per discovered skill. Discovery happens
         // once at first access; restart to pick up new skills.
         const skillsRoot = workspace.skills();
-        const allCommands = buildAllCommands(skillsRoot);
+        const mainAgentName = resolveMainAgentName();
+        const allCommands = buildAllCommands(skillsRoot, mainAgentName);
         log.info(
             {
                 builtin: COMMANDS.length,
                 skills: allCommands.length - COMMANDS.length,
                 total: allCommands.length,
+                mainAgent: mainAgentName ?? '(none configured)',
             },
             'command dispatcher initialized',
         );
         sharedDispatcher = new CommandDispatcher(allCommands);
     }
     return sharedDispatcher;
+}
+
+/**
+ * Resolve the main-agent name from flopsy.json5 so slash-command routing
+ * works for any configured main, not just "gandalf". Returns undefined
+ * when config is unreadable or no agent is marked `role: 'main'` — callers
+ * fall back to the "always delegate" path which is correct (just slower
+ * by one hop).
+ */
+function resolveMainAgentName(): string | undefined {
+    try {
+        const cfg = loadConfig();
+        const main = cfg.agents.find((a) => a.role === 'main' && a.enabled !== false);
+        return main?.name;
+    } catch {
+        return undefined;
+    }
 }

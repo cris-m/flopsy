@@ -173,11 +173,25 @@ function detectLowResponse(rows: ProactiveDecisionRow[]): LowResponseRow[] {
     return out;
 }
 
+// Suppression reasons that are infrastructure/harness outcomes, not agent
+// judgment. Surfacing these to self-improve produces counterproductive lessons
+// ("adapt to injection_blocked") because the agent can't fix a scanner
+// false-positive, a model timeout, or a host cooldown by changing its behavior.
+// Only agent-judgment silences (no_new_signal, duplicate_recent, low_value …)
+// are worth learning from.
+const NON_LEARNABLE_SILENCE_REASONS = new Set([
+    'injection_blocked',
+    'empty_agent_response',
+    'unicode-contamination',
+    'cooldown',
+]);
+
 function detectRecurringSilences(rows: ProactiveDecisionRow[]): RecurringSilenceRow[] {
     const byPair = new Map<string, { job: string; reason: string; count: number }>();
     for (const r of rows) {
         if (r.delivered !== 0) continue;
         if (!r.silenceReason) continue;
+        if (NON_LEARNABLE_SILENCE_REASONS.has(r.silenceReason)) continue;
         const job = r.jobName ?? r.jobId;
         const key = `${job}|${r.silenceReason}`;
         const cur = byPair.get(key) ?? { job, reason: r.silenceReason, count: 0 };

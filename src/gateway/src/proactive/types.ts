@@ -59,6 +59,11 @@ export const SilenceReason = z.enum([
     'context_insufficient',   // agent couldn't gather enough to decide
     // Synthetic — set by JobExecutor when the agent returned empty (NOT agent-selectable).
     'empty_agent_response',
+    'injection_blocked',
+    'cooldown',
+    // Synthetic — set by JobExecutor when the agent emits the `[SILENT]` sentinel
+    // (see `isSilentSentinel` in pipeline/executor.ts). NOT agent-selectable.
+    'silent_sentinel',
 ]);
 export type SilenceReasonT = z.infer<typeof SilenceReason>;
 
@@ -77,8 +82,6 @@ export const ReportedIdsSchema = z.object({
     meetings: z.array(z.string()).max(20).optional(),
     tasks: z.array(z.string()).max(20).optional(),
     news: z.array(z.string()).max(20).optional(),
-    /** Inferred-commitment ids; executor marks delivered to hide from future fires. */
-    commitments: z.array(z.number().int().positive()).max(10).optional(),
 });
 export type ReportedIds = z.infer<typeof ReportedIdsSchema>;
 

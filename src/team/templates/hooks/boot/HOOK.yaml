@@ -1,0 +1,9 @@
+name: boot
+description: |
+  Logs gateway startup + shutdown lifecycle events. Example TypeScript hook —
+  safe to edit or remove. Fires deterministically (no LLM, no agent decision).
+enabled: true
+events:
+  - gateway.startup
+  - gateway.shutdown
+handler: handler.ts

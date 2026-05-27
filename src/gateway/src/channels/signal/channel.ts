@@ -1,9 +1,19 @@
 import { spawn, type ChildProcess } from 'child_process';
 import { createInterface, type Interface } from 'readline';
-import type { Peer, OutboundMessage, ReactionOptions, Message } from '@gateway/types';
+import type { Peer, OutboundMessage, ReactionOptions, Message, Media } from '@gateway/types';
+import { isTextDocument } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
 import { resolveMediaSource } from '@gateway/core/media-resolver';
 import type { SignalChannelConfig } from './types';
+
+const MAX_TEXT_DOCUMENT_BYTES = 256 * 1024;
+
+interface SignalAttachment {
+    id?: string;
+    contentType?: string;
+    filename?: string;
+    size?: number;
+}
 
 /** Per-RPC ack timeout — signal-cli typically responds in <500ms but
  *  we cap at 10s so a hung child doesn't pin send() promises forever.
@@ -21,6 +31,7 @@ interface PendingRpc {
 export class SignalChannel extends BaseChannel {
     readonly name = 'signal';
     readonly authType = 'qr';
+    readonly rendersCodeBlocks = false;
 
     private process: ChildProcess | null = null;
     private reader: Interface | null = null;
@@ -43,7 +54,13 @@ export class SignalChannel extends BaseChannel {
         try {
             const cliPath = this.channelConfig.cliPath ?? 'signal-cli';
 
-            this.process = spawn(cliPath, ['-a', this.channelConfig.account, 'jsonRpc'], {
+            const cliArgs: string[] = [];
+            if (this.channelConfig.sessionPath) {
+                cliArgs.push('--config', this.channelConfig.sessionPath);
+            }
+            cliArgs.push('-a', this.channelConfig.account, 'jsonRpc');
+
+            this.process = spawn(cliPath, cliArgs, {
                 stdio: ['pipe', 'pipe', 'pipe'],
                 env: { PATH: process.env.PATH, HOME: process.env.HOME },
             });
@@ -258,6 +275,42 @@ export class SignalChannel extends BaseChannel {
 
         if (!this.isAllowed(isGroup ? peerId : source, peerType)) return;
 
+        const media: Media[] = [];
+        const attachments = dataMessage.attachments as SignalAttachment[] | undefined;
+        if (Array.isArray(attachments) && attachments.length > 0) {
+            for (const a of attachments) {
+                const fileName = a.filename;
+                const mimeType = a.contentType;
+                const fileSize = a.size;
+                if (mimeType?.startsWith('image/')) {
+                    media.push({ type: 'image', mimeType, fileName, fileSize });
+                } else if (mimeType?.startsWith('video/')) {
+                    media.push({ type: 'video', mimeType, fileName, fileSize });
+                } else if (isTextDocument(mimeType, fileName)) {
+                    const attachDir = this.channelConfig.attachmentsPath;
+                    const id = a.id;
+                    const withinSize = !fileSize || fileSize <= MAX_TEXT_DOCUMENT_BYTES;
+                    if (attachDir && id && withinSize) {
+                        try {
+                            const { readFile } = await import('fs/promises');
+                            const { join } = await import('path');
+                            const buffer = await readFile(join(attachDir, id));
+                            if (buffer.length <= MAX_TEXT_DOCUMENT_BYTES) {
+                                const text = new TextDecoder('utf-8', { fatal: false }).decode(buffer);
+                                media.push({ type: 'document', mimeType, fileName, fileSize, text });
+                                continue;
+                            }
+                        } catch {
+                            /* fall through */
+                        }
+                    }
+                    media.push({ type: 'document', mimeType, fileName, fileSize });
+                } else {
+                    media.push({ type: 'document', mimeType, fileName, fileSize });
+                }
+            }
+        }
+
         const normalized: Message = {
             id: String(dataMessage.timestamp ?? Date.now()),
             channelName: this.name,
@@ -265,6 +318,7 @@ export class SignalChannel extends BaseChannel {
             sender: { id: source, name: String(envelope.sourceName ?? '') },
             body: String(dataMessage.message),
             timestamp: new Date(Number(envelope.timestamp ?? Date.now())).toISOString(),
+            ...(media.length > 0 && { media }),
         };
 
         await this.emit('onMessage', normalized);

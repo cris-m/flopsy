@@ -83,6 +83,7 @@ export interface HeartbeatDefinition {
      * by the executor before invoking the agent. Ignored when `noAgent` is true.
      */
     skills?: readonly string[];
+    cooldownAfterSilences?: number;
 }
 
 export interface CronPayload {
@@ -104,6 +105,7 @@ export interface CronPayload {
     preCheckScript?: string;
     /** See HeartbeatDefinition.skills — same semantics for cron. */
     skills?: readonly string[];
+    cooldownAfterSilences?: number;
 }
 
 export interface JobDefinition {
@@ -140,6 +142,7 @@ export interface ExecutionJob {
      * HeartbeatDefinition.skills for full semantics. Empty/undefined: no-op.
      */
     skills?: readonly string[];
+    cooldownAfterSilences?: number;
     /**
      * Optional voice overlay name for this fire (matches a key in
      * personalities.yaml — e.g. "playful", "concise"). When set and the

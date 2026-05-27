@@ -114,7 +114,7 @@ export function initBroker(opts: InitBrokerOptions): CredentialBroker {
     const db = openVaultDb({ path: opts.path });
     if (!isVaultInitialised(db)) {
         closeVaultDb(db);
-        throw new VaultSealError('vault not initialised — run `flopsy vault init` first');
+        throw new VaultSealError('vault not initialised — call initVault() first');
     }
     let dek: Buffer;
     try {

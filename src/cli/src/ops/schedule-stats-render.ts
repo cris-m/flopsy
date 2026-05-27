@@ -453,7 +453,7 @@ export interface ShowOptions {
 export function renderScheduleShow(kind: ScheduleKind, id: string, opts: ShowOptions): void {
     const all = loadSchedulesOfKind(kind);
     if (all === null) {
-        console.log(bad('No proactive.db yet.'));
+        console.log(bad('No schedules store yet (learning.db absent — start the gateway with proactive enabled).'));
         process.exit(1);
     }
     const r = all.find((x) => x.id === id);
@@ -480,5 +480,5 @@ function cap(s: string): string {
 }
 
 function noDbHint(): string {
-    return 'No proactive.db yet — the gateway has not started with proactive enabled.';
+    return 'No schedules store yet — the gateway has not started with proactive enabled (schedules live in learning.db).';
 }

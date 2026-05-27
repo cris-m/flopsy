@@ -5,6 +5,7 @@ import type { StateStore } from '../state/store';
 import type { HeartbeatDefinition, DeliveryTarget, ExecutionJob } from '../types';
 import type { PromptLoader } from '../prompt-loader';
 import { buildProactiveSelfReviewBlock } from '../self-review';
+import { buildFaqBlock } from '../faq-block';
 import { parseDurationMs } from '../duration';
 
 const log = createLogger('heartbeat');
@@ -198,12 +199,31 @@ export class HeartbeatTrigger {
         if (prompt === null) return;
 
         // self-improve fires with a pre-computed `<proactive_self_review>`
-        // block prepended. If the block is empty (no anti-patterns), the
-        // prompt instructs the agent to bail with a single `OK`.
+        // block prepended. If the block is empty (no anti-patterns), skip
+        // the LLM call entirely — the prompt instructs the agent to bail
+        // with a single `OK`, so the call costs ~$0.002 and outputs nothing.
+        // Cost-guard pattern from openclaw's isHeartbeatContentEffectivelyEmpty.
         let finalPrompt = prompt;
         if (hb.name === 'self-improve') {
             const block = buildProactiveSelfReviewBlock(delivery.peer.id, 24 * 60 * 60 * 1000);
-            if (block) finalPrompt = `${block}\n\n${prompt}`;
+            if (!block) {
+                log.debug({ name: hb.name }, 'self-improve: review block empty — skipping fire (saves LLM cost)');
+                return;
+            }
+            finalPrompt = `${block}\n\n${prompt}`;
+        }
+
+        // dreaming fires with a pre-computed `<faq_recurring>` block
+        // prepended. Surfaces patterns from the last 30 days of session
+        // summaries — recurring topics become candidates for USER.md
+        // additions, MEMORY.md project facts, or new skills via
+        // skill_manage(create). Empty block ⇒ no patterns met threshold,
+        // agent proceeds with normal dreaming flow (memory consolidation
+        // from <my_recent_fires> + conversation history).
+        if (hb.name === 'dreaming') {
+            const FAQ_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+            const faqBlock = buildFaqBlock(delivery.peer.id, FAQ_WINDOW_MS);
+            if (faqBlock) finalPrompt = `${faqBlock}\n\n${finalPrompt}`;
         }
 
         const resolvedThreadId = this.threadIdResolver?.(delivery.channelName, delivery.peer, 'heartbeat');
@@ -220,6 +240,9 @@ export class HeartbeatTrigger {
             ...(hb.script ? { script: hb.script } : {}),
             ...(hb.preCheckScript ? { preCheckScript: hb.preCheckScript } : {}),
             ...(hb.skills && hb.skills.length > 0 ? { skills: hb.skills } : {}),
+            ...(typeof hb.cooldownAfterSilences === 'number' && hb.cooldownAfterSilences > 0
+                ? { cooldownAfterSilences: hb.cooldownAfterSilences }
+                : {}),
         };
 
         await this.executor.execute(job).catch((err) => {

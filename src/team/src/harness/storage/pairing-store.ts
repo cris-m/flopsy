@@ -121,7 +121,7 @@ export class PairingStore {
             )
             .run(channel, code, senderId, senderName ?? null, now);
 
-        log.info({ channel, senderId, code }, 'pairing code issued');
+        log.info({ channel, senderId }, 'pairing code issued');
         return { code, isNew: true };
     }
 

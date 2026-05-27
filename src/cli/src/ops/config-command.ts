@@ -22,7 +22,8 @@
 import { renameSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { Command } from 'commander';
-import { bad, dim, info, ok, section } from '../ui/pretty';
+import { flopsyConfigSchema, RELOAD_RULES_META } from '@flopsy/shared';
+import { bad, dim, info, ok, section, warn as warnLine } from '../ui/pretty';
 import { configPath, readFlopsyConfig } from './config-reader';
 
 export function registerConfigCommand(root: Command): void {
@@ -106,6 +107,66 @@ export function registerConfigCommand(root: Command): void {
         console.log('');
         console.log(JSON.stringify(config, null, 2));
     });
+
+    cfg.command('validate')
+        .description('Type-check flopsy.json5 against the Zod schema without reloading the gateway')
+        .option('--json', 'Emit machine-readable JSON (issues array, exit 0/1)', false)
+        .action((opts: { json?: boolean }) => {
+            const { path, config } = readFlopsyConfig();
+            const result = flopsyConfigSchema.safeParse(config);
+            if (result.success) {
+                if (opts.json) {
+                    console.log(JSON.stringify({ ok: true, file: path, issues: [] }));
+                    return;
+                }
+                console.log(ok('flopsy.json5 is valid against the schema.'));
+                console.log(dim(`file: ${path}`));
+                return;
+            }
+            const issues = result.error.issues.map((i) => ({
+                path: i.path.join('.') || '(root)',
+                code: i.code,
+                message: i.message,
+            }));
+            if (opts.json) {
+                console.log(JSON.stringify({ ok: false, file: path, issues }, null, 2));
+                process.exit(1);
+            }
+            console.log(bad(`flopsy.json5 has ${issues.length} schema issue${issues.length === 1 ? '' : 's'}`));
+            console.log(dim(`file: ${path}`));
+            console.log('');
+            for (const iss of issues) {
+                console.log(`  ${bad('✗')} ${iss.path}`);
+                console.log(`    ${iss.message} ${dim(`(${iss.code})`)}`);
+            }
+            console.log('');
+            console.log(dim(`  Fix the file, then re-run: flopsy config validate`));
+            process.exit(1);
+        });
+
+    cfg.command('reload-info')
+        .description('Show which config paths hot-reload vs require a gateway restart')
+        .action(() => {
+            console.log(section('Reload rules'));
+            console.log(dim('  Order matters — first matching pattern wins.'));
+            console.log('');
+            const rows: string[][] = [['pattern', 'mode', 'reason']];
+            for (const r of RELOAD_RULES_META) {
+                const modeCell = r.mode === 'hot' ? ok(r.mode) : warnLine(r.mode);
+                rows.push([r.pattern, modeCell, r.reason]);
+            }
+            const widths: number[] = new Array(rows[0].length).fill(0);
+            const visible = (s: string): number => s.replace(/\x1b\[[0-9;]*m/g, '').length;
+            for (const r of rows) for (let c = 0; c < r.length; c++) {
+                widths[c] = Math.max(widths[c], visible(r[c]));
+            }
+            for (const r of rows) {
+                console.log('  ' + r.map((cell, c) => cell + ' '.repeat(widths[c] - visible(cell))).join('  '));
+            }
+            console.log('');
+            console.log(dim(`  hot = applied live;  restart = run \`flopsy gateway restart\` to take effect.`));
+            console.log(dim(`  Anything not matched here is silently ignored on reload — file an issue if you hit one.`));
+        });
 }
 
 /**

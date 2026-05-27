@@ -8,11 +8,6 @@ interface CacheEntry {
     loadedAt: number;
 }
 
-/**
- * Reads prompt files namespaced by schedule kind under
- * `<FLOPSY_HOME>/proactive/<kind>/`. Absolute paths bypass namespacing.
- * 60s TTL cache so edits propagate without restart.
- */
 export class PromptLoader {
     private readonly cache = new Map<string, CacheEntry>();
 
@@ -29,11 +24,10 @@ export class PromptLoader {
     }
 
     private async loadFile(filePath: string, kind?: PromptKind): Promise<string> {
-        // Relative paths require a kind to resolve under .flopsy/proactive/<kind>/.
         if (!kind && !filePath.startsWith('/')) {
             throw new Error(
                 `PromptLoader.loadFile: relative filePath "${filePath}" requires a PromptKind ` +
-                    `("heartbeat" or "cron") to resolve under .flopsy/proactive/<kind>/.`,
+                    `("heartbeat" or "cron") to resolve under <FLOPSY_HOME>/content/prompts/<kind>/.`,
             );
         }
         const absPath = kind

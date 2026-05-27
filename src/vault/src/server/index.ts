@@ -1,9 +1,13 @@
 import { CredentialBroker, initBroker } from '../broker';
+import { pruneAudit } from '../store/audit';
 import { listRules } from '../store/rules';
 import { listSecrets } from '../store/secrets';
 import { listTokens } from '../store/tokens';
 import { startMgmtServer, type MgmtServerHandle } from './mgmt';
 import { startProxyServer, type ProxyServerHandle } from './proxy';
+
+const AUDIT_RETENTION_MS = 1000 * 60 * 60 * 24 * 30;
+const AUDIT_PRUNE_INTERVAL_MS = 1000 * 60 * 60 * 6;
 
 export interface VaultServerOptions {
     vaultDbPath: string;
@@ -46,11 +50,18 @@ export async function startVaultServer(opts: VaultServerOptions): Promise<VaultS
         broker,
     });
 
+    try { pruneAudit(db, AUDIT_RETENTION_MS); } catch { /* */ }
+    const pruneTimer: NodeJS.Timeout = setInterval(() => {
+        try { pruneAudit(db, AUDIT_RETENTION_MS); } catch { /* */ }
+    }, AUDIT_PRUNE_INTERVAL_MS);
+    pruneTimer.unref?.();
+
     return {
         broker,
         mgmt,
         proxy,
         stop: async () => {
+            clearInterval(pruneTimer);
             await Promise.all([mgmt.close(), proxy.close()]);
             broker.close();
         },

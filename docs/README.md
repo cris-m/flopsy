@@ -32,8 +32,9 @@ flopsy gateway start       # or: flopsy run start
 | [Gateway](./gateway.md) | Gateway daemon, management endpoint, lifecycle |
 | [Proactive](./proactive.md) | Heartbeats, cron scheduler, inbound webhooks |
 | [Memory](./memory.md) | SOUL.md, AGENTS.md, learning.db, memory.db, the memory tool |
-| [Goal loop](./goal.md) | The `/goal` Ralph-loop self-continuation feature |
+| [Goal loop](./goal.md) | The `/goal` + `/subgoal` Ralph-loop self-continuation feature with progress notifications |
 | [Hooks](./hooks.md) | YAML event hooks (`.flopsy/content/hooks/*.yaml`) |
+| [Vault](./vault.md) | Encrypted credential broker with MITM proxy — agents never hold real API keys |
 
 ## The 30-second mental model
 
@@ -103,7 +104,8 @@ flopsy.json5                          # single source of truth for config
 │   ├── memory.db                     # vector memory (embeddings)
 │   ├── checkpoints.db                # paused turns (LangGraph-style)
 │   ├── proactive.db                  # heartbeat/cron/webhook schedules + dedup
-│   └── proactive.json                # presence, queue, oneshot markers
+│   ├── proactive.json                # presence, queue, oneshot markers
+│   └── vault.db                      # encrypted credential broker (AES-256-GCM)
 ├── auth/                             # OAuth + pairing material (chmod 0700)
 └── logs/                             # gateway.log
 ```

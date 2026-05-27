@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 
 export const NONCE_BYTES = 12;
 export const TAG_BYTES = 16;
@@ -42,7 +42,3 @@ export function newKey(): Buffer {
     return randomBytes(KEY_BYTES);
 }
 
-export function constantTimeEqual(a: Buffer, b: Buffer): boolean {
-    if (a.length !== b.length) return false;
-    return timingSafeEqual(a, b);
-}

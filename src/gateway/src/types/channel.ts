@@ -18,7 +18,6 @@ export type GroupActivation = 'mention' | 'always';
 
 export type MediaType = 'image' | 'video' | 'audio' | 'document' | 'sticker';
 
-/** Capability flags each channel declares. */
 export type InteractiveCapability =
     | 'buttons'
     | 'select'
@@ -29,7 +28,6 @@ export type InteractiveCapability =
     | 'typing'
     | 'edit-message';
 
-/** Button style for interactive messages. */
 export type ButtonStyle = 'primary' | 'secondary' | 'success' | 'danger';
 
 export interface InteractiveButton {
@@ -60,7 +58,6 @@ export interface InteractiveSelectBlock {
     readonly multiSelect?: boolean;
 }
 
-/** Channels without native polls render a numbered-text fallback. */
 export interface InteractivePollBlock {
     readonly type: 'poll';
     readonly question: string;
@@ -101,6 +98,45 @@ export interface Media {
     fileSize?: number;
     caption?: string;
     data?: string;
+    text?: string;
+}
+
+export const DOCUMENT_TEXT_MIMES: ReadonlySet<string> = new Set([
+    'text/plain',
+    'text/markdown',
+    'text/csv',
+    'text/x-log',
+    'text/html',
+    'text/xml',
+    'application/json',
+    'application/xml',
+    'application/yaml',
+    'application/x-yaml',
+    'application/toml',
+    'application/javascript',
+    'application/typescript',
+]);
+
+export const DOCUMENT_TEXT_EXTENSIONS: ReadonlySet<string> = new Set([
+    'md', 'markdown', 'txt', 'log', 'csv', 'tsv',
+    'json', 'jsonl', 'ndjson', 'xml', 'yaml', 'yml', 'toml', 'ini', 'cfg', 'env',
+    'js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx',
+    'py', 'rb', 'go', 'rs', 'java', 'kt', 'swift', 'c', 'h', 'cpp', 'hpp', 'cs',
+    'sh', 'bash', 'zsh', 'fish',
+    'html', 'htm', 'css', 'scss', 'sass', 'less',
+    'sql', 'graphql', 'gql', 'proto',
+]);
+
+export function isTextDocument(mimeType?: string, fileName?: string): boolean {
+    if (mimeType) {
+        if (mimeType.startsWith('text/')) return true;
+        if (DOCUMENT_TEXT_MIMES.has(mimeType.toLowerCase())) return true;
+    }
+    if (fileName) {
+        const ext = fileName.split('.').pop()?.toLowerCase();
+        if (ext && DOCUMENT_TEXT_EXTENSIONS.has(ext)) return true;
+    }
+    return false;
 }
 
 export interface Message {
@@ -109,7 +145,6 @@ export interface Message {
     peer: Peer;
     sender?: { id: string; name?: string };
     body: string;
-    /** True for channel-adapter-generated placeholders ("[Image]", "[Video]"). */
     synthetic?: boolean;
     timestamp: string;
     replyTo?: { id: string; body?: string; sender?: string };
@@ -122,6 +157,41 @@ export interface OutboundMessage {
     replyTo?: string;
     media?: Media[];
     interactive?: InteractiveReply;
+}
+
+/**
+ * Multi-message delivery intent. Replaces in-band delimiters with a typed,
+ * auditable contract for "send N messages with natural pacing between."
+ *
+ * Owned by `BaseChannel.deliverMessages`. The agent expresses intent in
+ * exactly one of two ways:
+ *   1. Tool path:  send_message({ parts: ['msg 1', 'msg 2', ...] })
+ *   2. Free-text path: structured-output { messages: ['msg 1', ...] }
+ * Both funnel through deliverMessages, which owns pacing, typing-indicator,
+ * replyTo-only-on-first, and per-part error isolation.
+ *
+ * No in-band delimiters: '---' in a single string remains a markdown
+ * thematic break, not a split marker.
+ */
+export interface DeliverMessagesOptions {
+    peer: Peer;
+    /** N >= 1 message bodies. Each becomes one channel send. */
+    parts: string[];
+    /** Applied to parts[0] only — subsequent parts never reply-chain. */
+    replyTo?: string;
+    /** Pacing between parts. Default scales with part length (≈30ms/char, capped). */
+    pauseMs?: number | ((partIndex: number, part: string) => number);
+    /** Show the channel's typing indicator between parts (default true). */
+    showTyping?: boolean;
+    /** Media attached to parts[0] only (typically). */
+    media?: Media[];
+}
+
+export interface DeliverMessagesResult {
+    /** Channel message IDs for each part, in order. Null entries = send failed. */
+    messageIds: (string | null)[];
+    /** True if every part sent successfully. */
+    allSent: boolean;
 }
 
 export interface ReactionOptions {
@@ -174,6 +244,7 @@ export interface Channel {
     readonly authType: AuthType;
     readonly streaming?: StreamingCapability;
     readonly capabilities?: readonly InteractiveCapability[];
+    readonly rendersCodeBlocks?: boolean;
 
     connect(): Promise<void>;
     disconnect(): Promise<void>;
@@ -182,7 +253,22 @@ export interface Channel {
     sendTyping(peer: Peer): Promise<void>;
     react(options: ReactionOptions): Promise<void>;
 
-    /** Native poll. Leave undefined for fallback to numbered-text via send(). */
+    /**
+     * Multi-message delivery with pacing + typing-indicator + per-part error
+     * isolation. Default implementation composes from `send`/`sendTyping`;
+     * channels may override for native batch APIs. See base-channel.ts.
+     */
+    deliverMessages(opts: DeliverMessagesOptions): Promise<DeliverMessagesResult>;
+
+    /**
+     * Per-channel flag — when true, the channel-worker's reasoning lane
+     * surfaces agent thinking as a single edit-in-place message. Default
+     * false. Wired from `channels.<name>.showThinking` in flopsy.json5.
+     */
+    readonly showThinking: boolean;
+
+    formatReasoning(content: string): string;
+
     sendPoll?(args: {
         peer: Peer;
         question: string;
@@ -194,15 +280,37 @@ export interface Channel {
 
     clearSession?(): Promise<void>;
     editMessage?(messageId: string, peer: Peer, body: string): Promise<void>;
-    /** Delete previously-sent message; used to clear orphan stream previews. */
     deleteMessage?(messageId: string, peer: Peer): Promise<void>;
     updateAccessControl?(update: AccessControlUpdate): void;
     pairingRequestHandler?: PairingRequestHandler | null;
 
-    /** Hook for channels (e.g. chat TUI) that render raw streaming chunks. */
     forwardChunk?(peer: Peer, chunk: import('./agent').AgentChunk): void;
 
-    /** Hook for channels that render background-task lifecycle events. */
+    /**
+     * Per-peer token + context-window usage update. Channels with a status
+     * line (Discord embeds, Telegram pinned messages) render this; channels
+     * without one ignore it. Optional — most channels don't implement it.
+     */
+    setPeerUsage?(
+        peerId: string,
+        usage: {
+            input: number;
+            output: number;
+            reasoning?: number;
+            cached?: number;
+            contextTokens?: number;
+            contextLimit?: number;
+        },
+    ): void;
+
+    /**
+     * Notify the channel that the agent compacted a thread the channel is
+     * displaying. Channels with a status line may surface a transient hint;
+     * channels without one ignore it. The compaction event type is opaque
+     * here to avoid a hard dep on `@flopsy/team`.
+     */
+    notifyCompaction?(peerId: string, event: unknown): void;
+
     forwardTaskEvent?(
         peer: Peer,
         event: {
@@ -220,7 +328,7 @@ export interface Channel {
 
 export interface WebhookChannel {
     readonly webhookPath: string;
-    verifyWebhook(req: IncomingMessage, body: string): boolean;
+    verifyWebhook(req: IncomingMessage, body: string | Buffer): boolean;
     extractEvents(parsed: unknown): unknown[];
     handleWebhookEvent(event: unknown): Promise<void>;
 }
@@ -236,6 +344,13 @@ export interface BaseChannelConfig {
     allowFrom?: string[];
     blockedFrom?: string[];
     allowedGroups?: string[];
+    /**
+     * Show the agent's reasoning ("thinking") on this channel as a single
+     * edit-in-place message. Default false — matches Hermes/openclaw
+     * industry pattern where reasoning stays in observability logs.
+     * Set `channels.<name>.showThinking: true` in flopsy.json5 to enable.
+     */
+    showThinking?: boolean;
 }
 
 export interface ChannelWorkerConfig {
@@ -264,20 +379,15 @@ export interface ChannelWorkerConfig {
     readonly coalesceDelayMs?: number;
     readonly agentTimeoutMs?: number;
     readonly backgroundTurnTimeoutMs?: number;
-    /** Lazy `/status` snapshot getter. */
     readonly getGatewayStatus?: () => GatewayStatusSnapshot | undefined;
-    /** BaseChatModel for conditional webhook delivery (typed `unknown` to avoid cycle). */
     readonly structuredOutputModel?: unknown;
-    /** Lifecycle-reaction policy; defaults to `{ direct: true, group: 'mentions' }`. */
     readonly reactionPolicy?: {
         readonly direct: boolean;
         readonly group: 'always' | 'mentions' | 'never';
     };
-    /** Pre-placed ackReaction.emoji reused as running indicator (avoids stacking). */
     readonly ackEmoji?: string;
 }
 
-/** User-safe snapshot for chat commands; no tokens, peer ids, URLs, or paths. */
 export interface GatewayStatusSnapshot {
     readonly uptimeMs: number;
     readonly channels: ReadonlyArray<{
@@ -286,14 +396,11 @@ export interface GatewayStatusSnapshot {
         readonly enabled: boolean;
     }>;
     readonly activeThreads: number;
-    /** Host deliberately omitted. */
     readonly port?: number;
-    /** Git short-sha or 'dev'. */
     readonly version?: string;
     readonly webhook?: {
         readonly enabled: boolean;
         readonly port?: number;
-        /** Route count — paths are not leaked. */
         readonly routeCount: number;
     };
     readonly proactive?: {

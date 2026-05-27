@@ -16,14 +16,15 @@ import chalk from 'chalk';
 import cliBoxes from 'cli-boxes';
 import { userInfo } from 'node:os';
 import { palette, tint } from './theme';
-import { styleRabbit, getRecentActivity, formatRelative } from './banner';
+import { styleRabbit, getRecentActivity, formatRelative, FLOPSY_VERSION } from './banner';
 import { renderMarkdown } from './components/markdown-renderer';
 import { center, fmtElapsed, fmtTok, padRight, stripLen, wrapVisible } from './components/text-utils';
 import {
-    buildToolStartLine,
     buildToolDoneLine,
     buildToolDurationLine,
     formatToolResultLines,
+    formatToolName,
+    argPreview,
     isToolError,
 } from './components/tool-display';
 import { buildThinkingLines } from './components/thinking-block';
@@ -39,6 +40,12 @@ const HIDE_CURSOR = `${ESC}[?25l`;
 const SHOW_CURSOR = `${ESC}[?25h`;
 const ENABLE_BRACKETED = `${ESC}[?2004h`;
 const DISABLE_BRACKETED = `${ESC}[?2004l`;
+// Kitty keyboard protocol — push flags=1 (disambiguate escape codes,
+// report modifier+key) on start, pop on exit. Lets us distinguish
+// Shift+Enter from plain Enter (and Ctrl+Enter, Alt+Enter, etc.).
+// Silently ignored by terminals that don't speak it.
+const ENABLE_KITTY_KEYBOARD = `${ESC}[>1u`;
+const DISABLE_KITTY_KEYBOARD = `${ESC}[<u`;
 const CLEAR_TO_END = `${ESC}[J`;
 const CR = '\r';
 const cursorUp = (n: number): string => (n > 0 ? `${ESC}[${n}A` : '');
@@ -47,6 +54,14 @@ const THINK_BASE = process.platform === 'darwin'
     ? ['·', '✢', '✳', '✶', '✻', '✽']
     : ['·', '✢', '*', '✶', '✻', '✽'];
 const THINK_SPIN = [...THINK_BASE, ...[...THINK_BASE].reverse()];
+
+// Playful gerunds for the working line (claude-code pattern). One is sampled
+// per turn so a long reply doesn't read as a frozen "working…".
+const THINK_VERBS = [
+    'Thinking', 'Working', 'Cogitating', 'Pondering', 'Brewing', 'Reasoning',
+    'Crunching', 'Noodling', 'Percolating', 'Mulling', 'Synthesizing',
+    'Computing', 'Churning', 'Scheming', 'Conjuring', 'Untangling',
+];
 
 export interface ChatTUICallbacks {
     /**
@@ -115,6 +130,7 @@ export class ChatTUI {
     private thinkingVisible = true;
     private thinkActive = false;
     private thinkFrame = 0;
+    private thinkVerb = 'Working';
     private thinkInterval: ReturnType<typeof setInterval> | null = null;
 
     /** When set, a tool is in flight. Show the spinner. */
@@ -128,6 +144,7 @@ export class ChatTUI {
     private threadId = '';
     private model = '';
     private cwd = '';
+    private branch = '';
     private tokenIn = 0;
     private tokenOut = 0;
     private tokenReasoning = 0;
@@ -140,10 +157,18 @@ export class ChatTUI {
     private lastResponseMs = 0;
 
     private clockInterval: ReturnType<typeof setInterval> | null = null;
+    /** True once start() has set up the terminal. Guards renders triggered before the TUI is live (e.g. async setBranch). */
+    private started = false;
 
     setContextUsage(used: number, limit: number | null): void {
         this.contextTokens = used;
         this.contextLimit = limit;
+        this.render();
+    }
+
+    setBranch(branch: string): void {
+        this.branch = branch;
+        this.render();
     }
 
     constructor(private readonly cbs: ChatTUICallbacks) {}
@@ -151,8 +176,11 @@ export class ChatTUI {
     // ── lifecycle ─────────────────────────────────────────────────────────
 
     start(): void {
+        this.started = true;
+        this.installConsoleInterceptor();
         write(HIDE_CURSOR);
         write(ENABLE_BRACKETED);
+        write(ENABLE_KITTY_KEYBOARD);
         process.stdin.setRawMode?.(true);
         process.stdin.resume();
         process.stdin.on('data', (d: Buffer) => this.input.handle(d));
@@ -172,10 +200,65 @@ export class ChatTUI {
             write(cursorUp(this.mutable.length) + CR + CLEAR_TO_END);
             this.mutable = [];
         }
+        write(DISABLE_KITTY_KEYBOARD);
         write(DISABLE_BRACKETED);
         write(SHOW_CURSOR);
         try { process.stdin.setRawMode?.(false); } catch { /* */ }
         process.stdin.pause();
+        this.restoreConsole();
+    }
+
+    private origConsole: { log?: typeof console.log; info?: typeof console.info } = {};
+
+    /**
+     * Foreign writers (gateway internals, [FileBridge], [programmatic-tool],
+     * [docker-session], etc.) emit console.log which lands on stdout *between*
+     * our renders. Without interception, those writes advance the cursor
+     * without updating this.mutable, so the next render's cursor math
+     * under-counts and the previous mutable region stays visible above the
+     * new one — the "doubling" bug.
+     *
+     * Fix: route console.log/info through commitForeignLog which clears the
+     * mutable region first, writes the line into the scrollback area above,
+     * then re-renders mutable below. console.warn/error go to stderr and
+     * don't affect the TUI, so we leave them alone.
+     */
+    private installConsoleInterceptor(): void {
+        this.origConsole.log = console.log;
+        this.origConsole.info = console.info;
+        const route = (...args: unknown[]): void => {
+            try {
+                const text = args
+                    .map((a) => typeof a === 'string' ? a : (() => { try { return require('node:util').inspect(a, { depth: 4, colors: false }); } catch { return String(a); } })())
+                    .join(' ');
+                this.commitForeignLog(text);
+            } catch {
+                this.origConsole.log?.(...args as Parameters<typeof console.log>);
+            }
+        };
+        console.log = route as typeof console.log;
+        console.info = route as typeof console.info;
+    }
+
+    private restoreConsole(): void {
+        if (this.origConsole.log) console.log = this.origConsole.log;
+        if (this.origConsole.info) console.info = this.origConsole.info;
+        this.origConsole = {};
+    }
+
+    private commitForeignLog(text: string): void {
+        if (!this.started) {
+            this.origConsole.log?.(text);
+            return;
+        }
+        if (this.mutable.length > 0) {
+            write(cursorUp(this.mutable.length - 1) + CR + CLEAR_TO_END);
+        } else {
+            write(CR + CLEAR_TO_END);
+        }
+        write(text + '\n');
+        this.mutable = [];
+        this.render();
     }
 
     private handleResize(): void {
@@ -214,7 +297,7 @@ export class ChatTUI {
         const leftW = Math.floor(innerW * 0.4);
         const rightW = innerW - leftW - 3; // 3 = " │ " separator
 
-        const titleInline = ` ${tint.brand.bold('FlopsyBot')} ${chalk.dim('v1.0.0')} `;
+        const titleInline = ` ${tint.brand.bold('FlopsyBot')} ${chalk.dim('v' + FLOPSY_VERSION)} `;
         const titleVis = stripLen(titleInline);
         const leftDashes = 3;
         const rightDashes = Math.max(1, innerW - titleVis - leftDashes);
@@ -291,15 +374,10 @@ export class ChatTUI {
             this.responseStartMs = Date.now();
             this.lastResponseMs = 0;
             this.toolFiredThisTurn = false;
-            if (this.thinkingVisible) {
-                this.stopThink();
-                this.thinkActive = true;
-                this.thinkFrame = 0;
-                this.thinkInterval = setInterval(() => {
-                    this.thinkFrame = (this.thinkFrame + 1) % THINK_SPIN.length;
-                    this.render();
-                }, 160);
-            }
+            this.thinkVerb = THINK_VERBS[Math.floor(Math.random() * THINK_VERBS.length)]!;
+            // Spinner runs for the WHOLE turn (thinking, tool calls, generation)
+            // so the user always sees liveness — not just during reasoning text.
+            this.startSpinner();
         } else {
             this.lastResponseMs = Date.now() - this.responseStartMs;
             this.activeTool = null;
@@ -346,15 +424,16 @@ export class ChatTUI {
     }
 
     addToolStart(name: string, args?: string): void {
+        // Commit any in-flight streamed text BEFORE this tool starts, so
+        // scrollback order (text → tool → text) is preserved.
+        this.flushThinking();
+        this.commitStreamingText();
         this.activeTool = { name, args, startedAt: Date.now() };
         this.toolFiredThisTurn = true;
-        this.flushThinking();
-        // Commit any in-flight streamed text BEFORE the tool line so order
-        // (text → tool → text) is preserved in the scrollback.
-        this.commitStreamingText();
-        this.stopThink();
-        const line = buildToolStartLine(name, args);
-        this.commit([line]);
+        // The running tool renders in the mutable region (one animated line
+        // that becomes a committed "done" line). It is deliberately NOT
+        // committed here — committing both a start and a done line is what
+        // previously double-printed the tool name.
         this.render();
     }
 
@@ -362,23 +441,23 @@ export class ChatTUI {
         const startedArgs = this.activeTool?.args;
         this.activeTool = null;
         const err = isToolError(result);
-        const out: string[] = [];
-        out.push(buildToolDoneLine(name, startedArgs, err));
-        if (result?.trim()) {
-            for (const l of formatToolResultLines(result, cols(), err)) out.push(l);
-        }
-        out.push(buildToolDurationLine(durationMs));
-        out.push('');
-        this.commit(out);
-        if (this.streaming) {
-            this.thinkActive = true;
-            this.thinkFrame = 0;
-            this.stopThink();
-            this.thinkInterval = setInterval(() => {
-                this.thinkFrame = (this.thinkFrame + 1) % THINK_SPIN.length;
-                this.render();
-            }, 160);
-        }
+        // Render as an expandable history block: collapsed by default (6-line
+        // cap + "ctrl+o to expand"), full when the user toggles Ctrl+O. This is
+        // why the hint is truthful — toggleExpansion repaints this block.
+        const block = (expanded: boolean): string[] => {
+            const out: string[] = [buildToolDoneLine(name, startedArgs, err)];
+            if (result?.trim()) {
+                for (const l of formatToolResultLines(result, cols(), err, expanded)) out.push(l);
+            }
+            out.push(buildToolDurationLine(durationMs));
+            out.push('');
+            return out;
+        };
+        this.historyBlocks.push(block);
+        // The single, finished tool entry. The spinner keeps running for the
+        // rest of the turn, so liveness never blinks out between tools.
+        this.commit(block(this.expanded), /* track */ false);
+        if (this.streaming && this.thinkInterval === null) this.startSpinner();
         this.render();
     }
 
@@ -435,6 +514,21 @@ export class ChatTUI {
         this.activeTool = null;
         this.stopThink();
         this.commit(['', `  ${chalk.red('✗')} ${chalk.red(msg)}`, '']);
+    }
+
+    /** Surface an auto-compaction event in scrollback + refresh the ctx figure. */
+    addCompaction(e: { tokensBefore: number; tokensAfter: number; durationMs: number; strategy: string }): void {
+        const dim = chalk.hex(palette.muted);
+        const sym = chalk.hex(palette.brand)('✦');
+        const dur = e.durationMs >= 1000 ? `${(e.durationMs / 1000).toFixed(1)}s` : `${e.durationMs}ms`;
+        const freed = Math.max(0, e.tokensBefore - e.tokensAfter);
+        this.commit([
+            '',
+            `  ${sym} ` + dim(`compacted context · ${fmtTok(e.tokensBefore)} → ${fmtTok(e.tokensAfter)} tokens (freed ${fmtTok(freed)}) · ${e.strategy} · ${dur}`),
+            '',
+        ]);
+        // Reflect freed context in the status bar right away.
+        this.setContextUsage(e.tokensAfter, this.contextLimit);
     }
 
     addTaskEvent(kind: 'start' | 'progress' | 'complete' | 'error', taskId: string, info?: string): void {
@@ -515,6 +609,7 @@ export class ChatTUI {
      * bottom of the viewport instead of leaving an empty trailing row.
      */
     private render(): void {
+        if (!this.started) return;
         const newMutable = this.buildMutable();
 
         let firstChanged = 0;
@@ -601,7 +696,10 @@ export class ChatTUI {
         if (streamSlice.length > 0 || thinkSlice.length > 0) {
             out.push('');
         }
-        if (this.streaming && (this.thinkActive || this.activeTool)) {
+        // Show the live working line for the WHOLE turn (thinking, tool calls,
+        // and generation) — not just while reasoning text streams — so the user
+        // is never left wondering whether the agent is still working.
+        if (this.streaming || this.activeTool) {
             out.push(this.thinkLine());
         } else {
             out.push('');
@@ -638,7 +736,7 @@ export class ChatTUI {
 
         const home = process.env['HOME'] ?? '';
         const cwdDisp = this.cwd ? this.cwd.replace(home, '~') : '';
-        const branch = (globalThis as any).__flopsyGitBranch ?? '';
+        const branch = this.branch;
 
         const left1 = dim(cwdDisp + (branch ? ' ' + chalk.hex(palette.channel)(branch) : ''));
         const rightParts1: string[] = [];
@@ -664,22 +762,82 @@ export class ChatTUI {
         if (this.tokenCached > 0) tokenParts.push(`◆${fmtTok(this.tokenCached)}`);
         rightParts2.push(dim(tokenParts.join(' ')));
         if (this.contextTokens > 0) {
-            const limitSuffix = this.contextLimit && this.contextLimit > 0
-                ? `/${fmtTok(this.contextLimit)}`
-                : '';
-            rightParts2.push(dim(`ctx ${fmtTok(this.contextTokens)}${limitSuffix}`));
-            if (this.contextTokens >= 80_000) {
-                rightParts2.push(chalk.hex(palette.warn)('⚠ ctx filling'));
-            }
+            rightParts2.push(this.renderContextBar());
         }
-        const line2 = rightParts2.join(' ');
+        const line2 = rightParts2.join('  ');
 
         return { line1, line2 };
     }
 
+    /**
+     * Render the context-usage indicator as a compact progress bar.
+     *
+     * Replaces the prior "ctx 554.3K / ⚠ ctx filling" duplicate-numeric form
+     * with a Hermes-style visual bar that shows how full the window is at a
+     * glance. Colour tiers: dim ≤60%, neutral 60–80%, warn 80–95%, red ≥95%.
+     * Bar is omitted when the model's window limit isn't known (no
+     * denominator) — falls back to bare token count + warn marker.
+     */
+    private renderContextBar(): string {
+        const used = this.contextTokens;
+        const limit = this.contextLimit && this.contextLimit > 0 ? this.contextLimit : null;
+        const dim = (s: string) => chalk.hex(palette.muted)(s);
+
+        if (!limit) {
+            const overflowMark = used >= 80_000 ? ' ' + chalk.hex(palette.warn)('⚠') : '';
+            return dim(`ctx ${fmtTok(used)}`) + overflowMark;
+        }
+
+        const pct = Math.max(0, Math.min(1, used / limit));
+        const pctNum = Math.round(pct * 100);
+
+        const BAR_WIDTH = 14;
+        const filled = Math.min(BAR_WIDTH, Math.max(0, Math.round(pct * BAR_WIDTH)));
+        const empty = BAR_WIDTH - filled;
+
+        const colour =
+            pct >= 0.95 ? (s: string) => chalk.red(s)
+            : pct >= 0.80 ? (s: string) => chalk.hex(palette.warn)(s)
+            : pct >= 0.60 ? (s: string) => s
+            : dim;
+
+        const bar = colour('█'.repeat(filled)) + dim('░'.repeat(empty));
+        const pctTxt = colour(`${pctNum}%`.padStart(4));
+        const sizeTxt = dim(`${fmtTok(used)}/${fmtTok(limit)}`);
+        return `${bar} ${pctTxt} ${sizeTxt}`;
+    }
+
+    /** Start the per-turn spinner (idempotent). Runs through thinking, tools, and generation. */
+    private startSpinner(): void {
+        this.stopThink();
+        this.thinkActive = true;
+        this.thinkFrame = 0;
+        this.thinkInterval = setInterval(() => {
+            this.thinkFrame = (this.thinkFrame + 1) % THINK_SPIN.length;
+            this.render();
+        }, 160);
+    }
+
     private thinkLine(): string {
         const sym = chalk.hex('#D77757')(THINK_SPIN[this.thinkFrame % THINK_SPIN.length]!);
-        return `  ${sym} ` + chalk.hex(palette.muted).italic('working…');
+        const dim = chalk.hex(palette.muted);
+        const elapsed = this.responseStartMs > 0 ? fmtElapsed(Date.now() - this.responseStartMs) : '';
+        // Live output-token estimate (~4 chars/token) over the text streamed so
+        // far this turn; the status bar shows the exact count on completion.
+        const genChars = this.streamTextBuf.length + this.thinkBuf.length;
+        const tokEst = Math.floor(genChars / 4);
+        const tok = tokEst > 0 ? `↓ ${fmtTok(tokEst)} tok` : '';
+        // While a tool runs, show the tool name (not a generic verb) so the
+        // single mutable line reads as "this exact tool is in flight".
+        if (this.activeTool) {
+            const display = formatToolName(this.activeTool.name);
+            const preview = this.activeTool.args ? argPreview(this.activeTool.args) : '';
+            const head = preview ? `${chalk.bold(display)}${dim('(' + preview + ')')}` : chalk.bold(display);
+            const meta = [elapsed, 'esc to interrupt'].filter(Boolean).join(' · ');
+            return `  ${sym} ` + head + dim(`  (${meta})`);
+        }
+        const meta = [elapsed, tok, 'esc to interrupt'].filter(Boolean).join(' · ');
+        return `  ${sym} ` + dim.italic(`${this.thinkVerb}…`) + dim(`  (${meta})`);
     }
 
     /**
@@ -708,16 +866,11 @@ export class ChatTUI {
             this.cbs.onQuit();
             return;
         }
-        // If a turn is still streaming, treat the new message as an
-        // implicit interrupt. The
-        // gateway aborts the in-flight LLM call, the visual streaming
-        // indicator clears, then the new message goes out as the next
-        // turn. Without this, the user has to Ctrl+C first; many users
-        // assume sending a message already supersedes the prior turn.
-        if (this.streaming) {
-            this.cbs.onInterrupt();
-            this.setStreaming(false);
-        }
+        // Sending a message while a turn streams does NOT interrupt it — the
+        // message is queued and the gateway injects it mid-turn (or runs it as
+        // the next turn). This mirrors Claude: typing QUEUES, esc/Ctrl+C STOPS.
+        // Previously a follow-up implicitly aborted the turn, so users who
+        // typed while the agent worked saw it "stop suddenly".
         this.render();
         this.cbs.onSend({ display, expanded, pastes });
     }

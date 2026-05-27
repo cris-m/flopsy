@@ -103,8 +103,8 @@ export class WebhookRouter {
         // Skip the global secret check when this route has its own —
         // otherwise per-route secrets are masked by the global mismatch.
         const ownsSignature = !!(cfg.secret && cfg.signature);
-        webhookServer.registerRoute(cfg.path, async (req, body, res) => {
-            if (!this.verify(req, body, cfg)) {
+        webhookServer.registerRoute(cfg.path, async (req, body, res, raw) => {
+            if (!this.verify(req, raw ?? body, cfg)) {
                 webhookServer.respond(res, 401, { error: `Invalid ${cfg.name} webhook signature` });
                 return;
             }
@@ -212,7 +212,7 @@ export class WebhookRouter {
         );
     }
 
-    private verify(req: IncomingMessage, body: string, cfg: ExternalWebhookConfig): boolean {
+    private verify(req: IncomingMessage, body: string | Buffer, cfg: ExternalWebhookConfig): boolean {
         if (!cfg.secret || !cfg.signature) return true;
 
         const sig = req.headers[cfg.signature.header.toLowerCase()] as string | undefined;

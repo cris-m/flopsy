@@ -19,6 +19,9 @@ import stripAnsi from 'strip-ansi';
 import { workspace } from '@flopsy/shared';
 import { palette } from './theme';
 
+/** Single source of truth for the CLI version. Consumed by index.ts (`--version`) and the chat welcome box. */
+export const FLOPSY_VERSION = '1.0.0';
+
 /**
  * Grapheme-aware string splitter. Using `Intl.Segmenter` means a string
  * with combining marks or emoji (e.g. '🐰' or 'a\u0301') counts as one
@@ -280,9 +283,10 @@ export function getRecentActivity(limit = 3): readonly ActivityEntry[] {
         }
     }
 
-    // Latest schedule added/removed — mtime on proactive.db-wal changes
-    // on write. We label it with createdAt/updatedAt if readable.
-    const proactiveDb = join(flopsyHome, 'state', 'proactive.db');
+    // Latest schedule added/removed — proactive schedules now live in
+    // learning.db (consolidated from the old proactive.db). mtime changes on
+    // schedule writes; labelled distinctly from generic learning updates.
+    const proactiveDb = join(flopsyHome, 'state', 'learning.db');
     if (existsSync(proactiveDb)) {
         try {
             const m = statSync(proactiveDb).mtimeMs;
@@ -317,21 +321,34 @@ export function getRecentActivity(limit = 3): readonly ActivityEntry[] {
 
     // Latest skill edit — when the user (or background reviewer) last
     // touched a SKILL.md. Great signal that the agent is learning.
+    // Walks BOTH flat (skills/<name>/SKILL.md) and grouped
+    // (skills/<group>/<name>/SKILL.md) layouts.
     const skillsDir = join(flopsyHome, 'skills');
     if (existsSync(skillsDir)) {
         try {
-            let best: { name: string; mtimeMs: number } | null = null;
-            for (const name of readdirSync(skillsDir)) {
-                const skillMd = join(skillsDir, name, 'SKILL.md');
-                if (!existsSync(skillMd)) continue;
+            // Collect all candidates, then pick the latest at the end.
+            const candidates: Array<{ name: string; mtimeMs: number }> = [];
+            for (const entry of readdirSync(skillsDir)) {
+                const entryPath = join(skillsDir, entry);
+                const flat = join(entryPath, 'SKILL.md');
+                if (existsSync(flat)) {
+                    try {
+                        candidates.push({ name: entry, mtimeMs: statSync(flat).mtimeMs });
+                    } catch { /* skip */ }
+                    continue;
+                }
                 try {
-                    const mtime = statSync(skillMd).mtimeMs;
-                    if (!best || mtime > best.mtimeMs) {
-                        best = { name, mtimeMs: mtime };
+                    for (const sub of readdirSync(entryPath)) {
+                        const subSkillMd = join(entryPath, sub, 'SKILL.md');
+                        if (!existsSync(subSkillMd)) continue;
+                        try {
+                            candidates.push({ name: sub, mtimeMs: statSync(subSkillMd).mtimeMs });
+                        } catch { /* skip */ }
                     }
                 } catch { /* skip */ }
             }
-            if (best) {
+            if (candidates.length > 0) {
+                const best = candidates.reduce((a, b) => (b.mtimeMs > a.mtimeMs ? b : a));
                 entries.push({
                     label: `skill "${best.name}" updated`,
                     mtimeMs: best.mtimeMs,

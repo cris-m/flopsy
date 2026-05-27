@@ -1,11 +1,13 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import type { Peer, OutboundMessage, ReactionOptions, Message, Media } from '@gateway/types';
+import { isTextDocument } from '@gateway/types';
 import { BaseChannel, toError } from '@gateway/core/base-channel';
 import { resolveMediaSource } from '@gateway/core/media-resolver';
 import type { IMessageChannelConfig } from './types';
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_TEXT_DOCUMENT_BYTES = 256 * 1024;
 
 const execFileAsync = promisify(execFile);
 const POLL_INTERVAL_MS = 3_000;
@@ -14,6 +16,7 @@ const EXEC_TIMEOUT_MS = 15_000;
 export class IMessageChannel extends BaseChannel {
     readonly name = 'imessage';
     readonly authType = 'none';
+    readonly rendersCodeBlocks = false;
 
     private readonly channelConfig: IMessageChannelConfig;
     private readonly cliPath: string;
@@ -180,6 +183,20 @@ export class IMessageChannel extends BaseChannel {
                     }
                 } else if (mimeType.startsWith('video/')) {
                     media.push({ type: 'video', url: a.path, mimeType });
+                } else if (a.path && isTextDocument(mimeType, a.path)) {
+                    try {
+                        const { readFile, stat } = await import('fs/promises');
+                        const st = await stat(a.path);
+                        if (st.size <= MAX_TEXT_DOCUMENT_BYTES) {
+                            const buffer = await readFile(a.path);
+                            const text = new TextDecoder('utf-8', { fatal: false }).decode(buffer);
+                            media.push({ type: 'document', url: a.path, mimeType: mimeType || undefined, fileSize: st.size, text });
+                        } else {
+                            media.push({ type: 'document', url: a.path, mimeType: mimeType || undefined, fileSize: st.size });
+                        }
+                    } catch {
+                        media.push({ type: 'document', url: a.path, mimeType: mimeType || undefined });
+                    }
                 } else {
                     media.push({ type: 'document', url: a.path, mimeType: mimeType || undefined });
                 }

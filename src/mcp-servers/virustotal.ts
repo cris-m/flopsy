@@ -154,7 +154,10 @@ export function createVirusTotalMcpServer() {
         {
             title: 'File Report',
             description:
-                'Look up a file by its MD5, SHA-1, or SHA-256 hash. Returns detection stats, file type, and which engines flagged it.',
+                'Look up a file by MD5, SHA-1, or SHA-256 hash. Returns detection stats, file type, and which engines flagged it.\n\n' +
+                'Args:\n' +
+                '  hash — MD5, SHA-1, or SHA-256 string.\n\n' +
+                'Investigation methodology lives in /skills/security/virustotal/SKILL.md.',
             inputSchema: {
                 hash: z.string().describe('MD5, SHA-1, or SHA-256 hash of the file'),
             },

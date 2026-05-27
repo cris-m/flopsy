@@ -1,4 +1,5 @@
-import { createLogger, deletePromptFile, resolveWorkspacePath, type PromptKind } from '@flopsy/shared';
+import { createLogger, deletePromptFile, heartbeatDefinitionSchema, jobDefinitionSchema, resolveWorkspacePath, type PromptKind } from '@flopsy/shared';
+import type { ZodObject, ZodRawShape } from 'zod';
 import { getSharedLearningStore } from '@flopsy/team';
 import { Cron } from 'croner';
 import { StateStore } from './state/store';
@@ -294,6 +295,7 @@ export class ProactiveEngine {
         }
 
         this.seedSchedulesFromConfigIfNeeded({ heartbeats });
+        this.ensureSystemHeartbeats();
 
         const all = this.loadRuntimeHeartbeats();
         await this.heartbeat.start(all, defaultDelivery);
@@ -321,6 +323,52 @@ export class ProactiveEngine {
         await this.cron.start(all, defaultDelivery);
 
         this.flushPendingRegistrations('cron');
+    }
+
+    /**
+     * Built-in heartbeats the harness guarantees on every boot, independent of
+     * the run-once config seed. `self-improve` drives the skill learning loop;
+     * without this it only existed if hand-added, so it never fired. Register
+     * if-missing only — a user who disabled it (row present, enabled=0) is
+     * respected; a fully-deleted one is restored.
+     */
+    private ensureSystemHeartbeats(): void {
+        const systemHeartbeats: HeartbeatDefinition[] = [
+            {
+                id: 'self-improve',
+                name: 'self-improve',
+                enabled: true,
+                interval: '1d',
+                prompt: '',
+                promptFile: 'self-improve.md',
+                deliveryMode: 'silent',
+                oneshot: false,
+                noAgent: false,
+            },
+            {
+                id: 'dreaming',
+                name: 'dreaming',
+                enabled: true,
+                interval: '1d',
+                prompt: '',
+                promptFile: 'dreaming.md',
+                deliveryMode: 'silent',
+                oneshot: false,
+                noAgent: false,
+                cooldownAfterSilences: 7,
+            },
+        ];
+        const present = new Set(this.dedupStore.listRuntimeSchedules().map((r) => r.id));
+        for (const hb of systemHeartbeats) {
+            if (present.has(hb.id!)) continue;
+            this.dedupStore.insertRuntimeSchedule({
+                id: hb.id!,
+                kind: 'heartbeat',
+                config: hb,
+                enabled: true,
+            });
+            log.info({ id: hb.id }, 'registered built-in system heartbeat');
+        }
     }
 
     /** First-boot import of config-defined schedules into proactive.db (run once). */
@@ -374,14 +422,12 @@ export class ProactiveEngine {
         const out: HeartbeatDefinition[] = [];
         for (const row of rows) {
             if (!row.enabled) continue;
-            try {
-                out.push(JSON.parse(row.configJson) as HeartbeatDefinition);
-            } catch (err) {
-                log.warn(
-                    { id: row.id, err: err instanceof Error ? err.message : String(err) },
-                    'Failed to parse runtime heartbeat config — skipping',
-                );
-            }
+            const cfg = safeParseConfig<HeartbeatDefinition>(
+                row.configJson,
+                heartbeatDefinitionSchema,
+                { id: row.id, kind: 'heartbeat' },
+            );
+            if (cfg) out.push(cfg);
         }
         log.info({ count: out.length }, 'runtime heartbeats loaded');
         return out;
@@ -392,14 +438,12 @@ export class ProactiveEngine {
         const out: JobDefinition[] = [];
         for (const row of rows) {
             if (!row.enabled) continue;
-            try {
-                out.push(JSON.parse(row.configJson) as JobDefinition);
-            } catch (err) {
-                log.warn(
-                    { id: row.id, err: err instanceof Error ? err.message : String(err) },
-                    'Failed to parse runtime cron config — skipping',
-                );
-            }
+            const cfg = safeParseConfig<JobDefinition>(
+                row.configJson,
+                jobDefinitionSchema,
+                { id: row.id, kind: 'cron' },
+            );
+            if (cfg) out.push(cfg);
         }
         log.info({ count: out.length }, 'runtime cron jobs loaded');
         return out;
@@ -431,26 +475,6 @@ export class ProactiveEngine {
             return true;
         }
         return this.heartbeat.addHeartbeat(withId, this.defaultDelivery);
-    }
-
-    seedConfigWebhooks(
-        configs: Array<{ name: string; path: string; targetChannel: string; secret?: string; [k: string]: unknown }>,
-    ): void {
-        if (!configs.length) return;
-        let seeded = 0;
-        for (const cfg of configs) {
-            if (cfg['enabled'] === false) continue;
-            this.dedupStore.insertRuntimeSchedule({
-                id: cfg.name,
-                kind: 'webhook',
-                config: cfg,
-                enabled: true,
-            });
-            seeded++;
-        }
-        if (seeded > 0) {
-            log.debug({ seeded }, 'seeded config-defined webhooks into proactive.db');
-        }
     }
 
     /** Inject the WebhookRouter so runtime webhook adds can live-register HTTP routes. */
@@ -491,24 +515,12 @@ export class ProactiveEngine {
         const out: Array<Record<string, unknown>> = [];
         for (const row of rows) {
             if (!row.enabled) continue;
-            try {
-                const cfg = JSON.parse(row.configJson) as Record<string, unknown>;
-                // Legacy rows: retro-fill signature config so ownsSignature works.
-                if (typeof cfg['secret'] === 'string' && cfg['secret'] && !cfg['signature']) {
-                    cfg['signature'] = {
-                        header: 'x-hub-signature-256',
-                        algorithm: 'sha256',
-                        format: 'hex',
-                        prefix: 'sha256=',
-                    };
-                }
-                out.push(cfg);
-            } catch (err) {
-                log.warn(
-                    { id: row.id, err: err instanceof Error ? err.message : String(err) },
-                    'Failed to parse runtime webhook config — skipping',
-                );
-            }
+            const cfg = safeParseConfig(row.configJson, undefined, {
+                id: row.id,
+                kind: 'webhook',
+            });
+            if (!cfg) continue;
+            out.push(cfg);
         }
         return out;
     }
@@ -609,7 +621,7 @@ export class ProactiveEngine {
         this.store.deleteJobState(id);
         this.store.clearOneshotCompleted(id);
 
-        const cfg = safeParseConfig(row.configJson);
+        const cfg = safeParseConfig(row.configJson, undefined, { id, kind: row.kind }) ?? {};
 
         const promptFile =
             (cfg['promptFile'] as string | undefined) ??
@@ -643,29 +655,32 @@ export class ProactiveEngine {
         if (!row) return false;
         this.dedupStore.setRuntimeScheduleEnabled(id, enabled);
 
-        try {
-            if (row.kind === 'heartbeat') {
-                const hb = JSON.parse(row.configJson) as HeartbeatDefinition;
-                if (enabled) {
-                    if (this.heartbeat && this.defaultDelivery) {
-                        this.heartbeat.addHeartbeat(hb, this.defaultDelivery);
-                    }
-                } else {
-                    this.heartbeat?.removeHeartbeat(hb.name);
+        if (row.kind === 'heartbeat') {
+            const hb = safeParseConfig<HeartbeatDefinition>(
+                row.configJson,
+                heartbeatDefinitionSchema,
+                { id, kind: 'heartbeat' },
+            );
+            if (!hb) return true;
+            if (enabled) {
+                if (this.heartbeat && this.defaultDelivery) {
+                    this.heartbeat.addHeartbeat(hb, this.defaultDelivery);
                 }
             } else {
-                const job = JSON.parse(row.configJson) as JobDefinition;
-                if (enabled) {
-                    void this.cron?.addJob(job);
-                } else {
-                    void this.cron?.removeJob(id);
-                }
+                this.heartbeat?.removeHeartbeat(hb.name);
             }
-        } catch (err) {
-            log.warn(
-                { id, err: err instanceof Error ? err.message : String(err) },
-                'Hot-(re)register on setRuntimeScheduleEnabled failed — will take effect on next restart',
+        } else {
+            const job = safeParseConfig<JobDefinition>(
+                row.configJson,
+                jobDefinitionSchema,
+                { id, kind: 'cron' },
             );
+            if (!job) return true;
+            if (enabled) {
+                void this.cron?.addJob(job);
+            } else {
+                void this.cron?.removeJob(id);
+            }
         }
         return true;
     }
@@ -679,16 +694,8 @@ export class ProactiveEngine {
             log.warn({ id, kind: row.kind }, 'setRuntimeScheduleSkills: unsupported kind, refusing');
             return false;
         }
-        let config: Record<string, unknown>;
-        try {
-            config = JSON.parse(row.configJson) as Record<string, unknown>;
-        } catch (err) {
-            log.warn(
-                { id, err: err instanceof Error ? err.message : String(err) },
-                'setRuntimeScheduleSkills: configJson parse failed',
-            );
-            return false;
-        }
+        const config = safeParseConfig(row.configJson, undefined, { id, kind: row.kind });
+        if (!config) return false;
         if (row.kind === 'heartbeat') {
             config['skills'] = [...skills];
         } else {
@@ -819,10 +826,14 @@ export class ProactiveEngine {
 
         try {
             if (existing.kind === 'heartbeat') {
-                const oldCfg = JSON.parse(existing.configJson) as HeartbeatDefinition;
+                const oldCfg = safeParseConfig<HeartbeatDefinition>(
+                    existing.configJson,
+                    heartbeatDefinitionSchema,
+                    { id, kind: 'heartbeat' },
+                );
                 const newCfg = newConfig as HeartbeatDefinition;
                 // Heartbeats are keyed by name — always remove old first.
-                this.heartbeat?.removeHeartbeat(oldCfg.name);
+                if (oldCfg) this.heartbeat?.removeHeartbeat(oldCfg.name);
                 if (existing.enabled && this.heartbeat && this.defaultDelivery) {
                     this.heartbeat.addHeartbeat(newCfg, this.defaultDelivery);
                 }
@@ -996,22 +1007,24 @@ export class ProactiveEngine {
 
     /** Single setter for defaultDelivery; warns on divergence between writers. */
     private setDefaultDelivery(next: DeliveryTarget): void {
+        const resolved: DeliveryTarget | null =
+            !next.peer?.id || next.peer.id === 'YOUR_CHAT_ID' ? null : next;
         const cur = this.defaultDelivery;
         if (
-            cur &&
-            (cur.channelName !== next.channelName || cur.peer.id !== next.peer.id)
+            cur && resolved &&
+            (cur.channelName !== resolved.channelName || cur.peer.id !== resolved.peer.id)
         ) {
             log.warn(
                 {
                     prevChannel: cur.channelName,
                     prevPeer: cur.peer.id,
-                    nextChannel: next.channelName,
-                    nextPeer: next.peer.id,
+                    nextChannel: resolved.channelName,
+                    nextPeer: resolved.peer.id,
                 },
                 'engine.defaultDelivery overwrite — heartbeats and cron may now disagree about fallback target',
             );
         }
-        this.defaultDelivery = next;
+        this.defaultDelivery = resolved;
     }
 
     /** Called at fire time so followActiveChannel picks up the live channel. */
@@ -1091,13 +1104,12 @@ export class ProactiveEngine {
                 break;
             }
             if (kind === 'heartbeat') {
-                let name: string | undefined;
-                try {
-                    name = (JSON.parse(r.configJson) as { name?: string }).name;
-                } catch {
-                    continue;
-                }
-                if (name) candidates.push({ id: r.id, name });
+                const cfg = safeParseConfig<{ name?: string }>(r.configJson, undefined, {
+                    id: r.id,
+                    kind: 'heartbeat',
+                });
+                if (!cfg) continue;
+                if (cfg.name) candidates.push({ id: r.id, name: cfg.name });
             } else {
                 candidates.push({ id: r.id });
             }
@@ -1241,13 +1253,38 @@ function detectCronOverdue(
     }
 }
 
-function safeParseConfig(json: string): Record<string, unknown> {
+function safeParseConfig<T = Record<string, unknown>>(
+    json: string,
+    schema?: ZodObject<ZodRawShape>,
+    ctx?: { id?: string; kind?: string },
+): T | null {
+    let parsed: unknown;
     try {
-        const parsed = JSON.parse(json);
-        return typeof parsed === 'object' && parsed !== null
-            ? (parsed as Record<string, unknown>)
-            : {};
-    } catch {
-        return {};
+        parsed = JSON.parse(json);
+    } catch (err) {
+        log.warn(
+            { ...ctx, err: err instanceof Error ? err.message : String(err) },
+            'safeParseConfig: invalid JSON, skipping',
+        );
+        return null;
     }
+    if (!schema) {
+        return typeof parsed === 'object' && parsed !== null ? (parsed as T) : ({} as T);
+    }
+    const result = schema.passthrough().safeParse(parsed);
+    if (!result.success) {
+        log.warn(
+            {
+                ...ctx,
+                issues: result.error.issues
+                    .slice(0, 5)
+                    .map((i: { path: (string | number)[]; message: string }) =>
+                        `${i.path.join('.')}: ${i.message}`,
+                    ),
+            },
+            'safeParseConfig: schema validation failed, skipping',
+        );
+        return null;
+    }
+    return result.data as T;
 }

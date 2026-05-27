@@ -6,4 +6,5 @@ export interface SignalChannelConfig extends BaseChannelConfig {
     deviceName?: string;
     sessionPath?: string;
     groupActivation?: 'mention' | 'always';
+    attachmentsPath?: string;
 }

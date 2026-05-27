@@ -87,6 +87,11 @@ export function renderCliCompact(s: StatusSnapshot, t: CliTheme = plainTheme, wi
         section('Gateway', [parts.join('    ')]);
     }
 
+    // When the gateway is down, every "live state" panel below has only
+    // config data — we MUST NOT call that "active" / "ready" / "running" or
+    // we lie about runtime state. Honest verbs: "enabled" / "configured".
+    const gwLive = s.gateway.running;
+
     {
         const enabled = s.channels.filter((c) => c.enabled);
         const disabled = s.channels.filter((c) => !c.enabled);
@@ -96,12 +101,14 @@ export function renderCliCompact(s: StatusSnapshot, t: CliTheme = plainTheme, wi
         } else {
             const rows: string[] = [];
             if (enabled.length > 0) {
-                rows.push(enabled.map((c) => `${t.ok(GLYPH.dot)} ${c.name}`).join('  '));
+                const glyph = gwLive ? t.ok(GLYPH.dot) : t.dim(GLYPH.circle);
+                rows.push(enabled.map((c) => `${glyph} ${c.name}`).join('  '));
             }
             if (disabled.length > 0) {
                 rows.push(disabled.map((c) => t.dim(`${GLYPH.circle} ${c.name}`)).join('  '));
             }
-            section(`Channels (${enabled.length}/${total} active)`, rows);
+            const verb = gwLive ? 'active' : 'enabled · gateway off';
+            section(`Channels (${enabled.length}/${total} ${verb})`, rows);
         }
     }
 
@@ -113,7 +120,7 @@ export function renderCliCompact(s: StatusSnapshot, t: CliTheme = plainTheme, wi
             const summary = s.team.map((m) => {
                 if (!m.enabled) return t.dim(m.name);
                 if (m.status === 'working') return t.accent(`${m.name}*`);
-                return m.name;
+                return gwLive ? m.name : t.dim(m.name);
             });
             const rows: string[] = [summary.join('  ')];
             const working = s.team.filter((m) => m.status === 'working' && m.currentTask);
@@ -122,7 +129,8 @@ export function renderCliCompact(s: StatusSnapshot, t: CliTheme = plainTheme, wi
                     t.dim(working.map((m) => `${m.name}: ${truncate(m.currentTask!, 30)}`).join(' · ')),
                 );
             }
-            section(`Team (${enabled.length}/${s.team.length} ready)`, rows);
+            const verb = gwLive ? 'ready' : 'configured · gateway off';
+            section(`Team (${enabled.length}/${s.team.length} ${verb})`, rows);
         }
     }
 
@@ -131,8 +139,19 @@ export function renderCliCompact(s: StatusSnapshot, t: CliTheme = plainTheme, wi
         const parts: string[] = [];
         if (!p.enabled) {
             parts.push(t.dim(`${GLYPH.circle} disabled`));
+        } else if (!gwLive) {
+            // Gateway down → engine can't be running regardless of config.
+            // Don't claim "running" just because nobody told us otherwise.
+            parts.push(t.dim(`${GLYPH.circle} gateway off`));
+        } else if (p.running === true) {
+            parts.push(t.ok(`${GLYPH.dot} running`));
+        } else if (p.running === false) {
+            parts.push(t.warn(`${GLYPH.circle} stopped`));
         } else {
-            parts.push(p.running === false ? t.warn(`${GLYPH.circle} stopped`) : t.ok(`${GLYPH.dot} running`));
+            // Live management didn't report running state — be honest.
+            parts.push(t.dim(`${GLYPH.circle} state unknown`));
+        }
+        if (p.enabled && gwLive) {
             const triggers: string[] = [];
             if (p.heartbeats.count > 0) triggers.push(`${p.heartbeats.enabled} hb`);
             if (p.cron.count > 0) triggers.push(`${p.cron.enabled} cron`);
@@ -155,6 +174,8 @@ export function renderCliCompact(s: StatusSnapshot, t: CliTheme = plainTheme, wi
     }
 
     if (s.integrations.vault) {
+        // Vault is independent of the gateway — its serverRunning flag is
+        // probed directly, so we trust it as-is.
         const v = s.integrations.vault;
         const parts: string[] = [];
         if (!v.initialised) {
@@ -184,16 +205,28 @@ export function renderCliCompact(s: StatusSnapshot, t: CliTheme = plainTheme, wi
         if (i.auth.length === 0) {
             parts.push(t.dim('auth none'));
         } else {
+            // Auth credentials live on disk — accurate regardless of gateway.
             const ok = i.auth.filter((a) => !a.expired).length;
             const tag = `auth ${ok}/${i.auth.length}`;
             parts.push(ok < i.auth.length ? t.warn(tag) : t.ok(tag));
         }
-        parts.push(i.mcp.enabled ? `${t.ok('mcp')} ${i.mcp.active}/${i.mcp.configured}` : t.dim('mcp off'));
-        if (i.memory.enabled) {
+        // MCP "active" implies SPAWNED. Without the gateway, no children exist.
+        if (!i.mcp.enabled) {
+            parts.push(t.dim('mcp off'));
+        } else if (gwLive) {
+            parts.push(`${t.ok('mcp')} ${i.mcp.active}/${i.mcp.configured}`);
+        } else {
+            parts.push(t.dim(`mcp ${i.mcp.configured} configured · gateway off`));
+        }
+        // Memory provider only loads when the gateway starts.
+        if (!i.memory.enabled) {
+            parts.push(t.dim('memory off'));
+        } else if (gwLive) {
             const emb = i.memory.embedder ? ` ${t.dim(i.memory.embedder)}` : '';
             parts.push(`${t.ok(`${GLYPH.dot} memory`)}${emb}`);
         } else {
-            parts.push(t.dim('memory off'));
+            const emb = i.memory.embedder ? ` ${t.dim(i.memory.embedder)}` : '';
+            parts.push(t.dim(`${GLYPH.circle} memory configured${emb} · gateway off`));
         }
         section('Integrations', [parts.join('    ')]);
     }
@@ -250,6 +283,8 @@ export function renderCliVerbose(s: StatusSnapshot, t: CliTheme = plainTheme): s
     }
     lines.push('');
 
+    const gwLive = s.gateway.running;
+
     {
         const total = s.channels.length;
         const enabledCount = s.channels.filter((c) => c.enabled).length;
@@ -258,8 +293,11 @@ export function renderCliVerbose(s: StatusSnapshot, t: CliTheme = plainTheme): s
             lines.push(`  ${t.dim('none configured')}`);
         } else {
             for (const c of s.channels) {
-                const dot = c.enabled ? t.ok(GLYPH.dot) : t.dim(GLYPH.circle);
-                const statusTag = c.enabled ? (c.status ?? 'unknown') : 'disabled';
+                const dot = !c.enabled ? t.dim(GLYPH.circle) : gwLive ? t.ok(GLYPH.dot) : t.dim(GLYPH.circle);
+                let statusTag: string;
+                if (!c.enabled) statusTag = 'disabled';
+                else if (!gwLive) statusTag = 'enabled · gateway off';
+                else statusTag = c.status ?? 'unknown';
                 lines.push(`  ${dot} ${c.name.padEnd(12)} ${t.dim(statusTag)}`);
             }
         }
@@ -274,9 +312,10 @@ export function renderCliVerbose(s: StatusSnapshot, t: CliTheme = plainTheme): s
             lines.push(`  ${t.dim('none configured')}`);
         } else {
             for (const m of s.team) {
-                const dot = m.enabled ? t.ok(GLYPH.dot) : t.dim(GLYPH.circle);
+                const dot = !m.enabled ? t.dim(GLYPH.circle) : gwLive ? t.ok(GLYPH.dot) : t.dim(GLYPH.circle);
                 let tag: string;
                 if (!m.enabled) tag = t.dim('disabled');
+                else if (!gwLive) tag = t.dim('configured · gateway off');
                 else if (m.status === 'working') {
                     tag = t.accent(`working${m.currentTask ? ': ' + truncate(m.currentTask, 40) : ''}`);
                 } else {
@@ -294,8 +333,13 @@ export function renderCliVerbose(s: StatusSnapshot, t: CliTheme = plainTheme): s
         lines.push(heading('Proactive'));
         if (!p.enabled) {
             lines.push(`  ${t.dim('disabled in flopsy.json5 (proactive.enabled = false)')}`);
+        } else if (!gwLive) {
+            lines.push(`  state        ${t.dim('gateway off — engine not running')}`);
         } else {
-            lines.push(`  state        ${p.running === false ? t.warn('stopped') : t.ok('running')}`);
+            const stateLabel = p.running === true ? t.ok('running')
+                : p.running === false ? t.warn('stopped')
+                : t.dim('unknown (mgmt did not report)');
+            lines.push(`  state        ${stateLabel}`);
             lines.push(
                 `  heartbeats   ${p.heartbeats.enabled}/${p.heartbeats.count} active${
                     p.heartbeats.lastFireAgoMs !== undefined ? t.dim(` · last ${agoLabel(p.heartbeats.lastFireAgoMs)}`) : ''

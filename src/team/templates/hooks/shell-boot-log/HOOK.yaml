@@ -1,0 +1,8 @@
+name: shell-boot-log
+description: |
+  Appends each gateway startup event (as JSON) to logs/boot.jsonl. Example
+  shell hook — context arrives on stdin as JSON, FLOPSY_HOME is in the env.
+enabled: true
+events:
+  - gateway.startup
+script: handler.sh
