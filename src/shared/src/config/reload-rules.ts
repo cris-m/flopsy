@@ -25,8 +25,9 @@ export const RELOAD_RULES_META: ReadonlyArray<ReloadRuleMeta> = [
     // Per-schedule enable toggles — engine has setRuntimeScheduleEnabled.
     { pattern: 'proactive.heartbeats.heartbeats.*.enabled', mode: 'hot', reason: 'heartbeat on/off toggle' },
     { pattern: 'proactive.scheduler.jobs.*.enabled', mode: 'hot', reason: 'cron job on/off toggle' },
-    // MCP child lifecycle — boot-only for now.
-    { pattern: 'mcp.servers.**', mode: 'restart', reason: 'MCP subprocesses need respawn' },
+    // MCP child lifecycle — hot: reload() re-reads config + (re)connects servers,
+    // so install/edit/toggle applies live without a gateway restart.
+    { pattern: 'mcp.servers.**', mode: 'hot', reason: 'MCP reload reconnects servers from fresh config' },
     // Agent factory — boot-only (rebuilding live would orphan threads).
     { pattern: 'agents.**', mode: 'restart', reason: 'agents are built once at boot' },
     { pattern: 'memory.**', mode: 'restart', reason: 'memory store + embedder init on boot' },

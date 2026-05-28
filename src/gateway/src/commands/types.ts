@@ -19,6 +19,10 @@ export type GatewayStatusSnapshot = GatewaySnapshotShared;
 export interface ThreadStatus {
     readonly threadId: string;
     readonly entryAgent: string;
+    /** True while the main agent is mid-turn (processing the user's message). */
+    readonly agentActive?: boolean;
+    /** Epoch ms when the in-flight main-agent turn started. */
+    readonly agentTurnStartedAt?: number;
     readonly activeTasks: ReadonlyArray<TaskSummary>;
     readonly recentTasks: ReadonlyArray<TaskSummary>;
     /** Today's totals; byModel sorted heaviest first. */

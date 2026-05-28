@@ -1,4 +1,4 @@
-import { createLogger } from '@flopsy/shared';
+import { createLogger, loadConfig, clearConfigCache } from '@flopsy/shared';
 import type { AgentDefinition, McpConfig } from '@flopsy/shared';
 import {
     McpClientManager,
@@ -36,9 +36,9 @@ export interface McpReloadResult {
  */
 export class McpLifecycle {
     private readonly manager = new McpClientManager();
-    private readonly serversCfg: McpConfig['servers'];
-    private readonly assignToMap: Readonly<Record<string, readonly string[]>>;
-    private readonly enabled: boolean;
+    private serversCfg: McpConfig['servers'];
+    private assignToMap: Readonly<Record<string, readonly string[]>>;
+    private enabled: boolean;
     private readyPromise: Promise<readonly BridgedTool[]> = Promise.resolve([]);
     private skipReasons: Readonly<Record<string, string>> = {};
     private readonly toolCounts = new Map<string, number>();
@@ -46,11 +46,7 @@ export class McpLifecycle {
     constructor(cfg: McpConfig | undefined) {
         this.serversCfg = cfg?.servers ?? {};
         this.enabled = cfg?.enabled !== false;
-        this.assignToMap = Object.fromEntries(
-            Object.entries(this.serversCfg)
-                .filter(([, srv]) => srv.enabled !== false)
-                .map(([name, srv]) => [name, srv.assignTo ?? []]),
-        );
+        this.assignToMap = buildAssignToMap(this.serversCfg);
     }
 
     /**
@@ -177,6 +173,18 @@ export class McpLifecycle {
     async reload(): Promise<McpReloadResult> {
         const beforeConnected = new Set(this.manager.connectedServerNames);
 
+        // Re-read flopsy.json5 so a newly-installed/edited server (written after
+        // boot, e.g. `flopsy mcp install`) is picked up without a gateway restart.
+        try {
+            clearConfigCache();
+            const freshMcp = loadConfig().mcp;
+            this.serversCfg = freshMcp?.servers ?? {};
+            this.enabled = freshMcp?.enabled !== false;
+            this.assignToMap = buildAssignToMap(this.serversCfg);
+        } catch (err) {
+            log.warn({ err: redactSecrets(err) }, 'mcp reload: config re-read failed — using in-memory config');
+        }
+
         const { servers, skipped } = await loadMcpServers(this.serversCfg);
         this.skipReasons = { ...skipped };
 
@@ -234,4 +242,14 @@ export class McpLifecycle {
             this.toolCounts.set(t.mcpServer, (this.toolCounts.get(t.mcpServer) ?? 0) + 1);
         }
     }
+}
+
+function buildAssignToMap(
+    servers: McpConfig['servers'],
+): Readonly<Record<string, readonly string[]>> {
+    return Object.fromEntries(
+        Object.entries(servers)
+            .filter(([, srv]) => srv.enabled !== false)
+            .map(([name, srv]) => [name, srv.assignTo ?? []]),
+    );
 }

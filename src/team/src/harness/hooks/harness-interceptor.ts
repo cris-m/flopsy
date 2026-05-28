@@ -17,6 +17,7 @@ import type {
 } from 'flopsygraph';
 
 import { normalizeErrorPattern } from '../learning/error-patterns';
+import { collectSkillLessons, type SkillLesson } from '../learning/skill-lessons';
 import { getSharedLearningStore } from '../storage';
 import type {
     LearningStore,
@@ -35,6 +36,8 @@ const HARNESS_MARKER = '<flopsy:harness';
 const TOOL_QUIRKS_LIMIT = 5;
 /** Window the harness considers "recent" for tool failures. */
 const TOOL_QUIRKS_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+/** Total bullets surfaced as <skill_lessons> — capped to bound context. */
+const SKILL_LESSONS_LIMIT = 12;
 
 export interface HarnessInterceptorConfig {
     readonly userId: string;
@@ -47,6 +50,7 @@ export interface HarnessInterceptorConfig {
 interface HarnessSnapshot {
     lastSession: SessionRow | null;
     toolQuirks: ReadonlyArray<ToolFailureRow>;
+    skillLessons: ReadonlyArray<SkillLesson>;
     silenceMs: number;
     /** Pre-rendered `<self_state>` block; empty string when telemetry is unavailable. */
     selfState: string;
@@ -234,7 +238,17 @@ export class HarnessInterceptor extends BaseInterceptor {
             );
         }
 
-        return { lastSession, toolQuirks, silenceMs, selfState };
+        let skillLessons: ReadonlyArray<SkillLesson> = [];
+        try {
+            skillLessons = collectSkillLessons(workspace.skills(), { limit: SKILL_LESSONS_LIMIT });
+        } catch (err) {
+            log.debug(
+                { err: err instanceof Error ? err.message : String(err) },
+                'skill-lessons collect failed (non-fatal)',
+            );
+        }
+
+        return { lastSession, toolQuirks, skillLessons, silenceMs, selfState };
     }
 }
 
@@ -254,6 +268,14 @@ function renderContextBlock(snapshot: HarnessSnapshot): string | null {
             sections.push(`  ${q.toolName}: "${escape(q.errorPattern)}" (×${q.count}, last ${ageH}h ago)`);
         }
         sections.push('</tool_quirks>');
+    }
+
+    if (snapshot.skillLessons.length > 0) {
+        sections.push('<skill_lessons description="Lessons learned from past skill use, surfaced from the ## Lessons Learned sections of your skills. Apply the relevant ones; loading the named skill gives you its full instructions.">');
+        for (const l of snapshot.skillLessons) {
+            sections.push(`  [${l.skill}] ${escape(l.lesson)}`);
+        }
+        sections.push('</skill_lessons>');
     }
 
     if (snapshot.selfState) {

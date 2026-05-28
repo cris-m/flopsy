@@ -114,12 +114,13 @@ export const DOCUMENT_TEXT_MIMES: ReadonlySet<string> = new Set([
     'application/x-yaml',
     'application/toml',
     'application/javascript',
+    'application/x-ipynb+json',
     'application/typescript',
 ]);
 
 export const DOCUMENT_TEXT_EXTENSIONS: ReadonlySet<string> = new Set([
     'md', 'markdown', 'txt', 'log', 'csv', 'tsv',
-    'json', 'jsonl', 'ndjson', 'xml', 'yaml', 'yml', 'toml', 'ini', 'cfg', 'env',
+    'json', 'jsonl', 'ndjson', 'ipynb', 'xml', 'yaml', 'yml', 'toml', 'ini', 'cfg', 'env',
     'js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx',
     'py', 'rb', 'go', 'rs', 'java', 'kt', 'swift', 'c', 'h', 'cpp', 'hpp', 'cs',
     'sh', 'bash', 'zsh', 'fish',

@@ -108,14 +108,18 @@ function buildProactiveSection(g: GatewayStatusSnapshot): PanelSection {
     if (p.inboundWebhooks !== undefined && p.inboundWebhooks > 0) {
         lines.push(row('webhooks', String(p.inboundWebhooks)));
     }
-    const stats24h = (p as { stats24h?: { delivered: number; suppressed: number; errors: number } }).stats24h;
-    if (stats24h) {
-        const parts = [
-            `${stats24h.delivered} delivered`,
-            `${stats24h.suppressed} suppressed`,
-            `${stats24h.errors} error${stats24h.errors === 1 ? '' : 's'}`,
-        ];
+    const funnel = (p as {
+        funnel24h?: { delivered: number; suppressed: number; errors: number; queued: number; retryQueue: number };
+    }).funnel24h;
+    if (funnel) {
+        const parts = [`${funnel.delivered} delivered`, `${funnel.suppressed} suppressed`];
+        if (funnel.retryQueue > 0) parts.push(`${funnel.retryQueue} retry-queued`);
         lines.push(row('24h', parts.join(' · ')));
+        // `errors` is a current consecutive-failure streak (not a 24h total), so
+        // surface it separately and labelled honestly — only when non-zero.
+        if (funnel.errors > 0) {
+            lines.push(row('failing', `${funnel.errors} job${funnel.errors === 1 ? '' : 's'} in error streak`));
+        }
     }
     if (lines.length === 0) {
         lines.push(row('', '(no schedules)'));

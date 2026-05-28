@@ -6,7 +6,6 @@
 
 import type { AuthProvider } from '../types';
 import {
-    googleProvider,
     gmailProvider,
     driveProvider,
     calendarProvider,
@@ -16,17 +15,16 @@ import {
 import { spotifyProvider } from './spotify';
 import { twitterProvider } from './twitter';
 
-// Per-service Google providers come first so `flopsy auth list` shows them
-// as the recommended entry points. `googleProvider` (the legacy all-scopes
-// flow) stays for backward-compat — re-running it overwrites only `google.json`,
-// not the per-service files.
+// Per-service Google providers are the only entry points — the legacy combined
+// `google` all-scopes flow was removed (each service writes its own credential
+// file). A stale `google.json` from an old install still loads via refresh's
+// legacy fallback; it just won't auto-refresh — re-auth the per-service provider.
 export const PROVIDERS: readonly AuthProvider[] = [
     gmailProvider,
     driveProvider,
     calendarProvider,
     youtubeProvider,
     contactsProvider,
-    googleProvider,
     spotifyProvider,
     twitterProvider,
 ];

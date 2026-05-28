@@ -1036,8 +1036,10 @@ export class TeamHandler implements AgentHandler {
                 calls: m.calls,
             }));
 
+            // Same member set as the active-thread branch below (do NOT filter
+            // to workers — the roster must be identical whether or not a session
+            // is warm). No registry here, so everyone enabled is idle.
             const team = this.config.team
-                .filter((a) => resolveRole(a) === 'worker')
                 .map((def): import('@flopsy/gateway').TeamMemberStatus => ({
                     name: def.name,
                     type: def.type,
@@ -1170,6 +1172,8 @@ export class TeamHandler implements AgentHandler {
         return {
             threadId,
             entryAgent: entry.entry.name,
+            agentActive: entry.activeTurns > 0,
+            ...(entry.activeTurns > 0 ? { agentTurnStartedAt: entry.lastUsedAt } : {}),
             activeTasks: active,
             recentTasks: recent,
             tokens:

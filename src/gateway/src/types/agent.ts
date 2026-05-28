@@ -282,6 +282,10 @@ export interface AggregateTaskSummary extends TaskStatusSummary {
 export interface ThreadStatusSnapshot {
     readonly threadId: string;
     readonly entryAgent: string;
+    /** True while the main agent is mid-turn (processing the user's message). */
+    readonly agentActive?: boolean;
+    /** When the in-flight main-agent turn started (epoch ms); set with agentActive. */
+    readonly agentTurnStartedAt?: number;
     readonly activeTasks: ReadonlyArray<TaskStatusSummary>;
     readonly recentTasks: ReadonlyArray<TaskStatusSummary>;
     /** Today's token totals; `byModel` sorted heaviest first. */

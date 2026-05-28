@@ -360,7 +360,19 @@ async function runInline(
         persist(aborted ? 'killed' : 'failed', null, message);
 
         if (timedOut) {
-            return `delegate_task: timed out after ${timeoutMs}ms (worker=${args.worker}). The teammate was aborted.`;
+            const partial = (err as { partialResult?: unknown }).partialResult;
+            const partialStr = typeof partial === 'string' ? partial.trim() : '';
+            const base = `delegate_task: timed out after ${timeoutMs}ms (worker=${args.worker}); teammate aborted.`;
+            if (partialStr) {
+                return (
+                    `${base}\n\nPartial output before the cutoff (use it if useful):\n${partialStr.slice(0, 2000)}\n\n` +
+                    `To finish: retry ONCE with a tighter, narrower brief, OR re-run via spawn_background_task so it runs detached and pings back instead of blocking your turn.`
+                );
+            }
+            return (
+                `${base} No output produced before the cutoff. ` +
+                `Retry ONCE with a tighter, narrower brief, or use spawn_background_task (non-blocking, survives your turn) for work this long.`
+            );
         }
         if (parentStop) {
             return `delegate_task: parent turn stopped; teammate aborted.`;

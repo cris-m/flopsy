@@ -355,7 +355,7 @@ export function createTeamMember(def: AgentDefinition, opts: CreateTeamMemberOpt
 
     const controlTools: BaseTool[] = (() => {
         if (role !== 'main')
-            return [delegateTaskTool, spawnBackgroundTaskTool, handoffTaskTool, notifyTeammateTool, skillManageTool];
+            return [delegateTaskTool, spawnBackgroundTaskTool, handoffTaskTool, notifyTeammateTool, skillManageTool, planTool];
 
         const mainTools = [
             sendMessageTool,

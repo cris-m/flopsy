@@ -1263,7 +1263,7 @@ export class ChannelWorker {
                     );
                 }
             } else {
-                const category = categorizeError(err, timeoutMs, durationMs);
+                let category = categorizeError(err, timeoutMs, durationMs);
                 if (category.kind === 'timeout') {
                     this.log.warn({ ...ctx, timeoutMs, elapsedMs: durationMs }, 'agent turn timed out');
                     // Surface partial stream output rather than a bare timeout apology.
@@ -1292,6 +1292,20 @@ export class ChannelWorker {
                             });
                         }
                         return;
+                    }
+                    // No partial output to show — but detached background tasks
+                    // survive this abort and deliver via task-notification. Tell
+                    // the user that instead of a dead-end "try again".
+                    const runningBg = (this.agentHandler.queryStatus?.(this.threadId)?.activeTasks ?? [])
+                        .filter((t) => t.status === 'running' || t.status === 'pending');
+                    if (runningBg.length > 0) {
+                        const n = runningBg.length;
+                        category = {
+                            kind: 'timeout',
+                            userMessage:
+                                `Still working — ${n} task${n === 1 ? '' : 's'} ${n === 1 ? 'is' : 'are'} ` +
+                                `running in the background. I'll message you the moment ${n === 1 ? 'it finishes' : 'they finish'} — no need to resend.`,
+                        };
                     }
                 } else {
                     this.log.error({ ...ctx, err, errKind: category.kind }, 'agent turn failed');

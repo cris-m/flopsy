@@ -14,12 +14,15 @@
  *   flopsy mcp enable <name> / disable <name> — flip the enabled flag
  */
 
-import { readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { readFileSync, renameSync, writeFileSync, existsSync } from 'node:fs';
+import { createInterface } from 'node:readline';
+import { join } from 'node:path';
 import { Command } from 'commander';
 import JSON5 from 'json5';
 import { configPath } from '../ops/config-reader';
 import { dim, section, table } from '../ui/pretty';
 import { tint } from '../ui/theme';
+import { MCP_CATALOG, getCatalogEntry, type McpCatalogEntry } from './catalog';
 
 function fail(msg: string, code = 1): never {
     process.stderr.write(`error: ${msg}\n`);
@@ -167,6 +170,136 @@ export function registerMcpCommands(root: Command): void {
         .description('Print a matrix showing which agent sees which MCP server')
         .option('--json', 'Emit raw JSON instead of the pretty table')
         .action((opts: { json?: boolean }) => printRoutes(Boolean(opts.json)));
+
+    mcp.command('catalog')
+        .description('List curated MCP servers available for `flopsy mcp install <name>`')
+        .action(() => {
+            const { parsed } = readConfig();
+            const installed = (parsed.mcp?.servers ?? {}) as Record<string, { enabled?: boolean }>;
+            const rows = MCP_CATALOG.map((e) => {
+                const has = installed[e.name];
+                const status = !has
+                    ? dim('available')
+                    : has.enabled === false
+                      ? dim('installed (disabled)')
+                      : tint.success('installed');
+                return [e.name, status, e.description];
+            });
+            console.log(section('MCP CATALOG'));
+            console.log(table(rows));
+            console.log(dim('\nInstall with `flopsy mcp install <name>` — prompts for any keys, applies live.'));
+        });
+
+    mcp.command('install')
+        .description('Install a catalog MCP server: prompts for credentials, writes the entry, applies live')
+        .argument('<name>', 'Catalog entry name (see `flopsy mcp catalog`)')
+        .option('--disabled', 'Install but leave disabled (enable later with `flopsy mcp enable`)')
+        .action(async (name: string, opts: { disabled?: boolean }) => {
+            const entry = getCatalogEntry(name);
+            if (!entry) {
+                fail(`No catalog entry "${name}". Run \`flopsy mcp catalog\` to list available servers.`);
+            }
+            await installCatalogEntry(entry, { disabled: Boolean(opts.disabled) });
+        });
+}
+
+function envFilePath(): string {
+    // .env lives at the workspace parent (repo root) where the gateway reads it.
+    const cfg = configPath();
+    // configPath → <root>/.flopsy/config/flopsy.json5 ; walk up to <root>.
+    const root = cfg.split('/.flopsy/')[0] ?? process.cwd();
+    return join(root, '.env');
+}
+
+function upsertEnvVar(key: string, value: string): string {
+    const path = envFilePath();
+    let body = '';
+    try {
+        body = existsSync(path) ? readFileSync(path, 'utf-8') : '';
+    } catch {
+        body = '';
+    }
+    const line = `${key}=${value}`;
+    const re = new RegExp(`^${key}=.*$`, 'm');
+    const next = re.test(body)
+        ? body.replace(re, line)
+        : (body.endsWith('\n') || body === '' ? body : body + '\n') + line + '\n';
+    const tmp = `${path}.tmp`;
+    writeFileSync(tmp, next, { mode: 0o600 });
+    renameSync(tmp, path);
+    return path;
+}
+
+function ask(question: string, opts: { secret?: boolean } = {}): Promise<string> {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    return new Promise((resolve) => {
+        if (opts.secret) {
+            // Mute echo: intercept the output stream while typing.
+            const out = process.stdout;
+            const mutableRl = rl as unknown as { _writeToOutput?: (s: string) => void };
+            mutableRl._writeToOutput = (s: string): void => {
+                if (s.includes(question)) out.write(s);
+            };
+        }
+        rl.question(`${question}: `, (answer) => {
+            rl.close();
+            if (opts.secret) process.stdout.write('\n');
+            resolve(answer.trim());
+        });
+    });
+}
+
+async function installCatalogEntry(
+    entry: McpCatalogEntry,
+    opts: { disabled: boolean },
+): Promise<void> {
+    console.log(section(`INSTALL ${entry.name}`));
+    console.log(`  ${entry.displayName} — ${entry.description}`);
+    console.log(dim(`  source: ${entry.source}`));
+    console.log(dim(`  runs:   ${entry.command} ${entry.args.join(' ')}\n`));
+
+    // Resolve prompts: arg-tokens substituted inline; env-tokens written to .env.
+    const argSubs = new Map<string, string>();
+    for (const p of entry.prompts ?? []) {
+        const value = await ask(`  ${p.label}`, { secret: p.secret });
+        if (!value) fail(`"${p.label}" is required — aborting.`);
+        if (p.target === 'arg') {
+            argSubs.set(p.token, value);
+        } else {
+            const path = upsertEnvVar(p.token, value);
+            console.log(dim(`  ✓ wrote ${p.token} to ${path}`));
+        }
+    }
+
+    const resolvedArgs = entry.args.map((a) => {
+        const m = a.match(/^\$\{([A-Z0-9_]+)\}$/);
+        if (m && argSubs.has(m[1]!)) return argSubs.get(m[1]!)!;
+        return a;
+    });
+
+    const serverEntry: Record<string, unknown> = {
+        enabled: !opts.disabled,
+        transport: entry.transport,
+        command: entry.command,
+        args: resolvedArgs,
+    };
+    if (entry.env) serverEntry.env = { ...entry.env };
+
+    const { path, parsed } = readConfig();
+    const servers = ensureMcpBlock(parsed);
+    if ((servers as Record<string, unknown>)[entry.name]) {
+        console.log(dim(`  note: replacing existing "${entry.name}" entry`));
+    }
+    (servers as Record<string, unknown>)[entry.name] = serverEntry;
+    writeConfig(path, parsed);
+
+    console.log(tint.success(`\n✓ Installed "${entry.name}"${opts.disabled ? ' (disabled)' : ''} → ${path}`));
+    console.log(
+        dim(
+            'A running gateway hot-reloads MCP on config change — the server connects within ~2s, no restart.\n' +
+            'If the gateway is not running, it will load on next start.',
+        ),
+    );
 }
 
 function flipEnabled(name: string, value: boolean): void {

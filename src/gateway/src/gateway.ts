@@ -1056,12 +1056,35 @@ export class FlopsyGateway extends BaseGateway {
             ['logging.pretty', (ctx) => this.handleLoggingChange(ctx)],
             ['proactive.heartbeats.heartbeats.*.enabled', (ctx) => this.handleScheduleToggle(ctx, 'heartbeat')],
             ['proactive.scheduler.jobs.*.enabled', (ctx) => this.handleScheduleToggle(ctx, 'cron')],
+            ['mcp.servers.**', () => this.handleMcpConfigChange()],
         ]);
         return RELOAD_RULES_META.map((m): ReloadRule => {
             const handler = hotHandlers.get(m.pattern);
             const base: ReloadRule = { pattern: m.pattern, mode: m.mode, reason: m.reason };
             return handler ? { ...base, handler } : base;
         });
+    }
+
+    /**
+     * Live-apply an MCP config change (server added/edited/toggled in
+     * flopsy.json5). reloadMcp re-reads the config from disk, (re)connects
+     * servers, and re-bridges tools — evicting cached threads so the new
+     * surface is visible immediately, no gateway restart.
+     */
+    private async handleMcpConfigChange(): Promise<void> {
+        if (!this.agentHandler?.reloadMcp) {
+            this.log.warn('mcp config changed but reloadMcp not wired — restart to apply');
+            return;
+        }
+        try {
+            const result = await this.agentHandler.reloadMcp({ evictCachedThreads: true });
+            this.log.info({ connected: result?.connected ?? [] }, 'mcp config hot-reloaded');
+        } catch (err) {
+            this.log.warn(
+                { err: err instanceof Error ? err.message : String(err) },
+                'mcp hot-reload failed — restart to apply',
+            );
+        }
     }
 
     /**

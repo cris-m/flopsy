@@ -16,27 +16,57 @@ export const tasksCommand: CommandDef = {
                 ),
             };
         }
-        return { text: render(ts.activeTasks, ts.recentTasks) };
+        return {
+            text: render(ts.activeTasks, ts.recentTasks, {
+                agentActive: ts.agentActive === true,
+                ...(ts.agentTurnStartedAt !== undefined ? { startedAtMs: ts.agentTurnStartedAt } : {}),
+                entryAgent: ts.entryAgent,
+            }),
+        };
     },
 };
 
-function render(active: readonly TaskSummary[], recent: readonly TaskSummary[]): string {
-    if (active.length === 0 && recent.length === 0) {
+interface MainTurn {
+    readonly agentActive: boolean;
+    readonly startedAtMs?: number;
+    readonly entryAgent: string;
+}
+
+function render(
+    active: readonly TaskSummary[],
+    recent: readonly TaskSummary[],
+    main: MainTurn,
+): string {
+    if (active.length === 0 && recent.length === 0 && !main.agentActive) {
         return panel(
             [{ title: 'tasks', lines: [row('', 'idle — nothing in flight, nothing recent')] }],
             { header: 'TASKS' },
         );
     }
 
-    const summary = `TASKS · ${active.length} active · ${recent.length} recent`;
     const sections: PanelSection[] = [];
 
+    if (main.agentActive) {
+        const age = main.startedAtMs !== undefined
+            ? agoLabel(Date.now() - main.startedAtMs).replace(' ago', '')
+            : 'now';
+        sections.push({
+            title: 'in progress',
+            lines: [row(`${STATE.on}  ${main.entryAgent}`, `processing your message · ${age}`, 18)],
+        });
+    }
     if (active.length > 0) {
         sections.push({ title: 'active', lines: active.map(activeRow) });
     }
     if (recent.length > 0) {
         sections.push({ title: 'recent', lines: recent.map(recentRow) });
     }
+
+    const parts: string[] = [];
+    if (main.agentActive) parts.push('agent working');
+    if (active.length > 0) parts.push(`${active.length} active`);
+    if (recent.length > 0) parts.push(`${recent.length} recent`);
+    const summary = `TASKS · ${parts.join(' · ')}`;
 
     return panel(sections, { header: summary });
 }

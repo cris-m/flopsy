@@ -22,7 +22,12 @@ A continuous learning system that captures, organizes, and surfaces insights ove
 
 ## How It Works
 
-Learnings are stored in `.flopsy/learning/reflection.json` and updated after significant tasks or at the end of sessions. Each learning entry contains:
+Durable, cross-session learnings belong in the `memory` tool (`target: "memory"`)
+or `smart_remember` — that is the real store the agent reads every turn. Use this
+skill's file only for bulk/structured session notes that don't fit memory.
+
+The file store lives at `/workspace/work/learning/reflection.json` (the writable
+work dir — `/workspace` itself is read-only, so never write there). Each entry contains:
 
 - **topic**: The subject or domain the insight relates to
 - **insight**: The specific lesson or observation
@@ -35,7 +40,7 @@ Learnings are stored in `.flopsy/learning/reflection.json` and updated after sig
 1. Identify the topic and the specific insight
 2. Write the insight as a concise, actionable statement (e.g., "Always check X before doing Y")
 3. Record the context (what task or situation prompted this)
-4. Append to the learning store by updating the reflection file (`.flopsy/learning/reflection.json`) with a new entry; see the tool catalog for the current writer tool if available
+4. For durable facts/preferences, call the `memory` tool (`target: "memory"`). For bulk structured notes, append to `/workspace/work/learning/reflection.json` (create the dir if missing — it is writable; `/workspace` is not)
 
 ### Reviewing Learnings
 1. Load the current learning store
